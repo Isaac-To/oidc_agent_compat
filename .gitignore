@@ -11,6 +11,9 @@ config.toml
 *.p12
 *.pfx
 
+# Docker dev stack — generated certs and volumes
+docker/certs/
+
 # Editor
 .vscode/
 .idea/

@@ -130,6 +130,9 @@ pub struct SecretStoreConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SecretStoreKind {
+    /// A file on disk (dev/testing only — the key is stored in a file with
+    /// `0600` permissions). Not for production.
+    File,
     /// HashiCorp Vault.
     Vault,
     /// AWS Secrets Manager.

@@ -1,0 +1,19 @@
+# Relay config for Docker dev stack
+# The relay runs on the host (not in Docker) so it can listen on 127.0.0.1
+# and Goose can connect to it. It forwards to the central proxy in Docker.
+
+listen_addr = "127.0.0.1:8787"
+database_url = "sqlite:///tmp/oac-relay.db"
+
+[oidc]
+issuer = "http://localhost:8080/realms/oac-dev"
+client_id = "oac-relay"
+client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+redirect_uri = "http://127.0.0.1:0/callback"
+scopes = ["openid", "email", "profile"]
+
+[central]
+url = "https://localhost:8443"
+ca_cert_path = "docker/certs/ca.crt"
+client_cert_path = "docker/certs/client.crt"
+client_key_path = "docker/certs/client.key"
