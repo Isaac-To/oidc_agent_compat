@@ -38,7 +38,8 @@ pub async fn host_guard_middleware(
         .and_then(|h| h.to_str().ok());
 
     match host {
-        Some(h) if allowed.iter().any(|a| a == h) => Ok(next.run(request).await),
+        // RFC 7230 §5.4: Host header values are case-insensitive.
+        Some(h) if allowed.iter().any(|a| a.eq_ignore_ascii_case(h)) => Ok(next.run(request).await),
         _ => {
             tracing::warn!(
                 host = ?host,

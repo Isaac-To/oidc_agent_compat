@@ -111,10 +111,14 @@ pub fn is_allowed_signing_alg(alg: &str) -> bool {
 
 /// Validates the OIDC redirect URI is a loopback http URL per RFC 8252 §7.3.
 ///
+/// Parses the URL and checks that the scheme is `http` and the host is a
+/// loopback address (`127.0.0.0/8` or `::1`). This prevents bypasses like
+/// `http://127.0.0.1.evil.com/callback` that a naive `starts_with` would
+/// accept.
+///
 /// # Errors
 ///
-/// Returns [`Error::Oidc`] if the redirect URI is not `http://127.0.0.1:...`
-/// or `http://[::1]:...`.
+/// Returns [`Error::Oidc`] if the redirect URI is not a loopback `http` URL.
 ///
 /// # Example
 ///
@@ -124,11 +128,17 @@ pub fn is_allowed_signing_alg(alg: &str) -> bool {
 /// assert!(validate_loopback_redirect("http://[::1]:8787/callback").is_ok());
 /// assert!(validate_loopback_redirect("https://evil.example.com/cb").is_err());
 /// assert!(validate_loopback_redirect("http://0.0.0.0:8787/cb").is_err());
+/// assert!(validate_loopback_redirect("http://127.0.0.1.evil.com/cb").is_err());
 /// ```
 pub fn validate_loopback_redirect(redirect_uri: &str) -> Result<()> {
-    let is_loopback =
-        redirect_uri.starts_with("http://127.0.0.1") || redirect_uri.starts_with("http://[::1]");
-    if !is_loopback {
+    let parsed = url::Url::parse(redirect_uri)
+        .map_err(|e| Error::oidc(format!("invalid redirect_uri: {e}")))?;
+    let is_loopback = match parsed.host() {
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        _ => false,
+    };
+    if parsed.scheme() != "http" || !is_loopback {
         return Err(Error::oidc(format!(
             "redirect_uri must be a loopback http URL (http://127.0.0.1:... or \
              http://[::1]:...), got: {redirect_uri}"
@@ -228,5 +238,21 @@ mod tests {
         assert!(validate_loopback_redirect("https://evil.example.com/cb").is_err());
         assert!(validate_loopback_redirect("http://0.0.0.0:8787/cb").is_err());
         assert!(validate_loopback_redirect("http://192.168.1.1:8787/cb").is_err());
+    }
+
+    #[test]
+    fn validate_loopback_redirect_rejects_substring_bypass() {
+        // These would pass a naive starts_with("http://127.0.0.1") check
+        // but are NOT loopback addresses.
+        assert!(validate_loopback_redirect("http://127.0.0.1.evil.com/cb").is_err());
+        assert!(validate_loopback_redirect("http://127.0.0.1ABC/cb").is_err());
+        assert!(validate_loopback_redirect("http://[::1].evil.com/cb").is_err());
+    }
+
+    #[test]
+    fn validate_loopback_redirect_rejects_domain_localhost() {
+        // "localhost" is a hostname, not an IP — the URL parser resolves it
+        // as a domain, not a loopback IP. We only accept IP literals.
+        assert!(validate_loopback_redirect("http://localhost:8787/cb").is_err());
     }
 }
