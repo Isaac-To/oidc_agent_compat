@@ -1,0 +1,26 @@
+# Central proxy config for Docker dev stack
+# The central proxy runs inside Docker, holds the master key in a file
+# (dev only), and forwards to the mock backend.
+
+listen_addr = "0.0.0.0:8443"
+database_url = "sqlite:///data/central.db"
+
+[oidc]
+issuer = "http://keycloak:8080/realms/oac-dev"
+client_id = "oac-relay"
+client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+redirect_uri = "http://127.0.0.1:0/callback"
+scopes = ["openid", "email", "profile"]
+
+[backend]
+name = "mock-backend"
+base_url = "http://mock-backend:8080"
+
+[mtls]
+ca_cert_path = "/certs/ca.crt"
+server_cert_path = "/certs/server.crt"
+server_key_path = "/certs/server.key"
+
+[secret_store]
+kind = "file"
+path = "/secrets/master-key"

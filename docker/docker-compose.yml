@@ -1,0 +1,69 @@
+# Docker dev stack for the OIDC Agent Compatibility Server.
+#
+# Services:
+#   keycloak      — OIDC IdP (pre-configured realm with test users)
+#   mock-backend  — OpenAI-compatible mock API (Flask)
+#   central       — Central proxy (holds master key, forwards to mock-backend)
+#
+# The relay runs on the HOST (not in Docker) so it can listen on 127.0.0.1
+# and Goose can connect to it. See docker/dev.sh for orchestration.
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/realms/oac-dev/.well-known/openid-configuration"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+
+  mock-backend:
+    build: ./mock-backend
+    ports:
+      - "8090:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/v1/models')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  central:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["oac-central", "serve", "--config", "/config/central.toml"]
+    environment:
+      OAC_OIDC_CLIENT_SECRET: "oac-relay-secret"
+      RUST_LOG: "info"
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./configs/central.toml:/config/central.toml:ro
+      - ./certs:/certs:ro
+      - central-data:/data
+      - central-secrets:/secrets
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      mock-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-kf", "https://localhost:8443/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  central-data:
+  central-secrets:

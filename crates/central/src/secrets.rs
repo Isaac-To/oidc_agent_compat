@@ -96,6 +96,9 @@ pub fn from_config(
     config: &oidc_agent_common::config::SecretStoreConfig,
 ) -> Result<Box<dyn SecretStore>> {
     match config.kind {
+        oidc_agent_common::config::SecretStoreKind::File => Ok(Box::new(FileSecretStore::new(
+            std::path::PathBuf::from(&config.path),
+        ))),
         oidc_agent_common::config::SecretStoreKind::Vault => {
             // Phase 2: implement Vault client.
             Err(Error::SecretStore(
