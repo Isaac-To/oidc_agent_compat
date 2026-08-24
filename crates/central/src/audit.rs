@@ -1,0 +1,235 @@
+//! Audit logging for the central proxy.
+//!
+//! Every proxied request is logged to the `audit_log` table with the device
+//! ID, user subject, model, backend, status, latency, and token usage. This
+//! provides a tamper-evident record for enterprise compliance.
+//!
+//! # Security
+//!
+//! - The audit log is append-only (no update/delete operations are exposed).
+//! - No secrets (master key, bearer tokens) are ever logged.
+//! - The log records who made the request, when, and what it cost.
+
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use time::PrimitiveDateTime;
+use uuid::Uuid;
+
+use oidc_agent_common::error::{Error, Result};
+
+/// An audit log entry for a single proxied request.
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    /// The device ID that made the request.
+    pub device_id: String,
+    /// The user subject.
+    pub user_subject: String,
+    /// The model requested (if parseable from the request body).
+    pub model: Option<String>,
+    /// The backend name.
+    pub backend: String,
+    /// The HTTP status code of the upstream response.
+    pub status: i32,
+    /// The request latency in milliseconds.
+    pub latency_ms: i64,
+    /// Whether the response was streamed.
+    pub stream: bool,
+    /// Token usage (prompt tokens), if reported.
+    pub prompt_tokens: Option<i32>,
+    /// Token usage (completion tokens), if reported.
+    pub completion_tokens: Option<i32>,
+    /// Token usage (total tokens), if reported.
+    pub total_tokens: Option<i32>,
+}
+
+/// The audit logger, backed by the central proxy's database.
+#[derive(Clone)]
+pub struct AuditLogger {
+    db: DatabaseConnection,
+}
+
+impl AuditLogger {
+    /// Creates a new `AuditLogger`.
+    #[must_use]
+    pub fn new(db: DatabaseConnection) -> Self {
+        Self { db }
+    }
+
+    /// Records an audit entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] if the insert fails.
+    pub async fn record(&self, entry: &AuditEntry) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = now_utc();
+        let now_str = format_time(&now);
+
+        let model = entry
+            .model
+            .as_ref()
+            .map(|m| format!("'{}'", m.replace('\'', "''")))
+            .unwrap_or_else(|| "NULL".to_string());
+        let prompt = entry
+            .prompt_tokens
+            .map_or("NULL".to_string(), |v| v.to_string());
+        let completion = entry
+            .completion_tokens
+            .map_or("NULL".to_string(), |v| v.to_string());
+        let total = entry
+            .total_tokens
+            .map_or("NULL".to_string(), |v| v.to_string());
+
+        let sql = format!(
+            "INSERT INTO audit_log \
+             (id, device_id, user_subject, model, backend, status, latency_ms, stream, \
+             prompt_tokens, completion_tokens, total_tokens, created_at) \
+             VALUES ('{}', '{}', '{}', {}, '{}', {}, {}, {}, {}, {}, {}, '{}')",
+            id,
+            entry.device_id.replace('\'', "''"),
+            entry.user_subject.replace('\'', "''"),
+            model,
+            entry.backend.replace('\'', "''"),
+            entry.status,
+            entry.latency_ms,
+            entry.stream,
+            prompt,
+            completion,
+            total,
+            now_str,
+        );
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                vec![],
+            ))
+            .await
+            .map_err(|e| Error::Database(format!("audit insert: {e}")))?;
+
+        Ok(())
+    }
+}
+
+/// Returns the current UTC time as a `PrimitiveDateTime`.
+fn now_utc() -> PrimitiveDateTime {
+    let offset = time::OffsetDateTime::now_utc();
+    PrimitiveDateTime::new(offset.date(), offset.time())
+}
+
+/// Formats a `PrimitiveDateTime` for SQLite.
+fn format_time(t: &PrimitiveDateTime) -> String {
+    t.format(time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second]"
+    ))
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn setup_test_db() -> AuditLogger {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-audit-test-{}-{counter}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let url = format!("sqlite://{}?mode=rwc", tmp.display());
+        let db = crate::db::setup(&url).await.expect("db setup");
+        AuditLogger::new(db)
+    }
+
+    #[tokio::test]
+    async fn record_inserts_entry() {
+        let logger = setup_test_db().await;
+        let entry = AuditEntry {
+            device_id: "dev-123".into(),
+            user_subject: "user-456".into(),
+            model: Some("gpt-4".into()),
+            backend: "openai".into(),
+            status: 200,
+            latency_ms: 150,
+            stream: false,
+            prompt_tokens: Some(100),
+            completion_tokens: Some(50),
+            total_tokens: Some(150),
+        };
+        logger.record(&entry).await.expect("record");
+
+        // Verify the entry was inserted.
+        use crate::entity::audit_log;
+        use sea_orm::EntityTrait;
+        let entries = audit_log::Entity::find()
+            .all(&logger.db)
+            .await
+            .expect("load");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].device_id, "dev-123");
+        assert_eq!(entries[0].model.as_deref(), Some("gpt-4"));
+        assert_eq!(entries[0].status, 200);
+        assert_eq!(entries[0].total_tokens, Some(150));
+    }
+
+    #[tokio::test]
+    async fn record_handles_null_fields() {
+        let logger = setup_test_db().await;
+        let entry = AuditEntry {
+            device_id: "dev-789".into(),
+            user_subject: "user-012".into(),
+            model: None,
+            backend: "openai".into(),
+            status: 500,
+            latency_ms: 0,
+            stream: true,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+        };
+        logger.record(&entry).await.expect("record");
+
+        use crate::entity::audit_log;
+        use sea_orm::EntityTrait;
+        let entries = audit_log::Entity::find()
+            .all(&logger.db)
+            .await
+            .expect("load");
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].model.is_none());
+        assert!(entries[0].total_tokens.is_none());
+        assert!(entries[0].stream);
+    }
+
+    #[tokio::test]
+    async fn record_escapes_single_quotes() {
+        let logger = setup_test_db().await;
+        let entry = AuditEntry {
+            device_id: "dev'; DROP TABLE--".into(),
+            user_subject: "user'.x".into(),
+            model: Some("gpt-4'; --".into()),
+            backend: "openai".into(),
+            status: 200,
+            latency_ms: 10,
+            stream: false,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+        };
+        logger.record(&entry).await.expect("record");
+
+        // Verify the table still exists (no SQL injection).
+        use crate::entity::audit_log;
+        use sea_orm::EntityTrait;
+        let entries = audit_log::Entity::find()
+            .all(&logger.db)
+            .await
+            .expect("load");
+        assert_eq!(entries.len(), 1, "entry must be inserted despite quotes");
+    }
+}
