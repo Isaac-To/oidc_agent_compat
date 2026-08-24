@@ -10,6 +10,10 @@ repository.workspace = true
 name = "oac-relay"
 path = "src/main.rs"
 
+[lib]
+name = "oac_relay"
+path = "src/lib.rs"
+
 [lints]
 workspace = true
 
@@ -41,6 +45,7 @@ time = { workspace = true }
 keyring = { workspace = true }
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
+bytes = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }

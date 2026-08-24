@@ -38,6 +38,7 @@ fn format_time(t: &PrimitiveDateTime) -> String {
 }
 
 /// A key store backed by the relay's SQLite database.
+#[derive(Clone)]
 pub struct KeyStore {
     /// The database connection (pub(crate) for use in main.rs logout).
     pub db: DatabaseConnection,
