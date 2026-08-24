@@ -83,6 +83,7 @@ pub async fn serve(
         .map_err(|e| oidc_agent_common::error::Error::Http(format!("bind: {e}")))?;
     tracing::info!("central proxy listening on {}", config.listen_addr);
     axum::serve(listener, app)
+        .with_graceful_shutdown(oidc_agent_common::shutdown::shutdown_signal())
         .await
         .map_err(|e| oidc_agent_common::error::Error::Http(format!("serve: {e}")))?;
     Ok(())
