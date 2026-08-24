@@ -1,10 +1,4 @@
-//! The laptop relay component of the OIDC agent compatibility server.
-//!
-//! The relay listens on `127.0.0.1`, authenticates the employee via OIDC
-//! against the enterprise IdP, mints a local API key that is auto-injected
-//! into the agent's config, and forwards agent requests to the central proxy
-//! over mTLS. It holds **no master backend key** — only a short-lived user
-//! token and an mTLS client certificate.
+//! The laptop relay binary entrypoint.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -14,21 +8,14 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-#![cfg_attr(
-    test,
-    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
-)]
-
-pub mod agent_config;
-pub mod db;
-pub mod entity;
-pub mod keystore;
-pub mod login;
-pub mod migration;
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use oac_relay::db;
+use oac_relay::keystore::KeyStore;
+use oac_relay::login;
+use oac_relay::proxy;
 use oidc_agent_common::config::RelayConfig;
 use oidc_agent_common::error::Result;
 
@@ -68,8 +55,8 @@ fn main() -> Result<()> {
     rt.block_on(async {
         match cli.command.unwrap_or(Command::Serve) {
             Command::Serve => serve(config).await,
-            Command::Login => login(config).await,
-            Command::Logout => logout(config).await,
+            Command::Login => login_cmd(config).await,
+            Command::Logout => logout_cmd(config).await,
         }
     })
 }
@@ -83,15 +70,16 @@ fn load_config(path: &std::path::Path) -> Result<RelayConfig> {
 }
 
 /// Starts the relay server.
-async fn serve(_config: RelayConfig) -> Result<()> {
-    println!("oac-relay: serve (not yet implemented — see Phase 3)");
-    Ok(())
+async fn serve(config: RelayConfig) -> Result<()> {
+    let db = db::setup(&config.database_url).await?;
+    let key_store = KeyStore::new(db);
+    proxy::serve(config, key_store).await
 }
 
 /// Runs the OIDC login flow and configures the agent.
-async fn login(config: RelayConfig) -> Result<()> {
+async fn login_cmd(config: RelayConfig) -> Result<()> {
     let db = db::setup(&config.database_url).await?;
-    let key_store = keystore::KeyStore::new(db);
+    let key_store = KeyStore::new(db);
     let result = login::run_login(&config, &key_store).await?;
     println!(
         "oac-relay: login successful for {} (agent config written to {})",
@@ -102,12 +90,11 @@ async fn login(config: RelayConfig) -> Result<()> {
 }
 
 /// Revokes local keys and clears the agent config.
-async fn logout(config: RelayConfig) -> Result<()> {
+async fn logout_cmd(config: RelayConfig) -> Result<()> {
     let db = db::setup(&config.database_url).await?;
-    let key_store = keystore::KeyStore::new(db);
-    // For v1, revoke all keys. Phase 2 will add per-identity selection.
+    let key_store = KeyStore::new(db);
     use sea_orm::EntityTrait;
-    let identities = crate::entity::identity::Entity::find()
+    let identities = oac_relay::entity::identity::Entity::find()
         .all(&key_store.db)
         .await
         .map_err(|e| oidc_agent_common::error::Error::Database(format!("load identities: {e}")))?;
