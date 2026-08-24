@@ -14,7 +14,7 @@
 
 use oidc_agent_common::keys::{KeyHash, LocalKey};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement, Value,
 };
 use time::PrimitiveDateTime;
 use uuid::Uuid;
@@ -88,37 +88,39 @@ impl KeyStore {
             return Ok(model);
         }
 
-        // Create a new identity using raw SQL (SQLite doesn't support
-        // last_insert_id for UUID PKs, so sea-orm's insert() fails).
+        // Create a new identity using parameterized SQL.
         let now = now_utc();
-        let id = Uuid::new_v4();
-        let sql = format!(
-            "INSERT INTO identities (id, issuer, subject, email, display_name, groups, created_at) \
-             VALUES ('{}', '{}', '{}', {}, {}, {}, '{}')",
-            id,
-            issuer.replace('\'', "''"),
-            subject.replace('\'', "''"),
-            email
-                .map(|e| format!("'{}'", e.replace('\'', "''")))
-                .unwrap_or_else(|| "NULL".to_string()),
-            display_name
-                .map(|d| format!("'{}'", d.replace('\'', "''")))
-                .unwrap_or_else(|| "NULL".to_string()),
-            groups
-                .map(|g| format!("'{}'", g.replace('\'', "''")))
-                .unwrap_or_else(|| "NULL".to_string()),
-            format_time(&now),
-        );
+        let id = Uuid::new_v4().to_string();
+        let now_str = format_time(&now);
+        let email_val = email
+            .map(|e| Value::String(Some(Box::new(e.to_string()))))
+            .unwrap_or(Value::String(None));
+        let display_val = display_name
+            .map(|d| Value::String(Some(Box::new(d.to_string()))))
+            .unwrap_or(Value::String(None));
+        let groups_val = groups
+            .map(|g| Value::String(Some(Box::new(g.to_string()))))
+            .unwrap_or(Value::String(None));
+        let sql = "INSERT INTO identities (id, issuer, subject, email, display_name, groups, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)";
         self.db
             .execute(Statement::from_sql_and_values(
                 self.db.get_database_backend(),
                 sql,
-                vec![],
+                vec![
+                    id.clone().into(),
+                    issuer.to_string().into(),
+                    subject.to_string().into(),
+                    email_val,
+                    display_val,
+                    groups_val,
+                    now_str.into(),
+                ],
             ))
             .await
             .map_err(|e| Error::Database(format!("insert identity: {e}")))?;
         Ok(identity::Model {
-            id: id.to_string(),
+            id,
             issuer: issuer.to_string(),
             subject: subject.to_string(),
             email: email.map(String::from),
@@ -143,23 +145,22 @@ impl KeyStore {
         let hash = KeyHash::from_plaintext(&plaintext.to_string());
         let now = now_utc();
         let key_id = Uuid::new_v4().to_string();
+        let now_str = format_time(&now);
 
-        // Raw SQL insert (SQLite doesn't support last_insert_id for UUID PKs).
-        let hash_hex: String = hash.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
-        let sql = format!(
-            "INSERT INTO api_keys (id, identity_id, key_hash, label, created_at, last_used_at) \
-             VALUES ('{}', '{}', X'{}', '{}', '{}', NULL)",
-            key_id,
-            identity_id,
-            hash_hex,
-            label.replace('\'', "''"),
-            format_time(&now),
-        );
+        // Use parameterized SQL to prevent injection.
+        let sql = "INSERT INTO api_keys (id, identity_id, key_hash, label, created_at, last_used_at) \
+             VALUES ($1, $2, $3, $4, $5, NULL)";
         self.db
             .execute(Statement::from_sql_and_values(
                 self.db.get_database_backend(),
                 sql,
-                vec![],
+                vec![
+                    key_id.clone().into(),
+                    identity_id.to_string().into(),
+                    Value::Bytes(Some(Box::new(hash.as_bytes().to_vec()))),
+                    label.to_string().into(),
+                    now_str.into(),
+                ],
             ))
             .await
             .map_err(|e| Error::Database(format!("insert api key: {e}")))?;
@@ -178,8 +179,10 @@ impl KeyStore {
     ///
     /// # Security
     ///
-    /// Hashes all keys and compares in constant time. On a match, updates
-    /// `last_used_at`.
+    /// Iterates through **all** keys and compares each in constant time,
+    /// without early return — this prevents timing leaks that would reveal
+    /// which key index matched (CWE-208). On a match, updates `last_used_at`
+    /// using parameterized SQL.
     ///
     /// # Errors
     ///
@@ -199,37 +202,38 @@ impl KeyStore {
             .await
             .map_err(|e| Error::Database(format!("load keys: {e}")))?;
 
-        for (key, ident) in keys {
+        // Iterate ALL keys without early return to prevent timing leaks.
+        let mut found: Option<(api_key::Model, identity::Model)> = None;
+        for (key, ident) in &keys {
             let stored_hash = KeyHash::from_hash_bytes(&key.key_hash);
-            if stored_hash.matches(&candidate_hash) {
-                // Update last_used_at via raw SQL.
-                let now = now_utc();
-                let sql = format!(
-                    "UPDATE api_keys SET last_used_at = '{}' WHERE id = '{}'",
-                    format_time(&now),
-                    key.id
-                );
-                let _ = self
-                    .db
-                    .execute(Statement::from_sql_and_values(
-                        self.db.get_database_backend(),
-                        sql,
-                        vec![],
-                    ))
-                    .await
-                    .map_err(|e| Error::Database(format!("update last_used_at: {e}")))?;
-
-                let ident = ident.ok_or_else(|| {
+            if stored_hash.matches(&candidate_hash) && found.is_none() {
+                let ident = ident.clone().ok_or_else(|| {
                     Error::Database(format!(
                         "key {} has no associated identity (foreign key violation)",
                         key.id
                     ))
                 })?;
-                return Ok(Some((key, ident)));
+                found = Some((key.clone(), ident));
             }
         }
 
-        Ok(None)
+        // Update last_used_at if we found a match (outside the loop).
+        if let Some((key, _)) = &found {
+            let now = now_utc();
+            let now_str = format_time(&now);
+            let sql = "UPDATE api_keys SET last_used_at = $1 WHERE id = $2";
+            let _ = self
+                .db
+                .execute(Statement::from_sql_and_values(
+                    self.db.get_database_backend(),
+                    sql,
+                    vec![now_str.into(), key.id.clone().into()],
+                ))
+                .await
+                .map_err(|e| Error::Database(format!("update last_used_at: {e}")))?;
+        }
+
+        Ok(found)
     }
 
     /// Revokes (deletes) all keys for the given identity.

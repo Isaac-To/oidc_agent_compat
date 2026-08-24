@@ -10,7 +10,7 @@
 //! - No secrets (master key, bearer tokens) are ever logged.
 //! - The log records who made the request, when, and what it cost.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement};
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
 use time::PrimitiveDateTime;
 use uuid::Uuid;
 
@@ -56,6 +56,11 @@ impl AuditLogger {
 
     /// Records an audit entry.
     ///
+    /// # Security
+    ///
+    /// Uses parameterized queries to prevent SQL injection. No user-supplied
+    /// data is interpolated into the SQL string.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Database`] if the insert fails.
@@ -64,45 +69,39 @@ impl AuditLogger {
         let now = now_utc();
         let now_str = format_time(&now);
 
-        let model = entry
+        // Use parameterized values — no string interpolation into SQL.
+        let model_value = entry
             .model
             .as_ref()
-            .map(|m| format!("'{}'", m.replace('\'', "''")))
-            .unwrap_or_else(|| "NULL".to_string());
-        let prompt = entry
-            .prompt_tokens
-            .map_or("NULL".to_string(), |v| v.to_string());
-        let completion = entry
-            .completion_tokens
-            .map_or("NULL".to_string(), |v| v.to_string());
-        let total = entry
-            .total_tokens
-            .map_or("NULL".to_string(), |v| v.to_string());
+            .map(|m| Value::String(Some(Box::new(m.clone()))))
+            .unwrap_or(Value::String(None));
+        let prompt_value = Value::Int(entry.prompt_tokens);
+        let completion_value = Value::Int(entry.completion_tokens);
+        let total_value = Value::Int(entry.total_tokens);
 
-        let sql = format!(
-            "INSERT INTO audit_log \
+        let sql = "INSERT INTO audit_log \
              (id, device_id, user_subject, model, backend, status, latency_ms, stream, \
              prompt_tokens, completion_tokens, total_tokens, created_at) \
-             VALUES ('{}', '{}', '{}', {}, '{}', {}, {}, {}, {}, {}, {}, '{}')",
-            id,
-            entry.device_id.replace('\'', "''"),
-            entry.user_subject.replace('\'', "''"),
-            model,
-            entry.backend.replace('\'', "''"),
-            entry.status,
-            entry.latency_ms,
-            entry.stream,
-            prompt,
-            completion,
-            total,
-            now_str,
-        );
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
 
         self.db
             .execute(Statement::from_sql_and_values(
                 self.db.get_database_backend(),
                 sql,
-                vec![],
+                vec![
+                    id.into(),
+                    entry.device_id.clone().into(),
+                    entry.user_subject.clone().into(),
+                    model_value,
+                    entry.backend.clone().into(),
+                    Value::Int(Some(entry.status)),
+                    Value::BigInt(Some(entry.latency_ms)),
+                    Value::Bool(Some(entry.stream)),
+                    prompt_value,
+                    completion_value,
+                    total_value,
+                    now_str.into(),
+                ],
             ))
             .await
             .map_err(|e| Error::Database(format!("audit insert: {e}")))?;

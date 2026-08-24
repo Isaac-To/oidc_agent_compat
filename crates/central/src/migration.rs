@@ -76,6 +76,26 @@ impl MigrationTrait for Migration {
             )
             .await?;
 
+        // Create an append-only trigger on the audit_log table (SQLite).
+        // This prevents UPDATE and DELETE operations, enforcing tamper-
+        // evidence at the database level.
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE TRIGGER IF NOT EXISTS audit_log_no_update \
+                 BEFORE UPDATE ON audit_log \
+                 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE TRIGGER IF NOT EXISTS audit_log_no_delete \
+                 BEFORE DELETE ON audit_log \
+                 BEGIN SELECT RAISE(ABORT, 'audit_log is append-only'); END;",
+            )
+            .await?;
+
         Ok(())
     }
 
