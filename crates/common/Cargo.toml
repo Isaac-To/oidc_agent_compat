@@ -1,0 +1,31 @@
+[package]
+name = "oidc-agent-common"
+description = "Shared types, crypto helpers, OIDC client builder, mTLS helpers, and config for the OIDC agent compatibility server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+openidconnect = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+subtle = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }

@@ -1,0 +1,54 @@
+# OIDC Agent Compatibility Server — Example Configuration
+#
+# Copy this file to config.toml and edit for your environment.
+# NEVER commit config.toml — it is gitignored.
+
+# ─── Relay configuration (laptop) ───────────────────────────────────────────
+# The relay listens on loopback only. The agent (Codex, etc.) points at this
+# address. 127.0.0.1 is required; 0.0.0.0 is rejected.
+
+# [relay]
+# listen_addr = "127.0.0.1:8787"
+# database_url = "sqlite://~/.oac/relay.db"
+#
+# [relay.oidc]
+# issuer = "https://idp.example.com"
+# client_id = "oac-relay"
+# # The env var holding the OIDC client secret (never a literal here):
+# client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+# redirect_uri = "http://127.0.0.1:0/callback"
+# scopes = ["openid", "email", "profile"]
+#
+# [relay.central]
+# url = "https://central.example.com"
+# ca_cert_path = "/etc/oac/ca.pem"
+# client_cert_path = "~/.oac/client.pem"
+# client_key_path = "~/.oac/client.key"
+
+# ─── Central proxy configuration (company-hosted) ───────────────────────────
+# The central proxy holds the master backend key in a secret manager and
+# forwards relay requests to the OpenAI-compatible backend.
+
+# [central]
+# listen_addr = "0.0.0.0:8443"
+# database_url = "postgres://central.example.com/oac"
+#
+# [central.oidc]
+# issuer = "https://idp.example.com"
+# client_id = "oac-central"
+# client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+# redirect_uri = "http://127.0.0.1:0/callback"
+# scopes = ["openid"]
+#
+# [central.backend]
+# name = "openai"
+# base_url = "https://api.openai.com"
+#
+# [central.mtls]
+# ca_cert_path = "/etc/oac/ca.pem"
+# server_cert_path = "/etc/oac/server.pem"
+# server_key_path = "/etc/oac/server.key"
+#
+# [central.secret_store]
+# kind = "vault"   # vault | aws | gcp | azure
+# path = "secret/data/oac/master-key"

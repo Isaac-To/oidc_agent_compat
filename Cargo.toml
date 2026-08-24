@@ -1,0 +1,88 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/relay",
+    "crates/central",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/iato/oidc-agent-compat"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+todo = "warn"
+dbg_macro = "warn"
+
+[workspace.dependencies]
+# Web server
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout", "limit"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# OIDC
+openidconnect = "4"
+
+# TLS
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+
+# OpenAI types (types only)
+async-openai = { version = "0.41", default-features = false, features = ["types"] }
+
+# Persistence
+sea-orm = { version = "1", default-features = false, features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+sea-orm-migration = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7"
+
+# OS keychain
+keyring = "3"
+
+# Serde / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Crypto
+subtle = "2"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+
+# Errors
+thiserror = "2"
+anyhow = "1"
+
+# Time
+time = "0.3"
+
+# Internal
+oidc-agent-common = { path = "crates/common" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

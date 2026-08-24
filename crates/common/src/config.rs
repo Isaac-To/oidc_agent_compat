@@ -1,0 +1,414 @@
+//! Configuration structs and validation for both components.
+//!
+//! The relay and the central proxy each load a TOML config file at startup.
+//! This module defines the schema, parses it, and validates it before the
+//! component starts serving traffic.
+//!
+//! # Security
+//!
+//! - The relay rejects `0.0.0.0` as a listen address (must be loopback).
+//! - Secrets are never stored as literals in config; the OIDC client secret
+//!   is referenced by environment-variable name (`client_secret_env`), and
+//!   the backend master key lives in the secret manager (not in config).
+//!
+//! # Example (relay)
+//!
+//! ```toml
+//! listen_addr = "127.0.0.1:8787"
+//! database_url = "sqlite://~/.oidc-agent-compat/relay.db"
+//!
+//! [oidc]
+//! issuer = "https://idp.example.com"
+//! client_id = "relay-client"
+//! client_secret_env = "OIDC_CLIENT_SECRET"
+//! redirect_uri = "http://127.0.0.1:0/callback"
+//! scopes = ["openid", "email", "profile"]
+//!
+//! [central]
+//! url = "https://central.example.com"
+//! ca_cert_path = "/etc/oac/ca.pem"
+//! client_cert_path = "~/.oac/client.pem"
+//! client_key_path = "~/.oac/client.key"
+//! ```
+
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
+
+/// Configuration for the laptop relay component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayConfig {
+    /// The loopback address to listen on (e.g. `127.0.0.1:8787`).
+    pub listen_addr: SocketAddr,
+    /// The database URL (SQLite for v1, e.g. `sqlite://~/.oac/relay.db`).
+    pub database_url: String,
+    /// OIDC relying-party settings.
+    pub oidc: OidcConfig,
+    /// Central proxy connection settings (mTLS).
+    pub central: CentralConnectionConfig,
+}
+
+/// Configuration for the central proxy component.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CentralConfig {
+    /// The address to listen on (e.g. `0.0.0.0:8443` behind a load balancer).
+    pub listen_addr: SocketAddr,
+    /// The database URL (Postgres for prod, SQLite for dev).
+    pub database_url: String,
+    /// OIDC relying-party settings (for token validation).
+    pub oidc: OidcConfig,
+    /// The backend to forward requests to.
+    pub backend: BackendConfig,
+    /// mTLS server settings.
+    pub mtls: MtlsServerConfig,
+    /// Secret-manager settings for the master key.
+    pub secret_store: SecretStoreConfig,
+}
+
+/// OIDC relying-party configuration shared by both components.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// The issuer URL (e.g. `https://idp.example.com`).
+    pub issuer: String,
+    /// The client ID registered with the IdP.
+    pub client_id: String,
+    /// The name of the environment variable holding the client secret.
+    pub client_secret_env: String,
+    /// The redirect URI (loopback, e.g. `http://127.0.0.1:0/callback`).
+    pub redirect_uri: String,
+    /// The OIDC scopes to request.
+    pub scopes: Vec<String>,
+}
+
+/// Central proxy connection settings for the relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CentralConnectionConfig {
+    /// The central proxy URL (e.g. `https://central.example.com`).
+    pub url: String,
+    /// Path to the company CA certificate (PEM).
+    pub ca_cert_path: PathBuf,
+    /// Path to the relay's mTLS client certificate (PEM).
+    pub client_cert_path: PathBuf,
+    /// Path to the relay's mTLS client private key (PEM).
+    pub client_key_path: PathBuf,
+}
+
+/// Backend configuration for the central proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendConfig {
+    /// A human-readable name for the backend.
+    pub name: String,
+    /// The base URL of the OpenAI-compatible backend.
+    pub base_url: String,
+}
+
+/// mTLS server configuration for the central proxy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MtlsServerConfig {
+    /// Path to the company CA certificate (PEM).
+    pub ca_cert_path: PathBuf,
+    /// Path to the server certificate (PEM).
+    pub server_cert_path: PathBuf,
+    /// Path to the server private key (PEM).
+    pub server_key_path: PathBuf,
+}
+
+/// Secret-manager configuration for the master backend key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretStoreConfig {
+    /// The secret-store backend kind.
+    #[serde(rename = "kind")]
+    pub kind: SecretStoreKind,
+    /// The path or address of the secret (e.g. Vault path, AWS secret ARN).
+    pub path: String,
+}
+
+/// Supported secret-store backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretStoreKind {
+    /// HashiCorp Vault.
+    Vault,
+    /// AWS Secrets Manager.
+    Aws,
+    /// Google Cloud Secret Manager.
+    Gcp,
+    /// Azure Key Vault.
+    Azure,
+}
+
+impl RelayConfig {
+    /// Parses a `RelayConfig` from a TOML string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if the TOML is malformed or fails validation.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use oidc_agent_common::config::RelayConfig;
+    /// let toml = r#"
+    /// listen_addr = "127.0.0.1:8787"
+    /// database_url = "sqlite://relay.db"
+    /// [oidc]
+    /// issuer = "https://idp.example.com"
+    /// client_id = "relay"
+    /// client_secret_env = "SECRET"
+    /// redirect_uri = "http://127.0.0.1:0/callback"
+    /// scopes = ["openid"]
+    /// [central]
+    /// url = "https://central.example.com"
+    /// ca_cert_path = "/ca.pem"
+    /// client_cert_path = "/client.pem"
+    /// client_key_path = "/client.key"
+    /// "#;
+    /// let cfg = RelayConfig::from_toml(toml).unwrap();
+    /// assert_eq!(cfg.listen_addr.port(), 8787);
+    /// ```
+    pub fn from_toml(toml_str: &str) -> Result<Self> {
+        let cfg: Self =
+            toml::from_str(toml_str).map_err(|e| Error::Config(format!("toml parse: {e}")))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validates the config, returning an error if any field is invalid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if:
+    /// - `listen_addr` is not a loopback address.
+    /// - `oidc.issuer` is empty or not a valid URL.
+    /// - `oidc.client_id` is empty.
+    /// - `oidc.client_secret_env` is empty.
+    /// - `oidc.redirect_uri` does not start with `http://127.0.0.1`.
+    /// - `central.url` is empty or not `https://`.
+    pub fn validate(&self) -> Result<()> {
+        validate_loopback(&self.listen_addr)?;
+        validate_oidc(&self.oidc)?;
+        validate_central_url(&self.central.url)?;
+        Ok(())
+    }
+}
+
+impl CentralConfig {
+    /// Parses a `CentralConfig` from a TOML string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if the TOML is malformed or fails validation.
+    pub fn from_toml(toml_str: &str) -> Result<Self> {
+        let cfg: Self =
+            toml::from_str(toml_str).map_err(|e| Error::Config(format!("toml parse: {e}")))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validates the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if OIDC fields are invalid or the backend
+    /// base URL is empty.
+    pub fn validate(&self) -> Result<()> {
+        validate_oidc(&self.oidc)?;
+        if self.backend.base_url.is_empty() {
+            return Err(Error::Config("backend.base_url must not be empty".into()));
+        }
+        if self.backend.name.is_empty() {
+            return Err(Error::Config("backend.name must not be empty".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Validates that a socket address is loopback (127.0.0.0/8 or ::1).
+fn validate_loopback(addr: &SocketAddr) -> Result<()> {
+    if !addr.ip().is_loopback() {
+        return Err(Error::Config(format!(
+            "listen_addr {addr} must be a loopback address (127.0.0.0/8 or ::1); \
+             binding to non-loopback addresses is forbidden for the relay"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates OIDC config fields.
+fn validate_oidc(oidc: &OidcConfig) -> Result<()> {
+    if oidc.issuer.is_empty() {
+        return Err(Error::Config("oidc.issuer must not be empty".into()));
+    }
+    if !oidc.issuer.starts_with("https://") && !oidc.issuer.starts_with("http://") {
+        return Err(Error::Config(format!(
+            "oidc.issuer must be an http(s) URL, got: {}",
+            oidc.issuer
+        )));
+    }
+    if oidc.client_id.is_empty() {
+        return Err(Error::Config("oidc.client_id must not be empty".into()));
+    }
+    if oidc.client_secret_env.is_empty() {
+        return Err(Error::Config(
+            "oidc.client_secret_env must not be empty".into(),
+        ));
+    }
+    if !oidc.redirect_uri.starts_with("http://127.0.0.1") {
+        return Err(Error::Config(format!(
+            "oidc.redirect_uri must be a loopback http URL (http://127.0.0.1:...), got: {}",
+            oidc.redirect_uri
+        )));
+    }
+    Ok(())
+}
+
+/// Validates the central proxy URL is https.
+fn validate_central_url(url: &str) -> Result<()> {
+    if url.is_empty() {
+        return Err(Error::Config("central.url must not be empty".into()));
+    }
+    if !url.starts_with("https://") {
+        return Err(Error::Config(format!(
+            "central.url must be https://, got: {url}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_relay_toml() -> &'static str {
+        r#"
+listen_addr = "127.0.0.1:8787"
+database_url = "sqlite://relay.db"
+[oidc]
+issuer = "https://idp.example.com"
+client_id = "relay"
+client_secret_env = "SECRET"
+redirect_uri = "http://127.0.0.1:0/callback"
+scopes = ["openid", "email"]
+[central]
+url = "https://central.example.com"
+ca_cert_path = "/ca.pem"
+client_cert_path = "/client.pem"
+client_key_path = "/client.key"
+"#
+    }
+
+    fn valid_central_toml() -> &'static str {
+        r#"
+listen_addr = "0.0.0.0:8443"
+database_url = "postgres://central"
+[oidc]
+issuer = "https://idp.example.com"
+client_id = "central"
+client_secret_env = "SECRET"
+redirect_uri = "http://127.0.0.1:0/callback"
+scopes = ["openid"]
+[backend]
+name = "openai"
+base_url = "https://api.openai.com"
+[mtls]
+ca_cert_path = "/ca.pem"
+server_cert_path = "/server.pem"
+server_key_path = "/server.key"
+[secret_store]
+kind = "vault"
+path = "secret/data/oac/master-key"
+"#
+    }
+
+    #[test]
+    fn relay_config_parses_valid_toml() {
+        let cfg = RelayConfig::from_toml(valid_relay_toml()).expect("valid config");
+        assert_eq!(cfg.listen_addr.port(), 8787);
+        assert_eq!(cfg.oidc.client_id, "relay");
+        assert_eq!(cfg.central.url, "https://central.example.com");
+    }
+
+    #[test]
+    fn central_config_parses_valid_toml() {
+        let cfg = CentralConfig::from_toml(valid_central_toml()).expect("valid config");
+        assert_eq!(cfg.backend.name, "openai");
+        assert_eq!(cfg.secret_store.kind, SecretStoreKind::Vault);
+    }
+
+    #[test]
+    fn relay_rejects_non_loopback_listen_addr() {
+        let toml = valid_relay_toml().replace("127.0.0.1:8787", "0.0.0.0:8787");
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn relay_rejects_empty_issuer() {
+        let toml = valid_relay_toml().replace("https://idp.example.com", "");
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("issuer"), "{err}");
+    }
+
+    #[test]
+    fn relay_rejects_non_http_issuer() {
+        let toml = valid_relay_toml().replace("https://idp.example.com", "ftp://bad");
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("http(s)"), "{err}");
+    }
+
+    #[test]
+    fn relay_rejects_non_loopback_redirect_uri() {
+        let toml = valid_relay_toml().replace(
+            "http://127.0.0.1:0/callback",
+            "https://evil.example.com/callback",
+        );
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn relay_rejects_non_https_central_url() {
+        let toml = valid_relay_toml().replace("https://central.example.com", "http://central");
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("https"), "{err}");
+    }
+
+    #[test]
+    fn relay_rejects_empty_client_id() {
+        let toml = valid_relay_toml().replace("client_id = \"relay\"", "client_id = \"\"");
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("client_id"), "{err}");
+    }
+
+    #[test]
+    fn central_rejects_empty_backend_name() {
+        let toml = valid_central_toml().replace("name = \"openai\"", "name = \"\"");
+        let err = CentralConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("backend.name"), "{err}");
+    }
+
+    #[test]
+    fn central_rejects_empty_backend_url() {
+        let toml = valid_central_toml()
+            .replace("base_url = \"https://api.openai.com\"", "base_url = \"\"");
+        let err = CentralConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("backend.base_url"), "{err}");
+    }
+
+    #[test]
+    fn secret_store_kind_serializes_lowercase() {
+        let toml = valid_central_toml();
+        let cfg = CentralConfig::from_toml(toml).unwrap();
+        let reserialized = toml::to_string(&cfg.secret_store).unwrap();
+        assert!(reserialized.contains("kind = \"vault\""), "{reserialized}");
+    }
+
+    #[test]
+    fn malformed_toml_returns_config_error() {
+        let err = RelayConfig::from_toml("not valid toml {{{").unwrap_err();
+        assert!(err.to_string().contains("toml parse"), "{err}");
+    }
+}

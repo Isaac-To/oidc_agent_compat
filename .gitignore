@@ -1,0 +1,17 @@
+/target
+
+# Secrets and local state — never commit
+config.toml
+*.db
+*.db-shm
+*.db-wal
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Editor
+.vscode/
+.idea/
+*.swp
