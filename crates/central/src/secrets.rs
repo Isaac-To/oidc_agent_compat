@@ -62,16 +62,34 @@ impl FileSecretStore {
 #[async_trait::async_trait]
 impl SecretStore for FileSecretStore {
     async fn load_master_key(&self) -> Result<Zeroizing<String>> {
-        let contents = std::fs::read_to_string(&self.path)
-            .map_err(|e| Error::SecretStore(format!("read {}: {e}", self.path.display())))?;
-        let trimmed = contents.trim().to_string();
+        // Enforce 0600 permissions on read (Unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(&self.path)
+                .map_err(|e| Error::SecretStore(format!("stat {}: {e}", self.path.display())))?;
+            let mode = metadata.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                return Err(Error::SecretStore(format!(
+                    "master key file {} has permissions {mode:o}; expected 0600",
+                    self.path.display()
+                )));
+            }
+        }
+
+        // Read into Zeroizing memory directly — no intermediate plain String.
+        let contents = Zeroizing::new(
+            std::fs::read_to_string(&self.path)
+                .map_err(|e| Error::SecretStore(format!("read {}: {e}", self.path.display())))?,
+        );
+        let trimmed = Zeroizing::new(contents.trim().to_string());
         if trimmed.is_empty() {
             return Err(Error::SecretStore(format!(
                 "master key file {} is empty",
                 self.path.display()
             )));
         }
-        Ok(Zeroizing::new(trimmed))
+        Ok(trimmed)
     }
 
     async fn store_master_key(&self, key: &str) -> Result<()> {

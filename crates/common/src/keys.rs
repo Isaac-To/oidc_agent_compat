@@ -228,17 +228,20 @@ impl HmacKeyHash {
 /// use oidc_agent_common::keys::extract_bearer;
 /// assert_eq!(extract_bearer("Bearer oac_abc"), Some("oac_abc"));
 /// assert_eq!(extract_bearer("bearer oac_abc"), Some("oac_abc"));
+/// assert_eq!(extract_bearer("BEARER oac_abc"), Some("oac_abc"));
+/// assert_eq!(extract_bearer("BeArEr oac_abc"), Some("oac_abc"));
 /// assert_eq!(extract_bearer("Basic xyz"), None);
 /// assert_eq!(extract_bearer(""), None);
 /// ```
 #[must_use]
 pub fn extract_bearer(header_value: &str) -> Option<&str> {
     let trimmed = header_value.trim();
-    // Case-insensitive "Bearer " prefix.
-    let rest = trimmed
-        .strip_prefix("Bearer ")
-        .or_else(|| trimmed.strip_prefix("bearer "))
-        .or_else(|| trimmed.strip_prefix("BEARER "))?;
+    // RFC 7235: the auth scheme is case-insensitive. Split on the first
+    // whitespace and check the scheme case-insensitively.
+    let (scheme, rest) = trimmed.split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
     let token = rest.trim();
     if token.is_empty() { None } else { Some(token) }
 }
@@ -341,6 +344,8 @@ mod tests {
         assert_eq!(extract_bearer("Bearer oac_abc"), Some("oac_abc"));
         assert_eq!(extract_bearer("bearer oac_abc"), Some("oac_abc"));
         assert_eq!(extract_bearer("BEARER oac_abc"), Some("oac_abc"));
+        assert_eq!(extract_bearer("BeArEr oac_abc"), Some("oac_abc"));
+        assert_eq!(extract_bearer("bEaReR oac_abc"), Some("oac_abc"));
     }
 
     #[test]

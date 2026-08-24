@@ -64,6 +64,9 @@ pub fn build_client(_config: &RelayConfig) -> Result<reqwest::Client> {
     // client_cert_path, client_key_path} once we have test certs.
     reqwest::Client::builder()
         .use_rustls_tls()
+        // Never follow redirects — prevents SSRF amplification if the central
+        // returns a redirect to an internal service.
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(300))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
@@ -142,18 +145,22 @@ async fn forward_request(
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
 
-    // Check if this is a streaming response (SSE).
+    // Check if this is a streaming response (SSE). Content-Type values are
+    // case-insensitive per RFC 7231 §3.1.1.1.
     let content_type = resp_headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let is_stream = content_type.contains("text/event-stream");
+    let is_stream = content_type.to_lowercase().contains("text/event-stream");
 
     let mut response_builder = Response::builder().status(status);
     for (name, value) in &resp_headers {
         // Strip hop-by-hop headers from the response too.
         let name_lower = name.as_str().to_lowercase();
-        if !HOP_BY_HOP_HEADERS.contains(&name_lower.as_str()) {
+        // Also strip Content-Length — Axum recomputes it from the actual body,
+        // and the upstream's Content-Length is wrong for streaming responses
+        // (where the body is re-framed by bytes_stream()).
+        if !HOP_BY_HOP_HEADERS.contains(&name_lower.as_str()) && name_lower != "content-length" {
             response_builder = response_builder.header(name, value);
         }
     }
@@ -177,16 +184,29 @@ async fn forward_request(
     }
 }
 
-/// Sanitizes the request path to prevent SSRF.
+/// Sanitizes the request path to prevent SSRF and path traversal.
 ///
-/// Rejects paths containing `..`, `//`, or absolute URLs.
+/// Rejects paths containing:
+/// - `..` (literal or URL-encoded as `%2e%2e` or `%2E%2E`)
+/// - `//` (double slashes)
+/// - `\` (backslashes, which some upstreams normalize to `/`)
+/// - Absolute URLs (`http://` or `https://`)
 ///
 /// # Errors
 ///
 /// Returns [`Error::Http`] if the path is unsafe.
 fn sanitize_path(path: &str) -> Result<String> {
+    // Reject literal `..` and backslashes.
     if path.contains("..") {
         return Err(Error::Http(format!("path contains '..': {path}")));
+    }
+    if path.contains('\\') {
+        return Err(Error::Http(format!("path contains backslash: {path}")));
+    }
+    // Reject URL-encoded `..` (%2e%2e, case-insensitive).
+    let path_lower = path.to_lowercase();
+    if path_lower.contains("%2e%2e") || path_lower.contains("%2e.") || path_lower.contains(".%2e") {
+        return Err(Error::Http(format!("path contains encoded '..': {path}")));
     }
     if path.contains("//") {
         return Err(Error::Http(format!("path contains '//': {path}")));
@@ -241,6 +261,19 @@ mod tests {
     #[test]
     fn sanitize_path_rejects_dot_dot() {
         assert!(sanitize_path("/v1/../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn sanitize_path_rejects_url_encoded_dot_dot() {
+        assert!(sanitize_path("/v1/%2e%2e/etc/passwd").is_err());
+        assert!(sanitize_path("/v1/%2E%2E/etc/passwd").is_err());
+        assert!(sanitize_path("/v1/%2e./etc/passwd").is_err());
+        assert!(sanitize_path("/v1/.%2e/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn sanitize_path_rejects_backslash() {
+        assert!(sanitize_path("/v1/\\..\\etc/passwd").is_err());
     }
 
     #[test]
