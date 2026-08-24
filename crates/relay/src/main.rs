@@ -23,6 +23,7 @@ pub mod agent_config;
 pub mod db;
 pub mod entity;
 pub mod keystore;
+pub mod login;
 pub mod migration;
 
 use std::path::PathBuf;
@@ -59,11 +60,18 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = load_config(&cli.config)?;
 
-    match cli.command.unwrap_or(Command::Serve) {
-        Command::Serve => serve(config),
-        Command::Login => login(config),
-        Command::Logout => logout(config),
-    }
+    // Initialize logging.
+    let _ = oidc_agent_common::logging::init();
+
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| oidc_agent_common::error::Error::Internal(format!("tokio runtime: {e}")))?;
+    rt.block_on(async {
+        match cli.command.unwrap_or(Command::Serve) {
+            Command::Serve => serve(config).await,
+            Command::Login => login(config).await,
+            Command::Logout => logout(config).await,
+        }
+    })
 }
 
 /// Loads the relay config from the given path.
@@ -75,19 +83,42 @@ fn load_config(path: &std::path::Path) -> Result<RelayConfig> {
 }
 
 /// Starts the relay server.
-fn serve(_config: RelayConfig) -> Result<()> {
+async fn serve(_config: RelayConfig) -> Result<()> {
     println!("oac-relay: serve (not yet implemented — see Phase 3)");
     Ok(())
 }
 
 /// Runs the OIDC login flow and configures the agent.
-fn login(_config: RelayConfig) -> Result<()> {
-    println!("oac-relay: login (not yet implemented — see Phase 2)");
+async fn login(config: RelayConfig) -> Result<()> {
+    let db = db::setup(&config.database_url).await?;
+    let key_store = keystore::KeyStore::new(db);
+    let result = login::run_login(&config, &key_store).await?;
+    println!(
+        "oac-relay: login successful for {} (agent config written to {})",
+        result.email.as_deref().unwrap_or(&result.subject),
+        result.injection.path.display()
+    );
     Ok(())
 }
 
 /// Revokes local keys and clears the agent config.
-fn logout(_config: RelayConfig) -> Result<()> {
-    println!("oac-relay: logout (not yet implemented)");
+async fn logout(config: RelayConfig) -> Result<()> {
+    let db = db::setup(&config.database_url).await?;
+    let key_store = keystore::KeyStore::new(db);
+    // For v1, revoke all keys. Phase 2 will add per-identity selection.
+    use sea_orm::EntityTrait;
+    let identities = crate::entity::identity::Entity::find()
+        .all(&key_store.db)
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Database(format!("load identities: {e}")))?;
+    let mut total = 0;
+    for ident in identities {
+        total += key_store
+            .revoke_all_keys(&ident.id)
+            .await
+            .map(|n| n as usize)
+            .unwrap_or(0);
+    }
+    println!("oac-relay: revoked {total} key(s)");
     Ok(())
 }
