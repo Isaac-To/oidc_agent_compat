@@ -19,6 +19,7 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod agent_config;
 pub mod db;
 pub mod entity;
 pub mod keystore;
