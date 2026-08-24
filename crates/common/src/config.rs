@@ -49,6 +49,10 @@ pub struct RelayConfig {
     pub oidc: OidcConfig,
     /// Central proxy connection settings (mTLS).
     pub central: CentralConnectionConfig,
+    /// When true, allows non-loopback listen addresses (for containerized
+    /// dev environments). Defaults to false for production safety.
+    #[serde(default)]
+    pub dev_mode: bool,
 }
 
 /// Configuration for the central proxy component.
@@ -184,16 +188,20 @@ impl RelayConfig {
     /// # Errors
     ///
     /// Returns [`Error::Config`] if:
-    /// - `listen_addr` is not a loopback address.
+    /// - `listen_addr` is not a loopback address (unless `dev_mode` is true).
     /// - `oidc.issuer` is empty or not a valid URL.
     /// - `oidc.client_id` is empty.
     /// - `oidc.client_secret_env` is empty.
     /// - `oidc.redirect_uri` does not start with `http://127.0.0.1`.
     /// - `central.url` is empty or not `https://`.
     pub fn validate(&self) -> Result<()> {
-        validate_loopback(&self.listen_addr)?;
+        if !self.dev_mode {
+            validate_loopback(&self.listen_addr)?;
+        }
         validate_oidc(&self.oidc)?;
-        validate_central_url(&self.central.url)?;
+        if !self.dev_mode {
+            validate_central_url(&self.central.url)?;
+        }
         Ok(())
     }
 }
@@ -346,6 +354,22 @@ path = "secret/data/oac/master-key"
         let toml = valid_relay_toml().replace("127.0.0.1:8787", "0.0.0.0:8787");
         let err = RelayConfig::from_toml(&toml).unwrap_err();
         assert!(err.to_string().contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn relay_dev_mode_allows_non_loopback() {
+        let toml = valid_relay_toml()
+            .replace("127.0.0.1:8787", "0.0.0.0:8787")
+            .replace(
+                "database_url = \"sqlite://relay.db\"",
+                "database_url = \"sqlite://relay.db\"\ndev_mode = true",
+            );
+        let cfg = RelayConfig::from_toml(&toml).expect("dev_mode allows non-loopback");
+        assert_eq!(
+            cfg.listen_addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+        assert!(cfg.dev_mode);
     }
 
     #[test]

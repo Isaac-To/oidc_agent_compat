@@ -1,6 +1,6 @@
-# Central proxy config for Docker dev stack
-# The central proxy runs inside Docker, holds the master key in a file
-# (dev only), and forwards to the mock backend.
+# Central proxy config for Docker dev stack.
+# Runs inside Docker, holds the master key in a file (dev only),
+# and forwards to the mock backend.
 
 listen_addr = "0.0.0.0:8443"
 database_url = "sqlite:///data/central.db"
