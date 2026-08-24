@@ -1,25 +1,27 @@
 # Docker Dev Stack
 
-A complete development environment for the OIDC Agent Compatibility Server,
-using open-source components. This is the primary development environment.
+A complete development environment for the OIDC Agent Compatibility Server.
+**Everything runs in Docker containers** — no host dependencies beyond Docker
+itself. Goose runs on the host (it's a desktop app) and connects to the relay
+at `127.0.0.1:8787`.
 
 ## Architecture
 
 ```
-Goose (host) → relay (host, 127.0.0.1:8787) → mTLS → central (Docker, :8443) → mock-backend (Docker, :8090)
-                                                   ↑ master key (file, dev only)
+Goose (host) → relay (Docker, 127.0.0.1:8787) → central (Docker, :8443) → mock-backend (Docker, :8090)
+                                               ↑ master key (file, dev only)
                     ↑ OIDC (browser)
               Keycloak (Docker, :8080)
 ```
 
 ## Services
 
-| Service | Port | Description |
-|---|---|---|
-| Keycloak | `http://localhost:8080` | OIDC IdP with pre-configured realm `oac-dev` |
-| Mock backend | `http://localhost:8090` | OpenAI-compatible Flask server returning fixed responses |
-| Central proxy | `https://localhost:8443` | Holds the master key, forwards to mock-backend |
-| Relay | `http://127.0.0.1:8787` | Runs on the host; Goose connects here |
+| Service | Container | Port | Description |
+|---|---|---|---|
+| Keycloak | `keycloak` | `localhost:8080` | OIDC IdP with pre-configured realm `oac-dev` |
+| Mock backend | `mock-backend` | `localhost:8090` | OpenAI-compatible Flask server |
+| Central proxy | `central` | `localhost:8443` | Holds the master key, forwards to mock-backend |
+| Relay | `relay` | `127.0.0.1:8787` | Forwards to central; Goose connects here |
 
 ## Test Users
 
@@ -37,22 +39,19 @@ Keycloak admin console: `http://localhost:8080/admin` (admin / admin)
 ## Quick Start
 
 ```sh
-# 1. Start everything (generates certs, builds Docker images, starts relay)
+# 1. Start everything (generates certs, builds images, starts all containers)
 ./docker/dev.sh up
 
-# 2. Authenticate via OIDC (opens browser — log in as alice/alice-pass-123)
-./docker/dev.sh login
-
-# 3. Configure Goose to use the relay
+# 2. Configure Goose to use the relay
 ./docker/dev.sh goose
 
-# 4. Set the API key from the login output
-export LOCAL_RELAY_API_KEY="<key from step 2>"
+# 3. Set the API key (dev test key for now)
+export LOCAL_RELAY_API_KEY="oac_dev_test_key"
 
-# 5. Run a test request through the full chain
+# 4. Run infrastructure tests
 ./docker/dev.sh test
 
-# 6. Start Goose
+# 5. Start Goose
 goose session
 ```
 
@@ -60,10 +59,11 @@ goose session
 
 | Command | Description |
 |---|---|
-| `./docker/dev.sh up` | Generate certs, start Docker stack, build + start relay |
-| `./docker/dev.sh down` | Stop everything |
-| `./docker/dev.sh status` | Show status of all services |
-| `./docker/dev.sh login` | Run OIDC login (opens browser) |
+| `./docker/dev.sh up` | Generate certs, build and start all containers |
+| `./docker/dev.sh down` | Stop all containers |
+| `./docker/dev.sh status` | Show container status |
+| `./docker/dev.sh logs` | Tail logs from all services |
+| `./docker/dev.sh shell` | Open a shell in the relay container |
 | `./docker/dev.sh goose` | Configure Goose to use the relay |
 | `./docker/dev.sh test` | Send test requests through the full chain |
 
@@ -72,8 +72,7 @@ goose session
 `./docker/dev.sh goose` creates a custom provider at
 `~/.config/goose/custom_providers/local_relay.json` that points Goose at
 `http://127.0.0.1:8787/v1/chat/completions`. The API key is read from the
-`LOCAL_RELAY_API_KEY` environment variable (set it to the key printed by
-`./docker/dev.sh login`).
+`LOCAL_RELAY_API_KEY` environment variable.
 
 ## Manual Operations
 
@@ -82,9 +81,6 @@ goose session
 ```sh
 ./docker/generate-certs.sh
 ```
-
-Certificates are written to `docker/certs/` (gitignored). Keys have `0600`
-permissions.
 
 ### Access Keycloak admin console
 
@@ -99,24 +95,23 @@ curl -X POST http://localhost:8090/v1/chat/completions \
   -d '{"model":"mock-gpt-4","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-### Direct central proxy access (with mTLS client cert)
+### Shell into the relay container
 
 ```sh
-curl -k --cert docker/certs/client.crt --key docker/certs/client.key \
-  https://localhost:8443/healthz
+./docker/dev.sh shell
 ```
 
 ## Files
 
 ```
 docker/
-├── dev.sh                    # Orchestration script (up/down/status/login/goose/test)
-├── docker-compose.yml        # Keycloak + mock-backend + central proxy
+├── dev.sh                    # Orchestration script
+├── docker-compose.yml        # Keycloak + mock-backend + central + relay
 ├── Dockerfile                # Builds oac-central + oac-relay binaries
 ├── generate-certs.sh         # Generates mTLS CA + server + client certs
 ├── configs/
-│   ├── central.toml          # Central proxy config (points at Keycloak + mock-backend)
-│   └── relay.toml            # Relay config (points at Keycloak + central proxy)
+│   ├── central.toml          # Central proxy config (Docker DNS)
+│   └── relay.toml            # Relay config (dev_mode=true, Docker DNS)
 ├── keycloak/
 │   └── realm-export.json     # Pre-configured realm with 4 test users
 ├── mock-backend/

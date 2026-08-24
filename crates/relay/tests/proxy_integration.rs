@@ -80,6 +80,7 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String) {
             client_cert_path: "/client.pem".into(),
             client_key_path: "/client.key".into(),
         },
+        dev_mode: false,
     };
 
     let client = proxy::forward::build_client(&config).expect("client");

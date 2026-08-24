@@ -1,12 +1,13 @@
 # Docker dev stack for the OIDC Agent Compatibility Server.
 #
+# All services run in containers. The relay is exposed on 127.0.0.1:8787
+# so Goose (on the host) can connect to it.
+#
 # Services:
 #   keycloak      — OIDC IdP (pre-configured realm with test users)
 #   mock-backend  — OpenAI-compatible mock API (Flask)
 #   central       — Central proxy (holds master key, forwards to mock-backend)
-#
-# The relay runs on the HOST (not in Docker) so it can listen on 127.0.0.1
-# and Goose can connect to it. See docker/dev.sh for orchestration.
+#   relay         — Laptop relay (forwards to central over mTLS)
 
 services:
   keycloak:
@@ -22,11 +23,11 @@ services:
     volumes:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/realms/oac-dev/.well-known/openid-configuration"]
+      test: ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/localhost/8080' || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 30
-      start_period: 15s
+      start_period: 20s
 
   mock-backend:
     build: ./mock-backend
@@ -42,7 +43,7 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    command: ["oac-central", "serve", "--config", "/config/central.toml"]
+    command: ["oac-central", "--config", "/config/central.toml", "serve"]
     environment:
       OAC_OIDC_CLIENT_SECRET: "oac-relay-secret"
       RUST_LOG: "info"
@@ -58,8 +59,41 @@ services:
         condition: service_healthy
       mock-backend:
         condition: service_healthy
+      central-init:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-kf", "https://localhost:8443/healthz"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8443/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot container that writes the master key to the secrets volume
+  # before the central proxy starts.
+  central-init:
+    image: busybox
+    command: ["sh", "-c", "echo -n 'sk-mock-backend-master-key' > /secrets/master-key && chmod 600 /secrets/master-key"]
+    volumes:
+      - central-secrets:/secrets
+
+  relay:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: ["oac-relay", "--config", "/config/relay.toml", "serve"]
+    environment:
+      OAC_OIDC_CLIENT_SECRET: "oac-relay-secret"
+      RUST_LOG: "info"
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./configs/relay.toml:/config/relay.toml:ro
+      - ./certs:/certs:ro
+      - relay-data:/data
+    depends_on:
+      central:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8787/healthz"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -67,3 +101,4 @@ services:
 volumes:
   central-data:
   central-secrets:
+  relay-data:

@@ -141,6 +141,7 @@ mod tests {
                 client_cert_path: "/client.pem".into(),
                 client_key_path: "/client.key".into(),
             },
+            dev_mode: false,
         }
     }
 
