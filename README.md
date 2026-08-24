@@ -39,3 +39,79 @@ the full design.
 - Secret-redaction logging layer.
 - `cargo audit` + `cargo deny` in CI.
 
+## Quickstart
+
+### Prerequisites
+
+- Rust 1.85+ (stable)
+- An OIDC IdP (Okta, Entra ID, Keycloak, Auth0, etc.)
+- An OpenAI-compatible backend (OpenAI, Azure OpenAI, OpenRouter, Ollama, vLLM, etc.)
+
+### Build
+
+```sh
+cargo build --release
+```
+
+### Configure
+
+Copy the example config and edit for your environment:
+
+```sh
+cp config.example.toml config.toml
+```
+
+Set the OIDC client secret via an environment variable (never in the config
+file):
+
+```sh
+export OAC_OIDC_CLIENT_SECRET="your-oidc-client-secret"
+```
+
+### Run the central proxy (company-hosted)
+
+```sh
+# Load the master backend key into the secret manager (admin only):
+oac-central set-backend-key
+
+# Start the central proxy:
+oac-central serve --config config.toml
+```
+
+### Run the laptop relay (per-employee)
+
+```sh
+# Authenticate via OIDC (opens a browser) and auto-configure the agent:
+oac-relay login --config config.toml
+
+# Start the relay server:
+oac-relay serve --config config.toml
+```
+
+After `login`, the relay writes the base URL + local API key directly into
+the agent's config file (Codex `config.json` or `~/.oac/agent-env.sh`). The
+employee never sees or copies a key.
+
+### Point your agent at the relay
+
+The agent should use:
+
+- **Base URL:** `http://127.0.0.1:8787/v1`
+- **API key:** (auto-injected by `oac-relay login`)
+
+## Development
+
+```sh
+# Run all tests (129 tests across all crates)
+cargo test
+
+# Lint
+cargo clippy --all-targets -- -D warnings
+
+# Check formatting
+cargo fmt --all --check
+
+# Build release binaries
+cargo build --release
+```
+

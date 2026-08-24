@@ -11,6 +11,7 @@
 //! - [`oidc`] — OIDC relying-party client builder.
 //! - [`mtls`] — rustls mTLS client and server configuration builders.
 //! - [`logging`] — structured JSON logging with secret redaction.
+//! - [`shutdown`] — graceful shutdown signal handling.
 //!
 //! # Security
 //!
@@ -34,3 +35,4 @@ pub mod keys;
 pub mod logging;
 pub mod mtls;
 pub mod oidc;
+pub mod shutdown;

@@ -96,6 +96,7 @@ pub async fn serve(config: RelayConfig, key_store: KeyStore) -> Result<()> {
     let app = router(state);
     tracing::info!("relay listening on {}", listen_addr);
     axum::serve(listener, app)
+        .with_graceful_shutdown(oidc_agent_common::shutdown::shutdown_signal())
         .await
         .map_err(|e| oidc_agent_common::error::Error::Http(format!("serve: {e}")))?;
     Ok(())
