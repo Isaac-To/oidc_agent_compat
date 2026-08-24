@@ -117,6 +117,17 @@ mod tests {
             matches!(backend, sea_orm::DatabaseBackend::Sqlite),
             "expected sqlite backend"
         );
+        // Verify the tables were created by querying them.
+        let stmt = sea_orm::Statement::from_sql_and_values(
+            backend,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='identities'",
+            vec![],
+        );
+        let rows = db.query_all(stmt).await.expect("query tables");
+        assert!(
+            !rows.is_empty(),
+            "identities table must exist after migration"
+        );
         // Run setup again to verify idempotency.
         let _ = setup(&url).await.expect("idempotent setup");
         // Clean up.

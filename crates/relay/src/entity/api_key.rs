@@ -6,11 +6,11 @@ use sea_orm::entity::prelude::*;
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "api_keys")]
 pub struct Model {
-    /// Primary key.
+    /// Primary key (UUID stored as text in SQLite).
     #[sea_orm(primary_key)]
-    pub id: Uuid,
+    pub id: String,
     /// The identity this key belongs to.
-    pub identity_id: Uuid,
+    pub identity_id: String,
     /// The SHA-256 hash of the key (32 bytes, stored as a fixed-size binary).
     #[sea_orm(column_type = "Binary(32)")]
     pub key_hash: Vec<u8>,

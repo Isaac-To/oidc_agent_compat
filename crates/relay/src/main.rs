@@ -14,10 +14,14 @@
     clippy::panic,
     clippy::indexing_slicing
 )]
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
+)]
 
 pub mod db;
 pub mod entity;
+pub mod keystore;
 pub mod migration;
 
 use std::path::PathBuf;

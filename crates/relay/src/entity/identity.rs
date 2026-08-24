@@ -6,9 +6,9 @@ use sea_orm::entity::prelude::*;
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "identities")]
 pub struct Model {
-    /// Primary key.
+    /// Primary key (UUID stored as text in SQLite).
     #[sea_orm(primary_key)]
-    pub id: Uuid,
+    pub id: String,
     /// The OIDC issuer URL (e.g. `https://idp.example.com`).
     pub issuer: String,
     /// The subject identifier from the IdP (the `sub` claim).

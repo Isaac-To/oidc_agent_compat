@@ -6,8 +6,13 @@
 use sea_orm_migration::prelude::*;
 
 /// The initial migration that creates the `identities` and `api_keys` tables.
-#[derive(DeriveMigrationName)]
 pub struct Migration;
+
+impl MigrationName for Migration {
+    fn name(&self) -> &str {
+        "m000001_initial_schema"
+    }
+}
 
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
@@ -16,8 +21,12 @@ impl MigrationTrait for Migration {
             .create_table(
                 Table::create()
                     .table(Identity::Table)
-                    .if_not_exists()
-                    .col(ColumnDef::new(Identity::Id).uuid().not_null().primary_key())
+                    .col(
+                        ColumnDef::new(Identity::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
                     .col(ColumnDef::new(Identity::Issuer).string().not_null())
                     .col(ColumnDef::new(Identity::Subject).string().not_null())
                     .col(ColumnDef::new(Identity::Email).string().null())
@@ -36,9 +45,8 @@ impl MigrationTrait for Migration {
             .create_table(
                 Table::create()
                     .table(ApiKey::Table)
-                    .if_not_exists()
-                    .col(ColumnDef::new(ApiKey::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(ApiKey::IdentityId).uuid().not_null())
+                    .col(ColumnDef::new(ApiKey::Id).string().not_null().primary_key())
+                    .col(ColumnDef::new(ApiKey::IdentityId).string().not_null())
                     .col(ColumnDef::new(ApiKey::KeyHash).binary_len(32).not_null())
                     .col(ColumnDef::new(ApiKey::Label).string().not_null())
                     .col(
@@ -80,6 +88,7 @@ impl MigrationTrait for Migration {
 #[derive(Iden)]
 pub enum Identity {
     /// The table.
+    #[iden = "identities"]
     Table,
     /// Primary key.
     Id,
@@ -101,6 +110,7 @@ pub enum Identity {
 #[derive(Iden)]
 pub enum ApiKey {
     /// The table.
+    #[iden = "api_keys"]
     Table,
     /// Primary key.
     Id,
