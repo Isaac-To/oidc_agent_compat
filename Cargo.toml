@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/relay",
     "crates/central",
+    "tests/e2e",
 ]
 
 [workspace.package]

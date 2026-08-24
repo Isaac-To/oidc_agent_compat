@@ -1,0 +1,23 @@
+[package]
+name = "oac-e2e-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+oac-relay = { path = "../../crates/relay" }
+oac-central = { path = "../../crates/central" }
+oidc-agent-common = { path = "../../crates/common" }
+axum = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+zeroize = { workspace = true }
+
+[lib]
+path = "src/lib.rs"

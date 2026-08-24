@@ -1620,6 +1620,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "oac-e2e-tests"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "oac-central",
+ "oac-relay",
+ "oidc-agent-common",
+ "reqwest",
+ "serde_json",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "oac-relay"
 version = "0.1.0"
 dependencies = [
