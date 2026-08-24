@@ -1,0 +1,40 @@
+//! The `audit_log` entity — an append-only log of every proxied request.
+
+use sea_orm::entity::prelude::*;
+
+/// An audit log entry for a single proxied request.
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
+#[sea_orm(table_name = "audit_log")]
+pub struct Model {
+    /// Primary key.
+    #[sea_orm(primary_key)]
+    pub id: String,
+    /// The device ID that made the request.
+    pub device_id: String,
+    /// The user subject.
+    pub user_subject: String,
+    /// The model requested (from the request body, if parseable).
+    pub model: Option<String>,
+    /// The backend name.
+    pub backend: String,
+    /// The HTTP status code of the upstream response.
+    pub status: i32,
+    /// The request latency in milliseconds.
+    pub latency_ms: i64,
+    /// Whether the response was streamed.
+    pub stream: bool,
+    /// Token usage (prompt tokens), if reported by the upstream.
+    pub prompt_tokens: Option<i32>,
+    /// Token usage (completion tokens), if reported.
+    pub completion_tokens: Option<i32>,
+    /// Token usage (total tokens), if reported.
+    pub total_tokens: Option<i32>,
+    /// When the request was made.
+    pub created_at: TimeDateTime,
+}
+
+/// Relations (none for v1).
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}

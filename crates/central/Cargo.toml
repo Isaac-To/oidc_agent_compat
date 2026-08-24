@@ -10,6 +10,10 @@ repository.workspace = true
 name = "oac-central"
 path = "src/main.rs"
 
+[lib]
+name = "oac_central"
+path = "src/lib.rs"
+
 [lints]
 workspace = true
 
@@ -39,3 +43,5 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 time = { workspace = true }
 rpassword = { workspace = true }
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
