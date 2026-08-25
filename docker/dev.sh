@@ -48,7 +48,7 @@ cmd_up() {
     info "Waiting for services to be healthy..."
     wait_for "http://localhost:8080/realms/oac-dev/.well-known/openid-configuration" 60 "Keycloak"
     wait_for "http://localhost:8090/v1/models" 30 "Mock backend"
-    wait_for_https "https://localhost:8443/healthz" 30 "Central proxy"
+    wait_for "http://localhost:8443/healthz" 30 "Central proxy"
     wait_for "http://127.0.0.1:8787/healthz" 30 "Relay"
 
     info "Loading master key into the central proxy..."
@@ -59,7 +59,7 @@ cmd_up() {
     # Restart central so it picks up the master key
     docker compose -f "$COMPOSE_FILE" restart central
     sleep 3
-    wait_for_https "https://localhost:8443/healthz" 30 "Central proxy (after restart)"
+    wait_for "http://localhost:8443/healthz" 30 "Central proxy (after restart)"
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════════════"
@@ -67,7 +67,7 @@ cmd_up() {
     echo ""
     echo "  Keycloak:        http://localhost:8080  (admin/admin)"
     echo "  Mock backend:   http://localhost:8090"
-    echo "  Central proxy:  https://localhost:8443"
+    echo "  Central proxy:  http://localhost:8443"
     echo "  Relay:           http://127.0.0.1:8787"
     echo ""
     echo "  Test users (Keycloak realm: oac-dev):"
@@ -143,7 +143,7 @@ cmd_test() {
     fi
 
     info "Testing central proxy healthz..."
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -k https://localhost:8443/healthz)
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8443/healthz)
     if [ "$HTTP_CODE" = "200" ]; then
         ok "Central healthz → 200"
     else

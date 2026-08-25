@@ -172,6 +172,59 @@ impl KeyStore {
         })
     }
 
+    /// Mints a local API key from a caller-supplied plaintext string.
+    ///
+    /// # Security
+    ///
+    /// This is intended **only** for seeding a well-known development key
+    /// (e.g. when `dev_mode` is enabled) so containerized agents can
+    /// authenticate without running the full OIDC login flow. It must never
+    /// be used to mint production keys — production keys must come from
+    /// [`KeyStore::mint_key`] so they carry 256 bits of OS CSPRNG entropy.
+    ///
+    /// Like [`mint_key`], only the SHA-256 hash is stored; the plaintext is
+    /// returned once via [`MintedKey`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on insert failure.
+    pub async fn mint_dev_key(
+        &self,
+        identity_id: &str,
+        label: &str,
+        plaintext: &str,
+    ) -> Result<MintedKey> {
+        let key = LocalKey::from_string(plaintext.to_string());
+        let hash = KeyHash::from_plaintext(&key.to_string());
+        let now = now_utc();
+        let key_id = Uuid::new_v4().to_string();
+        let now_str = format_time(&now);
+
+        // Use parameterized SQL to prevent injection.
+        let sql = "INSERT INTO api_keys (id, identity_id, key_hash, label, created_at, last_used_at) \
+             VALUES ($1, $2, $3, $4, $5, NULL)";
+        self.db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                vec![
+                    key_id.clone().into(),
+                    identity_id.to_string().into(),
+                    Value::Bytes(Some(Box::new(hash.as_bytes().to_vec()))),
+                    label.to_string().into(),
+                    now_str.into(),
+                ],
+            ))
+            .await
+            .map_err(|e| Error::Database(format!("insert dev api key: {e}")))?;
+
+        Ok(MintedKey {
+            plaintext: key,
+            key_id,
+            identity_id: identity_id.to_string(),
+        })
+    }
+
     /// Verifies a bearer token against the stored key hashes.
     ///
     /// Returns the matching key + identity if found, or `None` if no key
@@ -338,6 +391,56 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key_hash.len(), 32);
         assert!(!keys[0].key_hash.starts_with(b"oac_"));
+    }
+
+    #[tokio::test]
+    async fn mint_dev_key_stores_hash_of_known_plaintext() {
+        let store = setup_test_db().await;
+        let ident = store
+            .upsert_identity("dev", "dev-user", None, None, None)
+            .await
+            .expect("identity");
+        let known = "oac_test_key_alice";
+        let minted = store
+            .mint_dev_key(&ident.id, "dev", known)
+            .await
+            .expect("mint dev key");
+        // The returned plaintext must be exactly the supplied string.
+        assert_eq!(minted.plaintext.to_string(), known);
+        // Only one key, and its hash is 32 bytes (not the plaintext).
+        let keys = api_key::Entity::find()
+            .all(&store.db)
+            .await
+            .expect("load keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key_hash.len(), 32);
+        assert!(!keys[0].key_hash.starts_with(b"oac_"));
+    }
+
+    #[tokio::test]
+    async fn mint_dev_key_verifies_with_known_plaintext() {
+        let store = setup_test_db().await;
+        let ident = store
+            .upsert_identity("dev", "dev-user", None, None, None)
+            .await
+            .expect("identity");
+        let known = "oac_test_key_alice";
+        let _ = store
+            .mint_dev_key(&ident.id, "dev", known)
+            .await
+            .expect("mint dev key");
+        // The known plaintext must verify.
+        let result = store.verify_key(known).await.expect("verify");
+        assert!(result.is_some(), "known dev key must verify");
+        let (key, identity) = result.unwrap();
+        assert_eq!(key.identity_id, ident.id);
+        assert_eq!(identity.subject, "dev-user");
+        // A wrong key must not verify.
+        let wrong = store
+            .verify_key("oac_test_key_bob")
+            .await
+            .expect("verify wrong");
+        assert!(wrong.is_none(), "a different key must not verify");
     }
 
     #[tokio::test]
