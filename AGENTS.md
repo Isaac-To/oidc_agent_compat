@@ -106,8 +106,10 @@ Everything runs in Docker; Goose runs headless in a container.
 ./docker/dev.sh up|down|status|logs|shell|goose|goose-run|test
 ```
 
-- Central proxy serves **plain HTTP on :8443** (axum::serve, no TLS — mTLS is
-  a TODO). Never probe it over HTTPS.
+- Central proxy serves **mTLS on :8443** in production mode (`dev_mode=false`),
+  using `axum_server::bind_rustls` with client cert required. In dev mode
+  (`dev_mode=true`), it serves plain HTTP for the containerized dev stack.
+  Never probe a prod central proxy over plain HTTP.
 - Relay auto-mints dev key `oac_test_key_alice` when `dev_mode=true`
   (`crates/relay/src/main.rs` `serve()` → `seed_dev_key`). Idempotent.
 - `dev.sh test` exercises the full chain + SSE + master-key-leak check.
@@ -123,10 +125,11 @@ See `docker/README.md` for the full service table and quick start.
 
 ## Out of scope (TODOs — don't assume implemented)
 
-- mTLS relay↔central (plain HTTP over Docker network in dev).
+- Rate limiting on central proxy (rely on mTLS + network ACLs for v1).
 - Vault/AWS/GCP/Azure secret-store backends (only `kind = "file"` works).
 - `at_hash` validation.
 - Groups extraction from userinfo (not a standard OIDC claim).
+- Refresh token handling (v1 re-login on expiry; no token storage).
 
 ## Commit preferences
 
