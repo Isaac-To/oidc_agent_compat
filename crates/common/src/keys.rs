@@ -83,6 +83,20 @@ impl LocalKey {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Wraps a caller-supplied key string into a [`LocalKey`].
+    ///
+    /// # Security
+    ///
+    /// This is intended **only** for seeding a well-known development key
+    /// (e.g. when `dev_mode` is enabled) so containerized agents can
+    /// authenticate without running the full OIDC login flow. It must never
+    /// be used to mint production keys — production keys must come from
+    /// [`LocalKey::generate`] so they carry 256 bits of OS CSPRNG entropy.
+    #[must_use]
+    pub fn from_string(s: String) -> Self {
+        Self(Zeroizing::new(s))
+    }
 }
 
 impl std::fmt::Display for LocalKey {

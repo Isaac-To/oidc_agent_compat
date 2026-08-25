@@ -48,7 +48,7 @@ cmd_up() {
     info "Waiting for services to be healthy..."
     wait_for "http://localhost:8080/realms/oac-dev/.well-known/openid-configuration" 60 "Keycloak"
     wait_for "http://localhost:8090/v1/models" 30 "Mock backend"
-    wait_for_https "https://localhost:8443/healthz" 30 "Central proxy"
+    wait_for "http://localhost:8443/healthz" 30 "Central proxy"
     wait_for "http://127.0.0.1:8787/healthz" 30 "Relay"
 
     info "Loading master key into the central proxy..."
@@ -59,7 +59,7 @@ cmd_up() {
     # Restart central so it picks up the master key
     docker compose -f "$COMPOSE_FILE" restart central
     sleep 3
-    wait_for_https "https://localhost:8443/healthz" 30 "Central proxy (after restart)"
+    wait_for "http://localhost:8443/healthz" 30 "Central proxy (after restart)"
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════════════"
@@ -67,7 +67,7 @@ cmd_up() {
     echo ""
     echo "  Keycloak:        http://localhost:8080  (admin/admin)"
     echo "  Mock backend:   http://localhost:8090"
-    echo "  Central proxy:  https://localhost:8443"
+    echo "  Central proxy:  http://localhost:8443"
     echo "  Relay:           http://127.0.0.1:8787"
     echo ""
     echo "  Test users (Keycloak realm: oac-dev):"
@@ -143,7 +143,7 @@ cmd_test() {
     fi
 
     info "Testing central proxy healthz..."
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -k https://localhost:8443/healthz)
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8443/healthz)
     if [ "$HTTP_CODE" = "200" ]; then
         ok "Central healthz → 200"
     else
@@ -191,18 +191,88 @@ cmd_test() {
         exit 1
     fi
 
+    info "Testing full chain: GET /v1/models with dev key..."
+    BODY=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer oac_test_key_alice" \
+        http://127.0.0.1:8787/v1/models)
+    HTTP_CODE=$(echo "$BODY" | tail -n1)
+    RESP_BODY=$(echo "$BODY" | sed '$d')
+    if [ "$HTTP_CODE" = "200" ]; then
+        ok "Relay /v1/models with dev key → 200"
+    else
+        err "Relay /v1/models with dev key → $HTTP_CODE (expected 200)"
+        exit 1
+    fi
+    if echo "$RESP_BODY" | grep -q "mock-gpt-4"; then
+        ok "Response contains mock-gpt-4 (full chain works)"
+    else
+        err "Response missing mock-gpt-4: $RESP_BODY"
+        exit 1
+    fi
+
+    info "Testing full chain: POST /v1/chat/completions (non-streaming)..."
+    BODY=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer oac_test_key_alice" \
+        -H "Content-Type: application/json" \
+        -X POST http://127.0.0.1:8787/v1/chat/completions \
+        -d '{"model":"mock-gpt-4","messages":[{"role":"user","content":"hello"}]}')
+    HTTP_CODE=$(echo "$BODY" | tail -n1)
+    RESP_BODY=$(echo "$BODY" | sed '$d')
+    if [ "$HTTP_CODE" = "200" ]; then
+        ok "Relay /v1/chat/completions (non-stream) → 200"
+    else
+        err "Relay /v1/chat/completions (non-stream) → $HTTP_CODE (expected 200)"
+        exit 1
+    fi
+    if echo "$RESP_BODY" | grep -q "Mock response to: hello"; then
+        ok "Non-stream response contains backend content"
+    else
+        err "Non-stream response missing backend content: $RESP_BODY"
+        exit 1
+    fi
+
+    info "Testing full chain: POST /v1/chat/completions (SSE streaming)..."
+    # For streaming, capture headers + body together.
+    OUT=$(curl -s -D - \
+        -H "Authorization: Bearer oac_test_key_alice" \
+        -H "Content-Type: application/json" \
+        -X POST http://127.0.0.1:8787/v1/chat/completions \
+        -d '{"model":"mock-gpt-4","stream":true,"messages":[{"role":"user","content":"hello"}]}')
+    if echo "$OUT" | grep -qi "content-type: text/event-stream"; then
+        ok "Stream response has content-type: text/event-stream"
+    else
+        err "Stream response missing text/event-stream content-type"
+        echo "$OUT"
+        exit 1
+    fi
+    # Check for the SSE stream terminator.
+    if echo "$OUT" | grep -q 'data: \[DONE\]'; then
+        ok "Stream response contains SSE terminator (data)"
+    else
+        err "Stream response missing SSE terminator"
+        echo "$OUT"
+        exit 1
+    fi
+
+    info "Verifying master key never leaks into relay responses..."
+    # Any response from the relay must not contain the master key.
+    LEAK=$(curl -s \
+        -H "Authorization: Bearer oac_test_key_alice" \
+        http://127.0.0.1:8787/v1/models)
+    if echo "$LEAK" | grep -q "sk-mock-backend-master-key"; then
+        err "Master key leaked into relay /v1/models response!"
+        exit 1
+    else
+        ok "Master key not present in relay response"
+    fi
+
     echo ""
-    ok "All infrastructure tests passed!"
+    ok "All tests passed (infrastructure + full chain + SSE)!"
     echo ""
-    info "To test the full request chain (agent → relay → central → backend),"
-    info "you need a valid API key. Run 'oac-relay login' inside the relay"
-    info "container to mint one via OIDC, or insert one directly:"
-    echo ""
-    echo "  docker compose -f docker/docker-compose.yml exec relay /bin/bash"
-    echo "  # Inside the container, use the relay CLI to mint a key"
-    echo ""
-    info "Then use that key with:"
-    echo "  curl -H 'Authorization: Bearer <key>' http://127.0.0.1:8787/v1/models"
+    info "The dev API key 'oac_test_key_alice' is auto-minted by the relay"
+    info "when dev_mode=true (see crates/relay/src/main.rs). Use it for"
+    info "manual curl, e.g.:"
+    echo "  curl -H 'Authorization: Bearer oac_test_key_alice' http://127.0.0.1:8787/v1/models"
 }
 
 # ─── Helpers ─────────────────────────────────────────────────────────────

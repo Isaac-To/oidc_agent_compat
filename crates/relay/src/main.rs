@@ -73,7 +73,57 @@ fn load_config(path: &std::path::Path) -> Result<RelayConfig> {
 async fn serve(config: RelayConfig) -> Result<()> {
     let db = db::setup(&config.database_url).await?;
     let key_store = KeyStore::new(db);
+
+    // In dev mode, seed a well-known API key so containerized agents (e.g.
+    // Goose) and manual curl can authenticate without running the full OIDC
+    // login flow. This is strictly gated behind `dev_mode` (false in all
+    // production configs) and is idempotent across restarts.
+    if config.dev_mode {
+        seed_dev_key(&key_store).await?;
+    }
+
     proxy::serve(config, key_store).await
+}
+
+/// The well-known plaintext dev API key minted when `dev_mode` is enabled.
+///
+/// This matches the `OPENAI_API_KEY` configured for the Goose service in
+/// `docker/docker-compose.yml`. It is intentionally a constant (not random)
+/// so the dev stack works out of the box without any login step.
+const DEV_KEY_PLAINTEXT: &str = "oac_test_key_alice";
+
+/// Seeds the well-known dev API key into the key store if it is not already
+/// present. Idempotent: skips minting if a key with the dev plaintext already
+/// verifies.
+///
+/// # Security
+///
+/// Only called when `config.dev_mode` is true. The key value is never logged.
+///
+/// # Errors
+///
+/// Returns [`Error`] if the identity upsert, verification, or mint fails.
+async fn seed_dev_key(key_store: &KeyStore) -> Result<()> {
+    // Upsert a dev identity (issuer "dev", subject "dev-user").
+    let identity = key_store
+        .upsert_identity("dev", "dev-user", None, Some("Dev User"), None)
+        .await?;
+
+    // Only mint if the dev key is not already present (idempotent across
+    // restarts — avoids duplicate rows).
+    let existing = key_store.verify_key(DEV_KEY_PLAINTEXT).await?;
+    if existing.is_none() {
+        key_store
+            .mint_dev_key(&identity.id, "dev", DEV_KEY_PLAINTEXT)
+            .await?;
+        tracing::info!(
+            "dev_mode: seeded well-known dev API key (label 'dev') for identity {}",
+            identity.id
+        );
+    } else {
+        tracing::debug!("dev_mode: dev API key already present, skipping seed");
+    }
+    Ok(())
 }
 
 /// Runs the OIDC login flow and configures the agent.
