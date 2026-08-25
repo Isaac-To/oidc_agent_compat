@@ -90,7 +90,7 @@ crates/central/src/
     └── group_policy.rs     # group_policy entity
 
 crates/central/tests/
-└── proxy_integration.rs    # 11 integration tests (dev + prod + mTLS modes)
+└── proxy_integration.rs    # 10 integration tests (dev + prod + mTLS modes)
 ```
 
 ### `tests/e2e/` — In-process E2E tests
@@ -101,7 +101,7 @@ tests/e2e/
 ├── src/
 │   └── lib.rs          # Lint allows only
 └── tests/
-    └── e2e.rs          # 15 E2E tests (full chain + permissions + device revocation)
+    └── e2e.rs          # 16 E2E tests (full chain + permissions + device revocation)
 ```
 
 ## Workspace `Cargo.toml`

@@ -66,5 +66,6 @@ built:
 
 - Vault / AWS Secrets Manager / GCP / Azure secret-store backends (only
   `kind = "file"` works today).
-- Rate limiting on the central proxy (relies on mTLS + network ACLs for v1).
 - Refresh token handling (v1 re-login on expiry; no token storage).
+- Token-quota enforcement (request-count quotas are enforced pre-flight;
+  token quotas are tracked but not yet blocked).

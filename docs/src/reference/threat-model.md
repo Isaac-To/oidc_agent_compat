@@ -92,7 +92,7 @@ Agent (Codex, etc.)
 | Slow client ties up connections | Connect timeout (10s) + request timeout (300s) | ✅ Implemented |
 | OIDC callback hangs forever | 5-minute callback timeout | ✅ Implemented |
 | Attacker floods relay with requests | Loopback-only binding (not network-accessible) | ✅ Implemented |
-| Attacker floods central proxy | ⚠️ Rate limiting not implemented (rely on mTLS + network ACLs) | ⚠️ Not yet implemented |
+| Attacker floods central proxy | Per-IP token-bucket rate limiter (60 req/min default, production only) | ✅ Implemented |
 
 ### E — Elevation of Privilege
 
@@ -105,11 +105,11 @@ Agent (Codex, etc.)
 | Attacker exploits `unsafe` code | `#![forbid(unsafe_code)]` across all crates | ✅ Implemented |
 | Authenticated user calls disallowed model | Permissions middleware enforces group-based model allowlists (403) | ✅ Implemented |
 | Authenticated user calls disallowed endpoint | Permissions middleware enforces group-based endpoint restrictions (403) | ✅ Implemented |
-| Authenticated user exceeds quota | Per-user daily token/request quotas enforced | ⚠️ Not yet implemented |
+| Authenticated user exceeds quota | Per-user daily request-count quota enforced pre-flight (429 `quota_exceeded`); token quotas tracked but not yet enforced | ⚠️ Partial (request quota enforced; token quota tracked only) |
 | Attacker spoofs group membership | Groups extracted from IdP-signed ID token / TLS-protected userinfo; forwarded over mTLS | ✅ Implemented |
 | Admin API accessed without authorization | Admin auth middleware checks IdP group membership (via relay-forwarded `x-oac-user-groups`); 403 if not in admin group | ✅ Implemented |
 | Admin API mutations go unlogged | All mutations recorded in append-only `admin_audit_log` | ✅ Implemented |
-| Revoked device continues to access | Device revocation enforced in prod mTLS mode (DeviceStore) | ⚠️ Not yet implemented (store ready, enforcement prod-only) |
+| Revoked device continues to access | Device revocation checked in `permissions_middleware` (uses `identity_id` or `subject` as device ID) | ✅ Implemented |
 
 ## Security standards compliance
 

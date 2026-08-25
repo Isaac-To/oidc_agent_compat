@@ -52,8 +52,8 @@ Production setup in 7 steps (central proxy in Docker + relay on laptop):
 cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/
 
 # 2. Configure the central proxy:
-cp docker/prod/configs/central.toml docker/prod/configs/central.toml
-# Edit issuer, backend.base_url for your environment.
+#    Edit docker/prod/configs/central.toml — set issuer, backend.base_url
+#    for your environment.
 
 # 3. Provide secrets:
 echo "OAC_OIDC_CLIENT_SECRET=your-secret" > docker/prod/.env

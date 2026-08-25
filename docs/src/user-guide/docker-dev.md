@@ -95,7 +95,7 @@ curl -X POST http://127.0.0.1:8787/v1/chat/completions \
 ```sh
 curl http://localhost:8090/v1/models
 curl -X POST http://localhost:8090/v1/chat/completions \
-  -H 'Content-Type: application/json" \
+  -H 'Content-Type: application/json' \
   -d '{"model":"mock-gpt-4","messages":[{"role":"user","content":"hello"}]}'
 ```
 

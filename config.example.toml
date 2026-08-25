@@ -1,17 +1,23 @@
 # OIDC Agent Compatibility Server — Example Configuration
 #
-# Copy this file to config.toml and edit for your environment.
-# NEVER commit config.toml — it is gitignored.
+# The relay and central proxy each use a SEPARATE config file with flat
+# top-level fields (NOT under a [relay] or [central] section). Copy the
+# relevant block below into its own file (e.g. relay.toml / central.toml)
+# and edit for your environment. NEVER commit a filled config — it is
+# gitignored.
+#
+# See docs/src/user-guide/configuration.md for the full field reference.
 
 # ─── Relay configuration (laptop) ───────────────────────────────────────────
-# The relay listens on loopback only. The agent (Codex, etc.) points at this
-# address. 127.0.0.1 is required; 0.0.0.0 is rejected.
-
-# [relay]
+# Save as relay.toml. The relay listens on loopback only. The agent
+# (Codex, etc.) points at this address. 127.0.0.1 is required; 0.0.0.0 is
+# rejected unless dev_mode = true.
+#
 # listen_addr = "127.0.0.1:8787"
 # database_url = "sqlite://~/.oac/relay.db"
+# dev_mode = false
 #
-# [relay.oidc]
+# [oidc]
 # issuer = "https://idp.example.com"
 # client_id = "oac-relay"
 # # The env var holding the OIDC client secret (never a literal here):
@@ -19,41 +25,41 @@
 # redirect_uri = "http://127.0.0.1:0/callback"
 # scopes = ["openid", "email", "profile"]
 #
-# [relay.central]
+# [central]
 # url = "https://central.example.com"
 # ca_cert_path = "/etc/oac/ca.pem"
 # client_cert_path = "~/.oac/client.pem"
 # client_key_path = "~/.oac/client.key"
 
 # ─── Central proxy configuration (company-hosted) ───────────────────────────
-# The central proxy holds the master backend key in a secret manager and
-# forwards relay requests to the OpenAI-compatible backend.
-
-# [central]
+# Save as central.toml. The central proxy holds the master backend key in
+# a secret manager and forwards relay requests to the OpenAI-compatible
+# backend.
+#
 # listen_addr = "0.0.0.0:8443"
 # database_url = "postgres://central.example.com/oac"
 # # When true, allows requests without relay-forwarded identity headers
 # # (for dev/testing only). Defaults to false.
 # dev_mode = false
 #
-# [central.oidc]
+# [oidc]
 # issuer = "https://idp.example.com"
 # client_id = "oac-central"
 # client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 # redirect_uri = "http://127.0.0.1:0/callback"
 # scopes = ["openid"]
 #
-# [central.backend]
+# [backend]
 # name = "openai"
 # base_url = "https://api.openai.com"
 #
-# [central.mtls]
+# [mtls]
 # ca_cert_path = "/etc/oac/ca.pem"
 # server_cert_path = "/etc/oac/server.pem"
 # server_key_path = "/etc/oac/server.key"
 #
-# [central.secret_store]
-# kind = "vault"   # vault | aws | gcp | azure
+# [secret_store]
+# kind = "vault"   # vault | aws | gcp | azure (only "file" implemented)
 # path = "secret/data/oac/master-key"
 #
 # # Admin API (optional). If present, enables the /admin/v1/ endpoints for
@@ -61,5 +67,5 @@
 # # authorized by IdP group membership — users in the configured admin_group
 # # (authenticated via the relay's OIDC login flow) may call the admin API.
 # # No static admin token is used; the admin's OIDC identity is the auth.
-# [central.admin]
+# [admin]
 # admin_group = "oac-admins"

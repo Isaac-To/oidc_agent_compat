@@ -10,13 +10,15 @@ mTLS to the central proxy.
 
 ## Configuration
 
-Create a config file for the relay. Start from the example:
+Create a config file for the relay. Start from the production reference
+config and edit it for your environment:
 
 ```sh
-cp config.example.toml config.toml
+cp docker/prod/configs/relay.toml ~/.oac/relay.toml
 ```
 
-The relay reads the `[relay]` section. A minimal production config:
+The relay config uses flat top-level fields (no `[relay]` wrapper). A
+minimal production config:
 
 ```toml
 listen_addr = "127.0.0.1:8787"

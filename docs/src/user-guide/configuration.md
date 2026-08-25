@@ -1,10 +1,13 @@
 # Configuration Reference
 
-The configuration file is TOML. The relay reads the `[relay]` section (or
-top-level fields when using a relay-only config), and the central proxy
-reads the `[central]` section (or top-level fields when using a
-central-only config). The example file `config.example.toml` shows both
-side by side.
+The configuration file is TOML. The relay and central proxy each use a
+**separate** config file with **flat top-level fields** — there is no
+`[relay]` or `[central]` wrapper section. The relay config is parsed by
+`RelayConfig::from_toml()` and the central config by
+`CentralConfig::from_toml()` (both in `oidc_agent_common::config`).
+
+See `config.example.toml` at the repo root for commented examples of both
+files side by side.
 
 All configs are parsed and validated by
 `oidc_agent_common::config::{RelayConfig, CentralConfig}::from_toml()`.

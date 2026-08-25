@@ -53,13 +53,14 @@ internal PKI — do not email them or store them in git.
 
 ## Step 2: Configure the central proxy
 
-Copy the reference config and edit it for your environment:
+Edit the reference config for your environment:
 
 ```sh
-cp docker/prod/configs/central.toml docker/prod/configs/central.toml
+$EDITOR docker/prod/configs/central.toml
 ```
 
-Edit `docker/prod/configs/central.toml`:
+The production compose file mounts this config directly into the
+container. Set at minimum the `issuer` and `backend.base_url`:
 
 ```toml
 listen_addr = "0.0.0.0:8443"
