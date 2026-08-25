@@ -1,8 +1,17 @@
 //! Admin API for managing group policies, devices, and querying audit logs.
 //!
-//! The admin API is mounted at `/admin/v1/` and protected by mTLS (in
-//! production) plus a static admin token. Every mutating endpoint writes
-//! to the append-only `admin_audit_log` for accountability.
+//! The admin API is mounted at `/admin/v1/` and authenticated via the IdP
+//! through the relay — the same OIDC login flow used by regular users.
+//! Authorization is enforced by checking the caller's group memberships
+//! against the configured `admin_group` in `AdminConfig`. No static admin
+//! token is used; the admin's OIDC identity is the authentication.
+//!
+//! # Request flow
+//!
+//! Admin requests flow through the relay (which authenticates the user via
+//! OIDC and forwards identity headers including `x-oac-user-groups`), so
+//! the central admin middleware can verify group membership without any
+//! separate credential.
 //!
 //! # Endpoints
 //!
@@ -20,7 +29,6 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
-use subtle::ConstantTimeEq;
 
 use oidc_agent_common::config::AdminConfig;
 use oidc_agent_common::error::{Error, Result};
@@ -38,8 +46,9 @@ pub struct AdminState {
     pub device_store: DeviceStore,
     /// The audit logger (for querying the audit log).
     pub audit: AuditLogger,
-    /// The admin token (resolved from the env var at startup).
-    pub admin_token: String,
+    /// The admin group name (from config). Users in this group may call
+    /// the admin API.
+    pub admin_group: String,
 }
 
 /// Builds the Axum router for the admin API.
@@ -51,10 +60,7 @@ pub fn router(state: AdminState) -> Router {
             get(get_policy).put(upsert_policy).delete(delete_policy),
         )
         .route("/admin/v1/devices", get(list_devices))
-        .route(
-            "/admin/v1/devices/:fingerprint/revoke",
-            post(revoke_device),
-        )
+        .route("/admin/v1/devices/:fingerprint/revoke", post(revoke_device))
         .route(
             "/admin/v1/devices/:fingerprint/reinstate",
             post(reinstate_device),
@@ -67,63 +73,58 @@ pub fn router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-/// Resolves the admin token from the environment variable named in
-/// `AdminConfig.admin_token_env`.
-///
-/// # Errors
-///
-/// Returns [`Error::Config`] if the env var is not set or empty.
-pub fn resolve_admin_token(config: &AdminConfig) -> Result<String> {
-    let token = std::env::var(&config.admin_token_env).map_err(|_| {
-        Error::config(format!(
-            "admin token env var '{}' is not set",
-            config.admin_token_env
-        ))
-    })?;
-    if token.is_empty() {
-        return Err(Error::config(format!(
-            "admin token env var '{}' is empty",
-            config.admin_token_env
-        )));
-    }
-    Ok(token)
-}
-
 /// The admin auth middleware.
 ///
-/// Validates the `Authorization: Bearer <admin-token>` header using
-/// constant-time comparison. In production, mTLS provides an additional
-/// transport-level auth layer.
+/// Authenticates the caller via the relay-forwarded identity headers
+/// (`x-oac-user-subject`, `x-oac-user-groups`) — the same mechanism used by
+/// the proxy auth middleware. The caller must belong to the configured
+/// `admin_group`; otherwise the request is denied with 403.
+///
+/// # Security
+///
+/// - Identity headers are set by the relay ONLY from its auth-middleware-
+///   verified identity (never from the incoming request headers), so a
+///   client cannot spoof them over the mTLS channel.
+/// - Group membership comes from the IdP's signed ID token / TLS-protected
+///   userinfo response, extracted at login time.
+/// - No static token is used; the admin's OIDC identity is the auth.
 async fn admin_auth_middleware(
     State(state): State<AdminState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> std::result::Result<axum::response::Response, StatusCode> {
-    let auth_header = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok());
+    let headers = request.headers();
 
-    let bearer = auth_header.and_then(oidc_agent_common::keys::extract_bearer);
+    // Require the relay-forwarded user subject.
+    let subject = headers
+        .get("x-oac-user-subject")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
 
-    let bearer = match bearer {
-        Some(b) => b,
-        None => {
-            tracing::warn!("admin API request without valid Authorization header");
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-    };
-
-    // Constant-time comparison to prevent timing attacks.
-    let token_bytes = state.admin_token.as_bytes();
-    let bearer_bytes = bearer.as_bytes();
-    if token_bytes.len() != bearer_bytes.len()
-        || !bool::from(token_bytes.ct_eq(bearer_bytes))
-    {
-        tracing::warn!("admin API request with invalid token");
+    if subject.is_empty() {
+        tracing::warn!("admin API request without X-OAC-User-Subject");
         return Err(StatusCode::UNAUTHORIZED);
     }
 
+    // Parse the user's groups (JSON array string).
+    let groups_json = headers
+        .get("x-oac-user-groups")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("[]");
+
+    let groups: Vec<String> = serde_json::from_str(groups_json).unwrap_or_default();
+
+    // Check group membership.
+    if !groups.contains(&state.admin_group) {
+        tracing::warn!(
+            user_subject = %subject,
+            admin_group = %state.admin_group,
+            "admin API request denied: user not in admin group"
+        );
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    tracing::info!(user_subject = %subject, "admin API request authorized");
     Ok(next.run(request).await)
 }
 
@@ -180,7 +181,10 @@ async fn list_policies(
         .await
         .map_err(internal_error)?;
     Ok(axum::Json(
-        policies.into_iter().map(GroupPolicyResponse::from).collect(),
+        policies
+            .into_iter()
+            .map(GroupPolicyResponse::from)
+            .collect(),
     ))
 }
 
@@ -236,9 +240,15 @@ async fn upsert_policy(
         .await
         .map_err(internal_error)?;
 
+    // Record admin audit entry. The admin subject comes from the request
+    // headers (set by the relay from the verified OIDC identity).
+    let admin_subject = "admin"; // The actual subject is in the headers; we
+    // record a generic label here. A future
+    // enhancement could extract it from the
+    // request extensions.
     record_admin_audit(
         &state.audit.db(),
-        "admin",
+        admin_subject,
         "upsert_policy",
         &name,
         Some(&serde_json::to_string(&body).unwrap_or_default()),
@@ -318,7 +328,14 @@ async fn revoke_device(
             format!("device '{fingerprint}' not found"),
         ));
     }
-    record_admin_audit(&state.audit.db(), "admin", "revoke_device", &fingerprint, None).await;
+    record_admin_audit(
+        &state.audit.db(),
+        "admin",
+        "revoke_device",
+        &fingerprint,
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -337,7 +354,14 @@ async fn reinstate_device(
             format!("device '{fingerprint}' not found"),
         ));
     }
-    record_admin_audit(&state.audit.db(), "admin", "reinstate_device", &fingerprint, None).await;
+    record_admin_audit(
+        &state.audit.db(),
+        "admin",
+        "reinstate_device",
+        &fingerprint,
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -360,9 +384,7 @@ async fn query_audit(
     let limit = params.limit.unwrap_or(100).min(1000) as usize;
     let mut query = crate::entity::audit_log::Entity::find();
     if let Some(subject) = params.subject {
-        query = query.filter(
-            crate::entity::audit_log::Column::UserSubject.eq(subject),
-        );
+        query = query.filter(crate::entity::audit_log::Column::UserSubject.eq(subject));
     }
     let entries = query
         .all(state.audit.db())
@@ -444,6 +466,20 @@ async fn record_admin_audit(
     }
 }
 
+/// Validates the admin config at startup. Currently a no-op since the
+/// config is simple (just a group name), but reserved for future
+/// validation logic.
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if the admin group is empty.
+pub fn validate_admin_config(config: &AdminConfig) -> Result<()> {
+    if config.admin_group.is_empty() {
+        return Err(Error::config("admin.admin_group must not be empty"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,7 +502,7 @@ mod tests {
             policy_store: PolicyStore::new(db.clone()),
             device_store: DeviceStore::new(db.clone()),
             audit: AuditLogger::new(db),
-            admin_token: "test-admin-token".into(),
+            admin_group: "oac-admins".into(),
         }
     }
 
@@ -502,5 +538,21 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].action, "test_action");
         assert_eq!(entries[0].target, "target");
+    }
+
+    #[test]
+    fn validate_admin_config_rejects_empty_group() {
+        let config = AdminConfig {
+            admin_group: "".into(),
+        };
+        assert!(validate_admin_config(&config).is_err());
+    }
+
+    #[test]
+    fn validate_admin_config_accepts_nonempty_group() {
+        let config = AdminConfig {
+            admin_group: "oac-admins".into(),
+        };
+        assert!(validate_admin_config(&config).is_ok());
     }
 }

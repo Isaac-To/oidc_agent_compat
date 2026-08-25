@@ -100,6 +100,13 @@ Agent (Codex, etc.)
 | Attacker bypasses auth via healthz | `/healthz` exempt from auth (returns only "ok", no data) | ✅ Implemented |
 | Attacker uses revoked key | Key deletion on logout; `verify_key` checks current keys only | ✅ Implemented |
 | Attacker exploits `unsafe` code | `#![forbid(unsafe_code)]` across all crates | ✅ Implemented |
+| Authenticated user calls disallowed model | Permissions middleware enforces group-based model allowlists (403) | ✅ Implemented |
+| Authenticated user calls disallowed endpoint | Permissions middleware enforces group-based endpoint restrictions (403) | ✅ Implemented |
+| Authenticated user exceeds quota | Per-user daily token/request quotas enforced (Phase 3) | ⚠️ TODO |
+| Attacker spoofs group membership | Groups extracted from IdP-signed ID token / TLS-protected userinfo; forwarded over mTLS | ✅ Implemented |
+| Admin API accessed without authorization | Admin auth middleware checks IdP group membership (via relay-forwarded `x-oac-user-groups`); 403 if not in admin group | ✅ Implemented |
+| Admin API mutations go unlogged | All mutations recorded in append-only `admin_audit_log` | ✅ Implemented |
+| Revoked device continues to access | Device revocation enforced in prod mTLS mode (DeviceStore) | ⚠️ TODO (store ready, enforcement prod-only) |
 
 ## 4. Open items (TODO)
 
@@ -108,7 +115,7 @@ Agent (Codex, etc.)
 | **mTLS relay ↔ central** | High | ✅ **DONE** — Wired in merge 3e23986. Central serves over mTLS (`axum_server::bind_rustls`) in prod mode; relay builds `reqwest` client with mTLS. Dev mode uses plain HTTP. |
 | **Rate limiting on central** | Medium | No rate limiting; rely on mTLS + network ACLs for v1. |
 | **at_hash validation** | Low | ✅ **DONE** — Implemented in login.rs step 13c. Verifies the at_hash claim against the access token when the IdP includes it (OIDC Core §3.1.3.7 step 3). |
-| **Groups extraction** | Low | Not a standard OIDC claim; would need `AdditionalClaims`. Deferred. |
+| **Groups extraction** | Low | ✅ **DONE** — Implemented via `CustomAdditionalClaims` (groups + roles unioned). Requires `groups` scope in OIDC config. |
 | **Vault/AWS/GCP/Azure secret stores** | Medium | Only `file` backend implemented; production needs Vault or AWS SM. |
 | **Refresh token handling** | Low | v1 re-login on expiry (no token storage); RFC 9700 §4.14.2 rotation deferred. |
 | **cargo deny config** | Low | `deny.toml` line 32 incompatible with cargo-deny 0.20.2 (pre-existing). |

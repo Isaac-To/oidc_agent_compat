@@ -96,8 +96,8 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
         client,
         audit: audit.clone(),
         rate_limiter: None,
-    policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
-    device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
+        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
+        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -234,8 +234,8 @@ async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
         client,
         audit: audit.clone(),
         rate_limiter: None,
-    policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
-    device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
+        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
+        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -449,8 +449,8 @@ async fn setup_mtls_central() -> SocketAddr {
         client,
         audit: audit.clone(),
         rate_limiter: None,
-    policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
-    device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
+        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
+        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
 

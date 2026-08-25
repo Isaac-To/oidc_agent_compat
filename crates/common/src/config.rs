@@ -82,13 +82,16 @@ pub struct CentralConfig {
 
 /// Admin API configuration.
 ///
-/// The admin API is protected by mTLS (in production) plus a static admin
-/// token referenced by environment variable name (the token itself is never
-/// in the config file).
+/// The admin API is authenticated via the IdP through the relay (same
+/// OIDC login flow as regular users). Access is authorized by checking
+/// the user's group memberships against the configured `admin_group`.
+/// No static admin token is used — the admin's OIDC identity is the auth.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdminConfig {
-    /// The name of the environment variable holding the admin token.
-    pub admin_token_env: String,
+    /// The group name that grants admin API access. Users who belong to
+    /// this group (via their IdP groups/roles claims) may call the admin
+    /// API; all others are denied (403).
+    pub admin_group: String,
 }
 
 /// OIDC relying-party configuration shared by both components.

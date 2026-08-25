@@ -540,10 +540,7 @@ async fn e2e_permissions_deny_disallowed_model() {
     let denied = entries
         .iter()
         .find(|e| e.permission_decision.as_deref() == Some("denied"));
-    assert!(
-        denied.is_some(),
-        "audit log must contain a denied entry"
-    );
+    assert!(denied.is_some(), "audit log must contain a denied entry");
     let denied = denied.expect("denied entry");
     assert_eq!(denied.denial_reason.as_deref(), Some("model_not_allowed"));
     assert_eq!(denied.status, 403);

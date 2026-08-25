@@ -258,7 +258,11 @@ impl MigrationTrait for Migration0003GroupPolicies {
                             .unique_key(),
                     )
                     .col(ColumnDef::new(GroupPolicy::AllowedModels).string().null())
-                    .col(ColumnDef::new(GroupPolicy::AllowedEndpoints).string().null())
+                    .col(
+                        ColumnDef::new(GroupPolicy::AllowedEndpoints)
+                            .string()
+                            .null(),
+                    )
                     .col(
                         ColumnDef::new(GroupPolicy::DailyTokenQuota)
                             .big_integer()
@@ -298,16 +302,8 @@ impl MigrationTrait for Migration0003GroupPolicies {
                             .string()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(AdminAuditLog::Action)
-                            .string()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(AdminAuditLog::Target)
-                            .string()
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(AdminAuditLog::Action).string().not_null())
+                    .col(ColumnDef::new(AdminAuditLog::Target).string().not_null())
                     .col(ColumnDef::new(AdminAuditLog::Payload).string().null())
                     .col(
                         ColumnDef::new(AdminAuditLog::CreatedAt)

@@ -114,12 +114,8 @@ pub async fn proxy_handler(
                 groups: identity.as_ref().and_then(|i| i.groups.clone()),
                 endpoint: Some(path.clone()),
                 request_id: identity.as_ref().and_then(|i| i.request_id.clone()),
-                permission_decision: permission_decision
-                    .as_ref()
-                    .map(|d| d.decision.clone()),
-                denial_reason: permission_decision
-                    .as_ref()
-                    .and_then(|d| d.reason.clone()),
+                permission_decision: permission_decision.as_ref().map(|d| d.decision.clone()),
+                denial_reason: permission_decision.as_ref().and_then(|d| d.reason.clone()),
                 cost_usd: None,
             };
             if let Err(e) = state.audit.record(&entry).await {

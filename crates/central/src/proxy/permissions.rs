@@ -20,7 +20,7 @@
 //! request is allowed (so the dev stack works without policy config). If
 //! policies *do* exist, they are enforced even in dev mode.
 
-use axum::body::{to_bytes, Body};
+use axum::body::{Body, to_bytes};
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
@@ -57,7 +57,10 @@ pub async fn permissions_middleware(
     let endpoint = request.uri().path().to_string();
 
     // Extract the verified relay identity.
-    let identity = request.extensions().get::<super::auth::VerifiedRelayIdentity>().cloned();
+    let identity = request
+        .extensions()
+        .get::<super::auth::VerifiedRelayIdentity>()
+        .cloned();
 
     let identity = match identity {
         Some(id) => id,
@@ -105,12 +108,10 @@ pub async fn permissions_middleware(
     let method = request.method().clone();
     if method == axum::http::Method::POST {
         let (parts, body) = request.into_parts();
-        let body_bytes = to_bytes(body, super::MAX_BODY_SIZE)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "permissions: failed to read body");
-                StatusCode::BAD_REQUEST
-            })?;
+        let body_bytes = to_bytes(body, super::MAX_BODY_SIZE).await.map_err(|e| {
+            tracing::error!(error = %e, "permissions: failed to read body");
+            StatusCode::BAD_REQUEST
+        })?;
 
         let model = extract_model(&body_bytes);
 

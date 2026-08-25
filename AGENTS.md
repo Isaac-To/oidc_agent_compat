@@ -34,14 +34,18 @@ Key modules:
 - `crates/common/src/config.rs` — `RelayConfig` / `CentralConfig` TOML schemas + validation (relay rejects `0.0.0.0`).
 - `crates/common/src/error.rs` — unified `Error` enum + `Result` alias. Use this, not `anyhow`, in library code.
 - `crates/common/src/keys.rs` — local API key gen, SHA-256 hashing, constant-time compare.
-- `crates/common/src/oidc.rs` — OIDC RP client builder.
+- `crates/common/src/oidc.rs` — OIDC RP client builder + `CustomAdditionalClaims` (groups/roles extraction).
 - `crates/common/src/mtls.rs` — rustls mTLS client/server builders.
 - `crates/relay/src/login.rs` — `oac-relay login`: auth-code + PKCE flow, loopback callback, ID-token validation, agent config injection.
 - `crates/relay/src/proxy/` — `mod.rs`, `auth.rs` (local key check), `forward.rs` (relay→central), `host_guard.rs` (DNS rebinding defense).
 - `crates/relay/src/keystore.rs`, `agent_config.rs`, `db.rs`, `migration.rs`, `entity/` — persistence + agent config injection.
-- `crates/central/src/proxy/` — `mod.rs`, `auth.rs` (validates relay user tokens), `forward.rs` (central→backend, SSE streaming).
+- `crates/relay/src/activity.rs` — relay-side activity logger (append-only `relay_activity_log`).
+- `crates/central/src/proxy/` — `mod.rs`, `auth.rs` (validates relay user tokens), `forward.rs` (central→backend, SSE streaming), `permissions.rs` (group-based model/endpoint enforcement), `rate_limit.rs`.
+- `crates/central/src/admin.rs` — admin API (`/admin/v1/`) for policy/device/audit management.
+- `crates/central/src/policy.rs` — `PolicyStore` + `resolve_policy` (group→policy merge, most-permissive-wins).
+- `crates/central/src/device_store.rs` — device registration + revocation store.
 - `crates/central/src/secrets.rs` — `SecretStore` trait; `FileSecretStore` for dev. Vault/AWS/GCP/Azure are TODO.
-- `crates/central/src/audit.rs` — audit logger.
+- `crates/central/src/audit.rs` — audit logger (enriched with identity, groups, endpoint, request-id, permission decision).
 - `crates/central/src/db.rs`, `migration.rs`, `entity/` — central persistence.
 
 ## Build, test, lint

@@ -270,10 +270,7 @@ mod tests {
 
         let revoked = store.revoke("fp-789").await.expect("revoke");
         assert!(revoked);
-        assert_eq!(
-            store.is_revoked("fp-789").await.expect("check"),
-            Some(true)
-        );
+        assert_eq!(store.is_revoked("fp-789").await.expect("check"), Some(true));
 
         let reinstated = store.reinstate("fp-789").await.expect("reinstate");
         assert!(reinstated);
@@ -293,6 +290,12 @@ mod tests {
     #[tokio::test]
     async fn is_revoked_nonexistent_returns_none() {
         let store = setup_test_db().await;
-        assert!(store.is_revoked("nonexistent").await.expect("check").is_none());
+        assert!(
+            store
+                .is_revoked("nonexistent")
+                .await
+                .expect("check")
+                .is_none()
+        );
     }
 }

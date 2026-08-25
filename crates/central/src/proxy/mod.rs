@@ -51,19 +51,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Resolves the admin token from the config, if the admin API is
-    /// enabled. Returns `None` if the admin config is absent or the env
-    /// var is not set (in which case the admin API is disabled).
+    /// Returns the admin group name if the admin API is enabled, or `None`
+    /// if the admin config is absent (admin API disabled).
     #[must_use]
-    pub fn admin_token(&self) -> Option<String> {
-        let admin_config = self.config.admin.as_ref()?;
-        match crate::admin::resolve_admin_token(admin_config) {
-            Ok(token) => Some(token),
-            Err(e) => {
-                tracing::warn!(error = %e, "admin API disabled: admin token not resolvable");
-                None
-            }
-        }
+    pub fn admin_group(&self) -> Option<&str> {
+        self.config.admin.as_ref().map(|a| a.admin_group.as_str())
     }
 }
 
@@ -106,12 +98,12 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.clone());
 
     // Merge the admin API router if an admin config is present.
-    if let Some(admin_token) = state.admin_token() {
+    if let Some(admin_group) = state.admin_group() {
         let admin_state = crate::admin::AdminState {
             policy_store: state.policy_store.clone(),
             device_store: state.device_store.clone(),
             audit: state.audit.clone(),
-            admin_token,
+            admin_group: admin_group.to_string(),
         };
         proxy_router = proxy_router.merge(crate::admin::router(admin_state));
     }

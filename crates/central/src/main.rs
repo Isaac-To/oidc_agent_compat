@@ -39,6 +39,71 @@ enum Command {
     Serve,
     /// Set the master backend key in the secret store.
     SetBackendKey,
+    /// Admin API operations (manage policies, devices, audit logs).
+    Admin(AdminCli),
+}
+
+/// Admin CLI subcommands.
+#[derive(Parser, Debug)]
+struct AdminCli {
+    /// The relay URL to send admin requests through (the relay authenticates
+    /// the user via OIDC and forwards to central). Defaults to
+    /// http://127.0.0.1:8787.
+    #[arg(long, env = "OAC_ADMIN_URL")]
+    url: Option<String>,
+
+    /// The local API key (obtained via `oac-relay login`). The relay
+    /// authenticates the user via OIDC and forwards the request to central
+    /// with the verified identity headers. The user must belong to the
+    /// configured admin group.
+    #[arg(long, env = "OAC_API_KEY")]
+    key: String,
+
+    /// The subcommand to run.
+    #[command(subcommand)]
+    subcommand: AdminSubcommand,
+}
+
+/// Admin subcommands.
+#[derive(Subcommand, Debug)]
+enum AdminSubcommand {
+    /// List all group policies.
+    PolicyList,
+    /// Get a single group policy.
+    PolicyGet { name: String },
+    /// Set (upsert) a group policy.
+    PolicySet {
+        name: String,
+        /// Comma-separated list of allowed models (omit for all).
+        #[arg(long)]
+        models: Option<String>,
+        /// Comma-separated list of allowed endpoints (omit for all).
+        #[arg(long)]
+        endpoints: Option<String>,
+        /// Daily token quota.
+        #[arg(long)]
+        token_quota: Option<i64>,
+        /// Daily request quota.
+        #[arg(long)]
+        request_quota: Option<i64>,
+    },
+    /// Delete a group policy.
+    PolicyDelete { name: String },
+    /// List all devices.
+    DeviceList,
+    /// Revoke a device.
+    DeviceRevoke { fingerprint: String },
+    /// Reinstate a revoked device.
+    DeviceReinstate { fingerprint: String },
+    /// Query the audit log.
+    AuditQuery {
+        /// Filter by user subject.
+        #[arg(long)]
+        subject: Option<String>,
+        /// Maximum number of entries.
+        #[arg(long, default_value = "100")]
+        limit: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -53,6 +118,7 @@ fn main() -> Result<()> {
         match cli.command.unwrap_or(Command::Serve) {
             Command::Serve => serve(config).await,
             Command::SetBackendKey => set_backend_key(config).await,
+            Command::Admin(admin_cli) => admin(admin_cli).await,
         }
     })
 }
@@ -94,4 +160,196 @@ async fn set_backend_key(config: CentralConfig) -> Result<()> {
     secret_store.store_master_key(&key).await?;
     println!("oac-central: master key stored in secret store");
     Ok(())
+}
+
+/// Runs an admin CLI command through the relay (which authenticates the user
+/// via OIDC and forwards to central). The user must belong to the configured
+/// admin group.
+async fn admin(cli: AdminCli) -> Result<()> {
+    // Resolve the relay URL. The admin sends requests through the relay,
+    // which authenticates the user via their local API key (obtained via
+    // `oac-relay login`) and forwards to central with the verified identity
+    // headers. The user must belong to the configured admin group.
+    let url = cli
+        .url
+        .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
+
+    let key = cli.key;
+    let client = reqwest::Client::new();
+    let base_url = url.trim_end_matches('/');
+
+    match cli.subcommand {
+        AdminSubcommand::PolicyList => {
+            let resp = admin_get(&client, base_url, &key, "/admin/v1/group-policies").await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::PolicyGet { name } => {
+            let resp = admin_get(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/group-policies/{name}"),
+            )
+            .await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::PolicySet {
+            name,
+            models,
+            endpoints,
+            token_quota,
+            request_quota,
+        } => {
+            let body = serde_json::json!({
+                "allowed_models": models.map(|m| m.split(',').map(String::from).collect::<Vec<_>>()),
+                "allowed_endpoints": endpoints.map(|e| e.split(',').map(String::from).collect::<Vec<_>>()),
+                "daily_token_quota": token_quota,
+                "daily_request_quota": request_quota,
+            });
+            let resp = admin_put(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/group-policies/{name}"),
+                &body,
+            )
+            .await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::PolicyDelete { name } => {
+            admin_delete(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/group-policies/{name}"),
+            )
+            .await?;
+            println!("policy '{name}' deleted");
+        }
+        AdminSubcommand::DeviceList => {
+            let resp = admin_get(&client, base_url, &key, "/admin/v1/devices").await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::DeviceRevoke { fingerprint } => {
+            admin_post(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/devices/{fingerprint}/revoke"),
+            )
+            .await?;
+            println!("device '{fingerprint}' revoked");
+        }
+        AdminSubcommand::DeviceReinstate { fingerprint } => {
+            admin_post(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/devices/{fingerprint}/reinstate"),
+            )
+            .await?;
+            println!("device '{fingerprint}' reinstated");
+        }
+        AdminSubcommand::AuditQuery { subject, limit } => {
+            let mut path = format!("/admin/v1/audit?limit={limit}");
+            if let Some(s) = subject {
+                path.push_str(&format!("&subject={s}"));
+            }
+            let resp = admin_get(&client, base_url, &key, &path).await?;
+            println!("{resp}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Sends an authenticated GET to the admin API.
+async fn admin_get(
+    client: &reqwest::Client,
+    base_url: &str,
+    key: &str,
+    path: &str,
+) -> Result<String> {
+    let resp = client
+        .get(format!("{base_url}{path}"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Http(format!("admin request: {e}")))?;
+    admin_response(resp).await
+}
+
+/// Sends an authenticated PUT with a JSON body to the admin API.
+async fn admin_put(
+    client: &reqwest::Client,
+    base_url: &str,
+    key: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<String> {
+    let resp = client
+        .put(format!("{base_url}{path}"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Http(format!("admin request: {e}")))?;
+    admin_response(resp).await
+}
+
+/// Sends an authenticated POST to the admin API.
+async fn admin_post(client: &reqwest::Client, base_url: &str, key: &str, path: &str) -> Result<()> {
+    let resp = client
+        .post(format!("{base_url}{path}"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Http(format!("admin request: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(oidc_agent_common::error::Error::Http(format!(
+            "admin request failed: {status} {body}"
+        )));
+    }
+    Ok(())
+}
+
+/// Sends an authenticated DELETE to the admin API.
+async fn admin_delete(
+    client: &reqwest::Client,
+    base_url: &str,
+    key: &str,
+    path: &str,
+) -> Result<()> {
+    let resp = client
+        .delete(format!("{base_url}{path}"))
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Http(format!("admin request: {e}")))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(oidc_agent_common::error::Error::Http(format!(
+            "admin request failed: {status} {body}"
+        )));
+    }
+    Ok(())
+}
+
+/// Extracts the response body, returning an error on non-2xx.
+async fn admin_response(resp: reqwest::Response) -> Result<String> {
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Http(format!("read response: {e}")))?;
+    if !status.is_success() {
+        return Err(oidc_agent_common::error::Error::Http(format!(
+            "admin request failed: {status} {body}"
+        )));
+    }
+    Ok(body)
 }

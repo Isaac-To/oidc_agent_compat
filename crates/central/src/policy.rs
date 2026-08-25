@@ -511,13 +511,7 @@ mod tests {
             .expect("upsert 1");
 
         store
-            .upsert_policy(
-                "engineering",
-                Some(r#"["gpt-4o", "o1"]"#),
-                None,
-                None,
-                None,
-            )
+            .upsert_policy("engineering", Some(r#"["gpt-4o", "o1"]"#), None, None, None)
             .await
             .expect("upsert 2");
 
@@ -528,8 +522,8 @@ mod tests {
             .await
             .expect("get")
             .expect("exists");
-        let models = parse_json_array(policy.allowed_models.as_deref().unwrap_or("[]"))
-            .expect("parse");
+        let models =
+            parse_json_array(policy.allowed_models.as_deref().unwrap_or("[]")).expect("parse");
         assert!(models.contains(&"gpt-4o".to_string()));
         assert!(models.contains(&"o1".to_string()));
     }

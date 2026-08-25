@@ -55,3 +55,11 @@
 # [central.secret_store]
 # kind = "vault"   # vault | aws | gcp | azure
 # path = "secret/data/oac/master-key"
+#
+# # Admin API (optional). If present, enables the /admin/v1/ endpoints for
+# # managing group policies, devices, and querying audit logs. Access is
+# # authorized by IdP group membership — users in the configured admin_group
+# # (authenticated via the relay's OIDC login flow) may call the admin API.
+# # No static admin token is used; the admin's OIDC identity is the auth.
+# [central.admin]
+# admin_group = "oac-admins"
