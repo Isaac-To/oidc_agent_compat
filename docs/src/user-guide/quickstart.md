@@ -24,8 +24,16 @@ in place.
 
 ## Step 1: Generate mTLS certificates
 
-The relay and central proxy communicate over mutual TLS. Generate a CA,
-server cert, and client cert:
+The relay and central proxy communicate over mutual TLS. You need a CA,
+server cert, and client cert.
+
+> **⚠️ Production security:** `./docker/generate-certs.sh` creates
+> **self-signed test certs** (CN=`OAC Test CA`). These are fine for getting
+> started, but for real production you should use your **company PKI** or a
+> properly signed CA. Never use the test certs in a production deployment
+> that handles real API keys.
+
+For initial testing:
 
 ```sh
 ./docker/generate-certs.sh
@@ -40,7 +48,8 @@ cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/
 ```
 
 Distribute `ca.crt`, `client.crt`, and `client.key` to each employee
-laptop for the relay config.
+laptop for the relay config. For production, distribute certs via your
+internal PKI — do not email them or store them in git.
 
 ## Step 2: Configure the central proxy
 

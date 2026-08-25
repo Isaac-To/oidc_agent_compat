@@ -43,6 +43,11 @@ company CA:
 - Both are verified against the company CA.
 - Private key files must have `0600` permissions.
 
+> **⚠️ Production:** Use your **company PKI** to issue mTLS certificates.
+> The `./docker/generate-certs.sh` script creates self-signed test certs
+> (CN=`OAC Test CA`) — these are for dev/testing only and must not be used
+> in a production deployment that handles real API keys.
+
 ## Local key security
 
 - **256-bit keys** generated from the OS CSPRNG (`OsRng`).

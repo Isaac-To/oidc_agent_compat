@@ -47,8 +47,8 @@ For full Rust API type signatures, run `cargo doc --workspace --open`.
 Production setup in 7 steps (central proxy in Docker + relay on laptop):
 
 ```sh
-# 1. Generate mTLS certs:
-./docker/generate-certs.sh
+# 1. Generate mTLS certs (use your company PKI for real production):
+./docker/generate-certs.sh   # ⚠️ self-signed test certs — dev only
 cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/
 
 # 2. Configure the central proxy:

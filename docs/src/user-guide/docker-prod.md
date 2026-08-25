@@ -187,3 +187,77 @@ store (Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault),
 the `SecretStore` trait is extensible but those backends are not yet built.
 See [Developer Guide: Conventions](../developer-guide/conventions.md) for
 the trait design.
+
+## Production security checklist
+
+Before going live, verify every item on this checklist:
+
+### Certificates
+
+- [ ] **Use your company PKI** — not the self-signed test certs from
+  `./docker/generate-certs.sh` (CN=`OAC Test CA`). Those are for dev only.
+- [ ] Server cert CN/SAN matches the central proxy's hostname.
+- [ ] Client certs are uniquely issued per relay (not shared across
+  employees if individual revocation is needed).
+- [ ] Private key files have `0600` permissions.
+- [ ] Certs are distributed via your internal PKI, not email or git.
+
+### Configuration
+
+- [ ] `dev_mode = false` in both central and relay configs.
+- [ ] Relay `listen_addr` is `127.0.0.1` (loopback only).
+- [ ] Central `url` in relay config is `https://` (mTLS enforced).
+- [ ] OIDC `issuer` points to your real enterprise IdP (not a dev
+  Keycloak).
+- [ ] `client_secret_env` references an env var, never a literal secret.
+- [ ] `[admin]` section's `admin_group` matches a real group in your IdP.
+
+### Secrets
+
+- [ ] Master backend key stored as a Docker secret (not an env var, not
+  baked into the image).
+- [ ] OIDC client secret provided via `.env` file or orchestrator secret
+  mechanism.
+- [ ] `.env` file is in `.gitignore` (it is by default).
+- [ ] No secrets appear in config files, Dockerfiles, or git history.
+
+### Network
+
+- [ ] Central proxy port `8443` is accessible only from the corporate
+  network or VPN (not the public internet).
+- [ ] Firewall rules restrict `8443` to known relay IP ranges where
+  possible.
+- [ ] The central proxy is behind a reverse proxy or load balancer if
+  you need TLS termination, healthcheck routing, or DDoS protection.
+
+### Runtime
+
+- [ ] Central container runs as non-root user (`oac`) — the Dockerfile
+  enforces this.
+- [ ] Config and certs mounted read-only.
+- [ ] Container has resource limits set (memory, CPU) via Docker or your
+  orchestrator.
+- [ ] Log rotation configured (the compose file sets `max-size: 10m`,
+  `max-file: 3`).
+- [ ] `RUST_LOG` is `info` or lower (not `debug` in production — debug
+  may log sensitive request details).
+
+### OIDC / IdP
+
+- [ ] Your IdP enforces MFA for users who can log in via the relay.
+- [ ] The OIDC client is **confidential** (not public), with a real
+  client secret.
+- [ ] Redirect URIs in the IdP are restricted to `http://127.0.0.1:*`
+  (loopback, any port — per RFC 8252).
+- [ ] The `groups` scope is configured if you use group-based
+  authorization.
+- [ ] Users who should not have access are removed from the IdP client's
+  allowed groups.
+
+### Audit & monitoring
+
+- [ ] The audit log is monitored for anomalous activity (unexpected 403s,
+  unusual request volumes, off-hours access).
+- [ ] Admin API mutations are reviewed periodically (via
+  `admin_audit_log`).
+- [ ] Device revocation is tested — a revoked relay cannot make requests.
