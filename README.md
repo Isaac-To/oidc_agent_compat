@@ -44,20 +44,43 @@ For full Rust API type signatures, run `cargo doc --workspace --open`.
 
 ## Quickstart
 
+Production setup in 7 steps (central proxy in Docker + relay on laptop):
+
 ```sh
-# Start the dev stack (Keycloak + mock backend + central + relay + Goose):
-./docker/dev.sh up
+# 1. Generate mTLS certs:
+./docker/generate-certs.sh
+cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/
 
-# Verify the full chain:
-./docker/dev.sh test
+# 2. Configure the central proxy:
+cp docker/prod/configs/central.toml docker/prod/configs/central.toml
+# Edit issuer, backend.base_url for your environment.
 
-# Make a request:
-curl -H 'Authorization: Bearer oac_test_key_alice' \
+# 3. Provide secrets:
+echo "OAC_OIDC_CLIENT_SECRET=your-secret" > docker/prod/.env
+echo -n 'sk-your-master-key' | docker secret create oac_master_key -
+
+# 4. Deploy the central proxy:
+cd docker/prod && docker compose up -d --build
+
+# 5. Install the relay on a laptop:
+cargo build --release -p oac-relay
+cp target/release/oac-relay /usr/local/bin/oac-relay
+cp docker/prod/configs/relay.toml ~/.oac/relay.toml
+# Copy ca.crt, client.crt, client.key to ~/.oac/certs/
+
+# 6. Log in and start the relay:
+export OAC_OIDC_CLIENT_SECRET="your-secret"
+oac-relay --config ~/.oac/relay.toml login
+oac-relay --config ~/.oac/relay.toml serve
+
+# 7. Make a request:
+curl -H "Authorization: Bearer $OPENAI_API_KEY" \
   http://127.0.0.1:8787/v1/models
 ```
 
 See [Quickstart](docs/src/user-guide/quickstart.md) for the full
-walkthrough.
+walkthrough. For the dev stack (bundled Keycloak + mock backend), see
+[Docker: Dev Stack](docs/src/user-guide/docker-dev.md).
 
 ## Development
 
