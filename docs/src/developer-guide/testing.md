@@ -44,7 +44,7 @@ proxy (in-process, `dev_mode=true`). Mints a key for identity `user123`.
 
 ## Central integration tests (`crates/central/tests/proxy_integration.rs`)
 
-11 tests across three modes:
+10 tests across three modes:
 
 ### Dev mode tests
 
@@ -83,7 +83,7 @@ with client cert required.
 
 ## E2E tests (`tests/e2e/tests/e2e.rs`)
 
-15 tests. `setup_full_system()` spins up in-process: mock backend + central
+16 tests. `setup_full_system()` spins up in-process: mock backend + central
 + relay, all wired together. Mints a key for identity `e2e-user`
 (`e2e@example.com`).
 

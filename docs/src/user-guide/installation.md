@@ -5,7 +5,7 @@
 ### Rust toolchain
 
 - **Rust 1.85+** (stable). The toolchain is pinned via
-  [`rust-toolchain.toml`](https://github.com/iato/oidc-agent-compat/blob/main/rust-toolchain.toml)
+  [`rust-toolchain.toml`](https://github.com/isaac-to/oidc-agent-compat/blob/main/rust-toolchain.toml)
   at the repo root, so if you use rustup it will automatically select the
   right version with `rustfmt` and `clippy` components.
 

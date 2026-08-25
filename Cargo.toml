@@ -11,7 +11,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-repository = "https://github.com/iato/oidc-agent-compat"
+repository = "https://github.com/isaac-to/oidc-agent-compat"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
