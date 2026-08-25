@@ -36,15 +36,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_creates_and_migrates_temp_db() {
-        let tmp = std::env::temp_dir().join(format!(
-            "oac-test-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
-        let url = format!("sqlite://{}", tmp.display());
+        let url = oidc_agent_common::persistence::temp_sqlite_url("relay-db");
         let db = setup(&url).await.expect("setup succeeds");
         let backend = db.get_database_backend();
         assert!(
@@ -64,23 +56,14 @@ mod tests {
         );
         // Run setup again to verify idempotency.
         let _ = setup(&url).await.expect("idempotent setup");
-        // Clean up.
-        let _ = std::fs::remove_file(&tmp);
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn setup_sets_0600_perms_on_db_file() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!(
-            "oac-test-perms-{}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
-        let url = format!("sqlite://{}", tmp.display());
+        let url = oidc_agent_common::persistence::temp_sqlite_url("relay-perms");
+        let tmp = oidc_agent_common::persistence::sqlite_path(&url).expect("sqlite url");
         let _ = setup(&url).await.expect("setup succeeds");
         let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
         assert_eq!(

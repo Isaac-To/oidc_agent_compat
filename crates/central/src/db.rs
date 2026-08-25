@@ -23,18 +23,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_creates_and_migrates_temp_db() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "oac-central-test-{}-{counter}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
-        let url = format!("sqlite://{}", tmp.display());
+        let url = oidc_agent_common::persistence::temp_sqlite_url("central-db");
         let db = setup(&url).await.expect("setup succeeds");
         let backend = db.get_database_backend();
         assert!(matches!(backend, sea_orm::DatabaseBackend::Sqlite));
@@ -50,6 +39,5 @@ mod tests {
 
         // Idempotent.
         let _ = setup(&url).await.expect("idempotent setup");
-        let _ = std::fs::remove_file(&tmp);
     }
 }
