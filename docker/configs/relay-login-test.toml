@@ -1,0 +1,19 @@
+# Host-side relay config for testing the OIDC login flow against the dev
+# Keycloak. Used only for manual verification of `oac-relay login`.
+
+listen_addr = "127.0.0.1:8787"
+database_url = "sqlite:///tmp/oac-relay-login-test.db"
+dev_mode = true
+
+[oidc]
+issuer = "http://localhost:8080/realms/oac-dev"
+client_id = "oac-relay"
+client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+redirect_uri = "http://127.0.0.1:0/callback"
+scopes = ["openid", "email", "profile"]
+
+[central]
+url = "http://localhost:8443"
+ca_cert_path = "/certs/ca.crt"
+client_cert_path = "/certs/client.crt"
+client_key_path = "/certs/client.key"

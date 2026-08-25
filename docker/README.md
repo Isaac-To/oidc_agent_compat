@@ -86,6 +86,39 @@ curl -H 'Authorization: Bearer oac_test_key_alice' http://127.0.0.1:8787/v1/mode
 > stack (mTLS between relay and central is not yet wired). The generated
 > certs in `docker/certs/` are unused until mTLS is implemented.
 
+## OIDC Login (real auth flow)
+
+The relay implements the full OIDC authorization-code + PKCE flow
+(`oac-relay login`). In the dev stack, the relay runs in Docker where it
+can't open a host browser or receive a loopback callback, so to test the
+real login flow, run the relay binary **on the host** against the dev
+Keycloak:
+
+```sh
+# 1. Build the release binary and start the dev stack (for Keycloak + central):
+cargo build --release -p oac-relay
+./docker/dev.sh up
+
+# 2. Run the login flow on the host (uses docker/configs/relay-login-test.toml):
+OAC_OIDC_CLIENT_SECRET="oac-relay-secret" \
+  ./target/release/oac-relay --config docker/configs/relay-login-test.toml login
+
+# 3. A browser opens to the Keycloak login page. Sign in as one of the test
+#    users (e.g. alice / alice-pass-123). The relay validates the ID token
+#    (alg pin RS256/ES256, iss, aud, exp, nonce, signature), fetches userinfo,
+#    mints a local API key, and injects it into ~/.oac/agent-env.sh.
+
+# 4. Source the config and use the minted key:
+source ~/.oac/agent-env.sh
+curl -H "Authorization: Bearer $OPENAI_API_KEY" http://127.0.0.1:8788/v1/models
+```
+
+The login test config (`docker/configs/relay-login-test.toml`) uses
+`dev_mode = true` (to allow the HTTP central URL) and a separate SQLite
+DB (`/tmp/oac-relay-login-test.db`) so it doesn't conflict with the
+containerized relay. It listens on `127.0.0.1:8788` to avoid port
+conflicts with the Docker relay on `:8787`.
+
 ## Manual Operations
 
 ### Generate mTLS certs

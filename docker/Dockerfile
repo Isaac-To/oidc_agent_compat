@@ -8,7 +8,9 @@ COPY crates/ crates/
 COPY tests/ tests/
 RUN cargo build --release -p oac-central -p oac-relay
 
-FROM debian:bookworm-slim
+# Use trixie-slim to match the glibc version in the rust:1.98-slim builder
+# (rust 1.98 is based on Debian trixie, glibc 2.41; bookworm has glibc 2.36).
+FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libssl3 curl && \
     rm -rf /var/lib/apt/lists/*
