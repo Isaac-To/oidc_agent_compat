@@ -16,6 +16,7 @@
 
 pub mod auth;
 pub mod forward;
+pub mod permissions;
 pub mod rate_limit;
 
 use std::sync::Arc;
@@ -27,6 +28,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use zeroize::Zeroizing;
 
 use crate::audit::AuditLogger;
+use crate::policy::PolicyStore;
 
 /// The shared application state for the central proxy.
 #[derive(Clone)]
@@ -41,6 +43,8 @@ pub struct AppState {
     pub audit: AuditLogger,
     /// The rate limiter (None in dev mode).
     pub rate_limiter: Option<rate_limit::RateLimiter>,
+    /// The group policy store.
+    pub policy_store: PolicyStore,
 }
 
 /// The maximum request body size (10 MB).
@@ -69,6 +73,10 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             rate_limit::rate_limit_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            permissions::permissions_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -104,12 +112,14 @@ pub async fn serve(
             rate_limit::DEFAULT_WINDOW,
         ))
     };
+    let policy_store = PolicyStore::new(audit.db().clone());
     let state = AppState {
         config: config.clone(),
         master_key: Arc::new(master_key),
         client,
         audit,
         rate_limiter,
+        policy_store,
     };
     let app = router(state);
 

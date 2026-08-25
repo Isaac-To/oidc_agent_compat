@@ -119,6 +119,7 @@ async fn setup_full_system() -> (
         client: central_client,
         audit: audit.clone(),
         rate_limiter: None,
+        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
     };
     let central_app = central_proxy::router(central_state);
     let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -471,5 +472,207 @@ async fn e2e_request_id_correlates_relay_and_central() {
     assert!(
         last.request_id.is_some(),
         "central audit log must record the request_id forwarded by the relay"
+    );
+}
+
+#[tokio::test]
+async fn e2e_permissions_deny_disallowed_model() {
+    // Set up a policy allowing only "gpt-4o" for the "engineering" group,
+    // then verify a request for "gpt-4" is denied with 403.
+    let (addr, client, key, audit, key_store) = setup_full_system().await;
+
+    // Use a distinct subject so a new identity with groups is created
+    // (upsert_identity returns existing rows without updating groups).
+    let ident = key_store
+        .upsert_identity(
+            "https://idp.example.com",
+            "e2e-user-eng",
+            Some("e2e-eng@example.com"),
+            None,
+            Some(r#"["engineering"]"#),
+        )
+        .await
+        .expect("upsert with groups");
+
+    // Mint a new key for this identity.
+    let minted = key_store
+        .mint_key(&ident.id, "e2e-perm-test")
+        .await
+        .expect("mint");
+    let key_with_groups = minted.plaintext.to_string();
+
+    // Create a policy allowing only "gpt-4o" for "engineering".
+    let policy_store = oac_central::policy::PolicyStore::new(audit.db().clone());
+    policy_store
+        .upsert_policy("engineering", Some(r#"["gpt-4o"]"#), None, None, None)
+        .await
+        .expect("upsert policy");
+
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {key_with_groups}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "request for disallowed model must be denied"
+    );
+
+    // Verify the denial was audited.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    use oac_central::entity::audit_log;
+    use sea_orm::EntityTrait;
+    let entries = audit_log::Entity::find()
+        .all(audit.db())
+        .await
+        .expect("load audit log");
+    let denied = entries
+        .iter()
+        .find(|e| e.permission_decision.as_deref() == Some("denied"));
+    assert!(
+        denied.is_some(),
+        "audit log must contain a denied entry"
+    );
+    let denied = denied.expect("denied entry");
+    assert_eq!(denied.denial_reason.as_deref(), Some("model_not_allowed"));
+    assert_eq!(denied.status, 403);
+
+    // The original key (no groups) should still work (no policies match).
+    let body2 = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+    let resp2 = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .json(&body2)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn e2e_permissions_allow_allowed_model() {
+    // Set up a policy allowing "gpt-4" for the "engineering" group, then
+    // verify a request for "gpt-4" succeeds.
+    let (addr, client, _, audit, key_store) = setup_full_system().await;
+
+    let ident = key_store
+        .upsert_identity(
+            "https://idp.example.com",
+            "e2e-user-allow",
+            Some("e2e-allow@example.com"),
+            None,
+            Some(r#"["engineering"]"#),
+        )
+        .await
+        .expect("upsert with groups");
+    let minted = key_store
+        .mint_key(&ident.id, "e2e-perm-allow")
+        .await
+        .expect("mint");
+    let key_with_groups = minted.plaintext.to_string();
+
+    let policy_store = oac_central::policy::PolicyStore::new(audit.db().clone());
+    policy_store
+        .upsert_policy("engineering", Some(r#"["gpt-4"]"#), None, None, None)
+        .await
+        .expect("upsert policy");
+
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {key_with_groups}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn e2e_permissions_deny_disallowed_endpoint() {
+    // Set up a policy allowing only /v1/chat/completions for "restricted"
+    // group, then verify /v1/embeddings is denied.
+    let (addr, client, _, audit, key_store) = setup_full_system().await;
+
+    let ident = key_store
+        .upsert_identity(
+            "https://idp.example.com",
+            "e2e-user-restricted",
+            Some("e2e-restricted@example.com"),
+            None,
+            Some(r#"["restricted"]"#),
+        )
+        .await
+        .expect("upsert with groups");
+    let minted = key_store
+        .mint_key(&ident.id, "e2e-perm-endpoint")
+        .await
+        .expect("mint");
+    let key_with_groups = minted.plaintext.to_string();
+
+    let policy_store = oac_central::policy::PolicyStore::new(audit.db().clone());
+    policy_store
+        .upsert_policy(
+            "restricted",
+            None,
+            Some(r#"["/v1/chat/completions"]"#),
+            None,
+            None,
+        )
+        .await
+        .expect("upsert policy");
+
+    let url = format!("http://127.0.0.1:{}/v1/embeddings", addr.port());
+    let body = serde_json::json!({
+        "model": "text-embedding-ada-002",
+        "input": "test",
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {key_with_groups}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "request to disallowed endpoint must be denied"
+    );
+
+    // Verify the denial reason.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    use oac_central::entity::audit_log;
+    use sea_orm::EntityTrait;
+    let entries = audit_log::Entity::find()
+        .all(audit.db())
+        .await
+        .expect("load audit log");
+    let denied = entries
+        .iter()
+        .find(|e| e.permission_decision.as_deref() == Some("denied"));
+    assert!(denied.is_some(), "audit log must contain a denied entry");
+    assert_eq!(
+        denied.expect("denied").denial_reason.as_deref(),
+        Some("endpoint_not_allowed")
     );
 }
