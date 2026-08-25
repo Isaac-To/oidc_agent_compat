@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Production deployment for the OIDC Agent Compatibility Server.
+#
+# This is a reference compose file for hosting the CENTRAL proxy in
+# production. The RELAY runs on employee laptops (see docker/prod/README.md
+# for the laptop install flow), so it is NOT included here.
+#
+# Differences from the dev stack (docker/docker-compose.yml):
+#   - No Keycloak, no mock-backend, no Goose — you bring your own IdP and
+#     OpenAI-compatible backend.
+#   - dev_mode = false everywhere (mTLS enforced, relay must bind loopback).
+#   - Master key loaded via a secret (Docker secret or mounted file), never
+#     an env var, never baked into the image.
+#   - Central serves mTLS on :8443 with client cert required.
+#   - Persistent data via named volumes; certs mounted read-only.
+#   - Healthchecks use the real mTLS endpoint where possible.
+#
+# Usage:
+#   docker compose -f docker/prod/docker-compose.yml up -d
+#
+# Prerequisites:
+#   1. Edit docker/prod/configs/central.toml (issuer, backend base_url).
+#   2. Provide the OIDC client secret: echo -n '...' | docker secret create oac_oidc_client_secret -
+#      (or set OAC_OIDC_CLIENT_SECRET in an .env file next to this compose file).
+#   3. Provide the master backend key as a Docker secret named oac_master_key
+#      (or mount a file at /run/secrets/master-key).
+#   4. Provide mTLS certs under docker/prod/certs/ (ca.crt, server.crt, server.key).
+#      Generate with: ./docker/generate-certs.sh
+# ─────────────────────────────────────────────────────────────────────────
+
+services:
+  central:
+    build:
+      context: ../..
+      dockerfile: docker/prod/Dockerfile.central
+    image: oac-central:prod
+    restart: unless-stopped
+    environment:
+      # OIDC client secret — reference by env-var name in the config.
+      # Provide via an .env file or your orchestrator's secret mechanism.
+      OAC_OIDC_CLIENT_SECRET: ${OAC_OIDC_CLIENT_SECRET:?OAC_OIDC_CLIENT_SECRET must be set}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./configs/central.toml:/config/central.toml:ro
+      - ./certs:/certs:ro
+      - central-data:/data
+    secrets:
+      - source: oac_master_key
+        target: master-key
+        # Mounted at /run/secrets/master-key; central.toml points here.
+    healthcheck:
+      # In production the central proxy requires a client cert on :8443,
+      # so a plain curl healthcheck will fail TLS handshake. We check the
+      # process is alive instead. If you terminate TLS upstream, switch to
+      # an HTTP healthcheck against /healthz.
+      test: ["CMD", "pgrep", "-x", "oac-central"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  central-data:
+
+secrets:
+  oac_master_key:
+    # Preferred: create with `echo -n 'sk-...' | docker secret create oac_master_key -`
+    # For compose without swarm, use a file:
+    #   file: /run/secrets/master-key
+    external: true

@@ -14,6 +14,10 @@ config.toml
 # Docker dev stack — generated certs and volumes
 docker/certs/
 
+# Docker prod stack — generated certs and local secrets
+docker/prod/certs/
+docker/prod/.env
+
 # Editor
 .vscode/
 .idea/

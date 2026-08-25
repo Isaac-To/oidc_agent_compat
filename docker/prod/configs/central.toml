@@ -1,0 +1,43 @@
+# Central proxy config — PRODUCTION reference.
+#
+# Copy to central.toml and edit for your environment. NEVER commit a filled
+# production config. The master key is NOT here — it lives in the secret
+# store (file path below points at the Docker secret mount).
+
+listen_addr = "0.0.0.0:8443"
+database_url = "sqlite:///data/central.db"
+# Production: dev_mode MUST be false. This enforces mTLS and rejects
+# relay-forwarded requests that lack valid identity headers.
+dev_mode = false
+
+[oidc]
+# Your OIDC provider. Must be reachable from the central container.
+issuer = "https://idp.example.com/realms/your-realm"
+client_id = "oac-relay"
+client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+redirect_uri = "http://127.0.0.1:0/callback"
+scopes = ["openid", "email", "profile"]
+
+[backend]
+name = "openai"
+# The OpenAI-compatible backend the central proxy forwards to.
+base_url = "https://api.openai.com"
+
+[mtls]
+# mTLS certs — mount read-only. The CA validates relay client certs.
+ca_cert_path = "/certs/ca.crt"
+server_cert_path = "/certs/server.crt"
+server_key_path = "/certs/server.key"
+
+[secret_store]
+# File-backed secret store for the master backend key.
+# In production, prefer a real secret manager (vault/aws/gcp/azure) once
+# those backends are implemented (see AGENTS.md "Out of scope"). For now,
+# the file backend reads the key from the Docker secret mount.
+kind = "file"
+path = "/run/secrets/master-key"
+
+# Admin API (optional). Enables /admin/v1/ for policy/device/audit management.
+# Access is authorized by IdP group membership — no static admin token.
+[admin]
+admin_group = "oac-admins"
