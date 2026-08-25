@@ -36,6 +36,7 @@ use oidc_agent_common::error::{Error, Result};
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
 use crate::policy::PolicyStore;
+use crate::usage::UsageTracker;
 
 /// The shared application state for the admin API.
 #[derive(Clone)]
@@ -46,6 +47,8 @@ pub struct AdminState {
     pub device_store: DeviceStore,
     /// The audit logger (for querying the audit log).
     pub audit: AuditLogger,
+    /// The usage tracker (for querying usage and quotas).
+    pub usage_tracker: UsageTracker,
     /// The admin group name (from config). Users in this group may call
     /// the admin API.
     pub admin_group: String,
@@ -66,6 +69,8 @@ pub fn router(state: AdminState) -> Router {
             post(reinstate_device),
         )
         .route("/admin/v1/audit", get(query_audit))
+        .route("/admin/v1/usage", get(query_usage))
+        .route("/admin/v1/quotas/:subject", get(get_quota))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
@@ -423,6 +428,116 @@ async fn query_audit(
     Ok(axum::Json(serde_json::Value::Array(serialized)))
 }
 
+// --- Usage & quota handlers ---
+
+/// Response for a usage query.
+#[derive(Debug, Serialize)]
+pub struct UsageResponse {
+    /// The user subject.
+    pub user_subject: String,
+    /// The period date (e.g. `2026-08-25`).
+    pub period_date: String,
+    /// Cumulative request count.
+    pub request_count: i64,
+    /// Cumulative token count.
+    pub token_count: i64,
+    /// Cumulative cost in USD.
+    pub cost_usd: f64,
+}
+
+/// Query parameters for the usage endpoint.
+#[derive(Debug, Deserialize)]
+pub struct UsageQuery {
+    /// Filter by user subject. If omitted, returns all users.
+    pub subject: Option<String>,
+}
+
+async fn query_usage(
+    State(state): State<AdminState>,
+    Query(params): Query<UsageQuery>,
+) -> HandlerResult<axum::Json<Vec<UsageResponse>>> {
+    if let Some(subject) = params.subject {
+        let usage = state
+            .usage_tracker
+            .get_usage(&subject)
+            .await
+            .map_err(internal_error)?;
+        match usage {
+            Some(u) => Ok(axum::Json(vec![UsageResponse {
+                user_subject: u.user_subject,
+                period_date: u.period_date,
+                request_count: u.request_count,
+                token_count: u.token_count,
+                cost_usd: u.cost_usd,
+            }])),
+            None => Ok(axum::Json(vec![])),
+        }
+    } else {
+        let all = state
+            .usage_tracker
+            .get_all_usage()
+            .await
+            .map_err(internal_error)?;
+        Ok(axum::Json(
+            all.into_iter()
+                .map(|u| UsageResponse {
+                    user_subject: u.user_subject,
+                    period_date: u.period_date,
+                    request_count: u.request_count,
+                    token_count: u.token_count,
+                    cost_usd: u.cost_usd,
+                })
+                .collect(),
+        ))
+    }
+}
+
+/// Response for a quota status query.
+#[derive(Debug, Serialize)]
+pub struct QuotaResponse {
+    /// The user subject.
+    pub user_subject: String,
+    /// The user's groups (JSON array string).
+    pub groups: Option<String>,
+    /// Daily request quota (None = unlimited).
+    pub daily_request_quota: Option<i64>,
+    /// Daily token quota (None = unlimited).
+    pub daily_token_quota: Option<i64>,
+    /// Current request count for today.
+    pub request_count: i64,
+    /// Current token count for today.
+    pub token_count: i64,
+    /// Current cost for today.
+    pub cost_usd: f64,
+}
+
+async fn get_quota(
+    State(state): State<AdminState>,
+    Path(subject): Path<String>,
+) -> HandlerResult<axum::Json<QuotaResponse>> {
+    // Get current usage.
+    let usage = state
+        .usage_tracker
+        .get_usage(&subject)
+        .await
+        .map_err(internal_error)?;
+
+    // Resolve the user's policy. We don't have the user's groups here (the
+    // admin API doesn't receive relay-forwarded groups for the *target*
+    // user), so we return the quotas as None unless we can look them up.
+    // A future enhancement could store the user's groups in the usage_counters
+    // table. For now, return the usage counts and let the admin cross-reference.
+    Ok(axum::Json(QuotaResponse {
+        user_subject: subject.clone(),
+        groups: None,
+        daily_request_quota: None,
+        daily_token_quota: None,
+        request_count: usage.as_ref().map(|u| u.request_count).unwrap_or(0),
+        token_count: usage.as_ref().map(|u| u.token_count).unwrap_or(0),
+        cost_usd: usage.as_ref().map(|u| u.cost_usd).unwrap_or(0.0),
+    }))
+}
+
 // --- Helpers ---
 
 /// Records an admin audit log entry (best-effort).
@@ -501,7 +616,8 @@ mod tests {
         AdminState {
             policy_store: PolicyStore::new(db.clone()),
             device_store: DeviceStore::new(db.clone()),
-            audit: AuditLogger::new(db),
+            audit: AuditLogger::new(db.clone()),
+            usage_tracker: UsageTracker::new(db),
             admin_group: "oac-admins".into(),
         }
     }

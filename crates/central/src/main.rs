@@ -104,6 +104,17 @@ enum AdminSubcommand {
         #[arg(long, default_value = "100")]
         limit: u32,
     },
+    /// Query usage (per-user request/token/cost totals).
+    UsageQuery {
+        /// Filter by user subject. If omitted, returns all users.
+        #[arg(long)]
+        subject: Option<String>,
+    },
+    /// Get quota status for a user.
+    QuotaGet {
+        /// The user subject.
+        subject: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -256,6 +267,24 @@ async fn admin(cli: AdminCli) -> Result<()> {
                 path.push_str(&format!("&subject={s}"));
             }
             let resp = admin_get(&client, base_url, &key, &path).await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::UsageQuery { subject } => {
+            let mut path = "/admin/v1/usage".to_string();
+            if let Some(s) = subject {
+                path.push_str(&format!("?subject={s}"));
+            }
+            let resp = admin_get(&client, base_url, &key, &path).await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::QuotaGet { subject } => {
+            let resp = admin_get(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/quotas/{subject}"),
+            )
+            .await?;
             println!("{resp}");
         }
     }
