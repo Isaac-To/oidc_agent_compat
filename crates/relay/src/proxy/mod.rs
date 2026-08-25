@@ -87,12 +87,8 @@ pub fn router(state: AppState) -> Router {
 /// Returns [`Error`] if the server fails to bind or start.
 pub async fn serve(config: RelayConfig, key_store: KeyStore) -> Result<()> {
     let client = forward::build_client(&config)?;
-    let listener = tokio::net::TcpListener::bind(&config.listen_addr)
-        .await
-        .map_err(|e| oidc_agent_common::error::Error::Http(format!("bind: {e}")))?;
-    let listen_addr = listener
-        .local_addr()
-        .map_err(|e| oidc_agent_common::error::Error::Http(format!("local_addr: {e}")))?;
+    let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
+    let listen_addr = listener.local_addr()?;
     let activity = ActivityLogger::new(key_store.db.clone());
     let state = AppState {
         key_store,
@@ -105,8 +101,7 @@ pub async fn serve(config: RelayConfig, key_store: KeyStore) -> Result<()> {
     tracing::info!("relay listening on {}", listen_addr);
     axum::serve(listener, app)
         .with_graceful_shutdown(oidc_agent_common::shutdown::shutdown_signal())
-        .await
-        .map_err(|e| oidc_agent_common::error::Error::Http(format!("serve: {e}")))?;
+        .await?;
     Ok(())
 }
 
