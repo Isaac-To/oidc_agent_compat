@@ -32,6 +32,10 @@ pub struct VerifiedRelayIdentity {
     pub email: Option<String>,
     /// The relay-side identity database ID.
     pub identity_id: Option<String>,
+    /// The group/role memberships (JSON array string), if provided.
+    pub groups: Option<String>,
+    /// The request ID for end-to-end correlation, if provided.
+    pub request_id: Option<String>,
 }
 
 /// The authentication middleware for the central proxy.
@@ -65,6 +69,16 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
+    let groups = headers
+        .get("x-oac-user-groups")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    let request_id = headers
+        .get("x-oac-request-id")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
     let subject = match subject {
         Some(s) if !s.is_empty() => s,
         _ => {
@@ -85,6 +99,8 @@ pub async fn auth_middleware(
         subject,
         email,
         identity_id,
+        groups,
+        request_id,
     });
 
     Ok(next.run(request).await)

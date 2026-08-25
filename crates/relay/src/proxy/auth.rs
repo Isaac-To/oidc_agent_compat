@@ -58,6 +58,7 @@ pub async fn auth_middleware(
                 identity_id: identity.id,
                 subject: identity.subject,
                 email: identity.email,
+                groups: identity.groups,
                 key_id: key.id,
             });
             Ok(next.run(request).await)
@@ -82,6 +83,8 @@ pub struct VerifiedIdentity {
     pub subject: String,
     /// The email, if provided.
     pub email: Option<String>,
+    /// The group/role memberships (JSON array string), if provided.
+    pub groups: Option<String>,
     /// The database ID of the key used.
     pub key_id: String,
 }

@@ -106,16 +106,21 @@ pub async fn proxy_handler(
     State(state): State<AppState>,
     request: axum::extract::Request,
 ) -> Response<Body> {
+    // Generate a request ID for end-to-end correlation across relay and
+    // central. This is forwarded as the x-oac-request-id header and logged
+    // on both sides.
+    let request_id = uuid::Uuid::new_v4().to_string();
+
     // Extract the verified identity (attached by auth middleware) before
     // the request body is consumed.
     let identity = request
         .extensions()
         .get::<super::auth::VerifiedIdentity>()
         .cloned();
-    match forward_request(&state, request, identity.as_ref()).await {
+    match forward_request(&state, request, identity.as_ref(), &request_id).await {
         Ok(resp) => resp,
         Err(e) => {
-            tracing::error!(error = %e, "forward failed");
+            tracing::error!(error = %e, request_id = %request_id, "forward failed");
             let body = serde_json::json!({
                 "error": {
                     "message": "upstream request failed",
@@ -137,13 +142,15 @@ pub async fn proxy_handler(
 /// # Security
 ///
 /// The relay replaces the incoming `Authorization` (the local API key) with
-/// the verified user identity, forwarded as `X-OAC-User-Subject` and
-/// `X-OAC-User-Email` headers. The central proxy uses these for audit
-/// logging. The local key is never forwarded to the central proxy.
+/// the verified user identity, forwarded as `X-OAC-User-Subject`,
+/// `X-OAC-User-Email`, `X-OAC-User-Groups`, and `X-OAC-Identity-Id` headers.
+/// The central proxy uses these for audit logging and authorization. The
+/// local key is never forwarded to the central proxy.
 async fn forward_request(
     state: &AppState,
     request: axum::extract::Request,
     identity: Option<&super::auth::VerifiedIdentity>,
+    request_id: &str,
 ) -> Result<Response<Body>> {
     let (parts, body) = request.into_parts();
 
@@ -169,9 +176,9 @@ async fn forward_request(
     }
 
     // Forward the verified user identity to the central proxy for audit
-    // logging. These headers are set by the relay ONLY from the
-    // auth-middleware-verified identity (never from the incoming request
-    // headers), so a client cannot spoof them.
+    // logging and authorization. These headers are set by the relay ONLY
+    // from the auth-middleware-verified identity (never from the incoming
+    // request headers), so a client cannot spoof them.
     if let Some(ident) = identity {
         if let Ok(v) = HeaderValue::from_str(&ident.subject) {
             upstream = upstream.header("x-oac-user-subject", v);
@@ -181,9 +188,19 @@ async fn forward_request(
                 upstream = upstream.header("x-oac-user-email", v);
             }
         }
+        if let Some(groups) = &ident.groups {
+            if let Ok(v) = HeaderValue::from_str(groups) {
+                upstream = upstream.header("x-oac-user-groups", v);
+            }
+        }
         if let Ok(v) = HeaderValue::from_str(&ident.identity_id) {
             upstream = upstream.header("x-oac-identity-id", v);
         }
+    }
+
+    // Forward the request ID for end-to-end correlation.
+    if let Ok(v) = HeaderValue::from_str(request_id) {
+        upstream = upstream.header("x-oac-request-id", v);
     }
 
     // Send the request.
