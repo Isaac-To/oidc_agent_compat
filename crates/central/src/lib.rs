@@ -17,5 +17,6 @@ pub mod audit;
 pub mod db;
 pub mod entity;
 pub mod migration;
+pub mod policy;
 pub mod proxy;
 pub mod secrets;

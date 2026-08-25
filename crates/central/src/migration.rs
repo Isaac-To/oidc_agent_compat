@@ -170,7 +170,11 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(Migration), Box::new(Migration0002AuditEnrichment)]
+        vec![
+            Box::new(Migration),
+            Box::new(Migration0002AuditEnrichment),
+            Box::new(Migration0003GroupPolicies),
+        ]
     }
 }
 
@@ -218,4 +222,173 @@ impl MigrationTrait for Migration0002AuditEnrichment {
         let _ = manager;
         Ok(())
     }
+}
+
+/// Migration 0003: create the `group_policies` and `admin_audit_log` tables.
+///
+/// `group_policies` stores per-group authorization policies (model
+/// allowlists, endpoint restrictions, quotas) managed via the admin API.
+/// `admin_audit_log` is an append-only record of admin API mutations for
+/// accountability.
+pub struct Migration0003GroupPolicies;
+
+impl MigrationName for Migration0003GroupPolicies {
+    fn name(&self) -> &str {
+        "m000003_group_policies"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0003GroupPolicies {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(GroupPolicy::Table)
+                    .col(
+                        ColumnDef::new(GroupPolicy::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(GroupPolicy::GroupName)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(GroupPolicy::AllowedModels).string().null())
+                    .col(ColumnDef::new(GroupPolicy::AllowedEndpoints).string().null())
+                    .col(
+                        ColumnDef::new(GroupPolicy::DailyTokenQuota)
+                            .big_integer()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(GroupPolicy::DailyRequestQuota)
+                            .big_integer()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(GroupPolicy::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(GroupPolicy::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(AdminAuditLog::Table)
+                    .col(
+                        ColumnDef::new(AdminAuditLog::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(AdminAuditLog::AdminSubject)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AdminAuditLog::Action)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AdminAuditLog::Target)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(AdminAuditLog::Payload).string().null())
+                    .col(
+                        ColumnDef::new(AdminAuditLog::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Append-only triggers on admin_audit_log.
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE TRIGGER IF NOT EXISTS admin_audit_log_no_update \
+                 BEFORE UPDATE ON admin_audit_log \
+                 BEGIN SELECT RAISE(ABORT, 'admin_audit_log is append-only'); END;",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE TRIGGER IF NOT EXISTS admin_audit_log_no_delete \
+                 BEFORE DELETE ON admin_audit_log \
+                 BEGIN SELECT RAISE(ABORT, 'admin_audit_log is append-only'); END;",
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(AdminAuditLog::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(GroupPolicy::Table).to_owned())
+            .await
+    }
+}
+
+/// Iden for the `group_policies` table.
+#[derive(Iden)]
+pub enum GroupPolicy {
+    /// The table.
+    #[iden = "group_policies"]
+    Table,
+    /// Primary key (UUID).
+    Id,
+    /// The group name (unique).
+    GroupName,
+    /// JSON array of allowed models (NULL = all allowed).
+    AllowedModels,
+    /// JSON array of allowed endpoints (NULL = all allowed).
+    AllowedEndpoints,
+    /// Daily token quota (NULL = unlimited).
+    DailyTokenQuota,
+    /// Daily request quota (NULL = unlimited).
+    DailyRequestQuota,
+    /// Creation timestamp.
+    CreatedAt,
+    /// Last-update timestamp.
+    UpdatedAt,
+}
+
+/// Iden for the `admin_audit_log` table.
+#[derive(Iden)]
+pub enum AdminAuditLog {
+    /// The table.
+    #[iden = "admin_audit_log"]
+    Table,
+    /// Primary key (UUID).
+    Id,
+    /// The admin's subject (from the admin token).
+    AdminSubject,
+    /// The action performed (e.g. `upsert_policy`, `delete_policy`).
+    Action,
+    /// The target of the action (e.g. group name or device fingerprint).
+    Target,
+    /// The request payload (JSON), if any.
+    Payload,
+    /// Creation timestamp.
+    CreatedAt,
 }
