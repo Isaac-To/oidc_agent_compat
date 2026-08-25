@@ -141,10 +141,7 @@ fn read_codex(path: &Path) -> Result<AgentConfig> {
             ))
         })?
         .to_string();
-    Ok(AgentConfig {
-        base_url,
-        api_key,
-    })
+    Ok(AgentConfig { base_url, api_key })
 }
 
 /// Reads the base URL and API key from a generic env file (`agent-env.sh`).
@@ -163,10 +160,7 @@ fn read_generic_env(path: &Path) -> Result<AgentConfig> {
             path.display()
         ))
     })?;
-    Ok(AgentConfig {
-        base_url,
-        api_key,
-    })
+    Ok(AgentConfig { base_url, api_key })
 }
 
 /// Extracts a `export VAR='value'` (or `export VAR="value"`) assignment from
@@ -430,8 +424,7 @@ mod tests {
 
     #[test]
     fn extract_env_var_finds_single_quoted_value() {
-        let contents =
-            "# comment\nexport OPENAI_API_BASE='http://127.0.0.1:8787/v1'\nexport OPENAI_API_KEY='oac_abc'\n";
+        let contents = "# comment\nexport OPENAI_API_BASE='http://127.0.0.1:8787/v1'\nexport OPENAI_API_KEY='oac_abc'\n";
         assert_eq!(
             extract_env_var(contents, "OPENAI_API_BASE"),
             Some("http://127.0.0.1:8787/v1".into())

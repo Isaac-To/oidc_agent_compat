@@ -72,9 +72,7 @@ pub async fn auth_middleware(
                 // In dev mode, allow requests without identity headers (the
                 // dev stack's relay forwards the dev identity, but be
                 // permissive for manual curl testing).
-                tracing::warn!(
-                    "dev_mode: allowing central request without X-OAC-User-Subject"
-                );
+                tracing::warn!("dev_mode: allowing central request without X-OAC-User-Subject");
                 return Ok(next.run(request).await);
             }
             tracing::warn!("rejected central request without X-OAC-User-Subject");
