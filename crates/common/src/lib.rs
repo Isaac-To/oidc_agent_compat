@@ -10,6 +10,10 @@
 //! - [`config`] — configuration structs and validation for both components.
 //! - [`oidc`] — OIDC relying-party client builder.
 //! - [`mtls`] — rustls mTLS client and server configuration builders.
+//! - [`http_util`] — shared HTTP forwarding utilities (hop-by-hop stripping, path sanitization, SSE detection).
+//! - [`identity`] — shared `X-OAC-*` identity-header constants for the relay → central flow.
+//! - [`time_util`] — shared timestamp helpers for activity/audit logs.
+//! - [`persistence`] — shared SQLite setup and migration-runner helpers.
 //! - [`logging`] — structured JSON logging with secret redaction.
 //! - [`shutdown`] — graceful shutdown signal handling.
 //!
@@ -31,11 +35,15 @@
 
 pub mod config;
 pub mod error;
+pub mod http_util;
+pub mod identity;
 pub mod keys;
 pub mod logging;
 pub mod mtls;
 pub mod oidc;
+pub mod persistence;
 pub mod shutdown;
+pub mod time_util;
 
 #[cfg(feature = "test-certs")]
 pub mod test_certs;

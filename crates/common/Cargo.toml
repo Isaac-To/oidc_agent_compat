@@ -16,6 +16,8 @@ reqwest = { workspace = true }
 openidconnect = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

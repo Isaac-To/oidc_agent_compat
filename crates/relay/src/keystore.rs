@@ -13,29 +13,14 @@
 //! - Verification uses constant-time comparison via [`subtle::ConstantTimeEq`].
 
 use oidc_agent_common::keys::{KeyHash, LocalKey};
+use oidc_agent_common::time_util;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, Statement, Value,
 };
-use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 use crate::entity::{api_key, identity};
 use oidc_agent_common::error::{Error, Result};
-
-/// Returns the current UTC time as a `PrimitiveDateTime` (for sea-orm).
-fn now_utc() -> PrimitiveDateTime {
-    let offset = time::OffsetDateTime::now_utc();
-    PrimitiveDateTime::new(offset.date(), offset.time())
-}
-
-/// Formats a `PrimitiveDateTime` as a string for SQLite.
-fn format_time(t: &PrimitiveDateTime) -> String {
-    // Use the time crate's built-in format items.
-    t.format(time::macros::format_description!(
-        "[year]-[month]-[day] [hour]:[minute]:[second]"
-    ))
-    .unwrap_or_default()
-}
 
 /// A key store backed by the relay's SQLite database.
 #[derive(Clone)]
@@ -89,9 +74,9 @@ impl KeyStore {
         }
 
         // Create a new identity using parameterized SQL.
-        let now = now_utc();
+        let now = time_util::now_utc();
         let id = Uuid::new_v4().to_string();
-        let now_str = format_time(&now);
+        let now_str = time_util::format_time(&now);
         let email_val = email
             .map(|e| Value::String(Some(Box::new(e.to_string()))))
             .unwrap_or(Value::String(None));
@@ -143,9 +128,9 @@ impl KeyStore {
     pub async fn mint_key(&self, identity_id: &str, label: &str) -> Result<MintedKey> {
         let plaintext = LocalKey::generate();
         let hash = KeyHash::from_plaintext(&plaintext.to_string());
-        let now = now_utc();
+        let now = time_util::now_utc();
         let key_id = Uuid::new_v4().to_string();
-        let now_str = format_time(&now);
+        let now_str = time_util::format_time(&now);
 
         // Use parameterized SQL to prevent injection.
         let sql = "INSERT INTO api_keys (id, identity_id, key_hash, label, created_at, last_used_at) \
@@ -196,9 +181,9 @@ impl KeyStore {
     ) -> Result<MintedKey> {
         let key = LocalKey::from_string(plaintext.to_string());
         let hash = KeyHash::from_plaintext(&key.to_string());
-        let now = now_utc();
+        let now = time_util::now_utc();
         let key_id = Uuid::new_v4().to_string();
-        let now_str = format_time(&now);
+        let now_str = time_util::format_time(&now);
 
         // Use parameterized SQL to prevent injection.
         let sql = "INSERT INTO api_keys (id, identity_id, key_hash, label, created_at, last_used_at) \
@@ -272,8 +257,8 @@ impl KeyStore {
 
         // Update last_used_at if we found a match (outside the loop).
         if let Some((key, _)) = &found {
-            let now = now_utc();
-            let now_str = format_time(&now);
+            let now = time_util::now_utc();
+            let now_str = time_util::format_time(&now);
             let sql = "UPDATE api_keys SET last_used_at = $1 WHERE id = $2";
             let _ = self
                 .db

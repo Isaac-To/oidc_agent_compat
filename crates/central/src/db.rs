@@ -1,8 +1,8 @@
 //! Database setup and migration runner for the central proxy.
 
-use oidc_agent_common::error::{Error, Result};
-use sea_orm::{ConnectOptions, DatabaseConnection};
-use sea_orm_migration::MigratorTrait;
+use oidc_agent_common::error::Result;
+use oidc_agent_common::persistence;
+use sea_orm::DatabaseConnection;
 
 use crate::migration::Migrator;
 
@@ -10,23 +10,10 @@ use crate::migration::Migrator;
 ///
 /// # Errors
 ///
-/// Returns [`Error::Database`] if the connection fails or migrations error.
+/// Returns [`oidc_agent_common::error::Error::Database`] if the connection
+/// fails or migrations error.
 pub async fn setup(database_url: &str) -> Result<DatabaseConnection> {
-    let url = if database_url.starts_with("sqlite://") && !database_url.contains('?') {
-        format!("{database_url}?mode=rwc")
-    } else {
-        database_url.to_string()
-    };
-    let options = ConnectOptions::new(url);
-    let db = sea_orm::Database::connect(options)
-        .await
-        .map_err(|e| Error::Database(format!("connect: {e}")))?;
-
-    Migrator::up(&db, None)
-        .await
-        .map_err(|e| Error::Database(format!("migrate: {e}")))?;
-
-    Ok(db)
+    persistence::setup_database::<Migrator>(database_url).await
 }
 
 #[cfg(test)]

@@ -14,10 +14,10 @@
 //! - The log records who made the request, when, and the outcome.
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
-use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 use oidc_agent_common::error::{Error, Result};
+use oidc_agent_common::time_util;
 
 /// A relay-side activity log entry for a single forwarded request.
 #[derive(Debug, Clone)]
@@ -65,8 +65,8 @@ impl ActivityLogger {
     /// Returns [`Error::Database`] if the insert fails.
     pub async fn record(&self, entry: &RelayActivityEntry) -> Result<()> {
         let id = Uuid::new_v4().to_string();
-        let now = now_utc();
-        let now_str = format_time(&now);
+        let now = time_util::now_utc();
+        let now_str = time_util::format_time(&now);
 
         let model_value = entry
             .model
@@ -110,20 +110,6 @@ impl ActivityLogger {
 
         Ok(())
     }
-}
-
-/// Returns the current UTC time as a `PrimitiveDateTime`.
-fn now_utc() -> PrimitiveDateTime {
-    let offset = time::OffsetDateTime::now_utc();
-    PrimitiveDateTime::new(offset.date(), offset.time())
-}
-
-/// Formats a `PrimitiveDateTime` for SQLite.
-fn format_time(t: &PrimitiveDateTime) -> String {
-    t.format(time::macros::format_description!(
-        "[year]-[month]-[day] [hour]:[minute]:[second]"
-    ))
-    .unwrap_or_default()
 }
 
 #[cfg(test)]

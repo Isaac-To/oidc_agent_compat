@@ -43,7 +43,10 @@ pub struct AppState {
 }
 
 /// The maximum request body size (10 MB).
-pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+///
+/// Re-exported from [`oidc_agent_common::http_util`] so both proxies share
+/// a single source of truth.
+pub const MAX_BODY_SIZE: usize = oidc_agent_common::http_util::MAX_BODY_SIZE;
 
 /// Builds the Axum router for the relay proxy.
 ///

@@ -21,33 +21,13 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
+use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
 use oidc_agent_common::error::{Error, Result};
+use oidc_agent_common::http_util;
 
 use super::AppState;
 use crate::audit::AuditEntry;
-
-/// Hop-by-hop headers that must be stripped when forwarding (RFC 7230 §6.1).
-pub const HOP_BY_HOP_HEADERS: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
-
-/// End-to-end headers that are safe to forward.
-pub const FORWARDABLE_HEADERS: &[&str] = &[
-    "content-type",
-    "accept",
-    "accept-encoding",
-    "accept-language",
-    "user-agent",
-];
 
 /// Builds the HTTP client for forwarding to the backend.
 ///
@@ -184,14 +164,14 @@ async fn forward_request(
     let body_bytes = axum::body::to_bytes(body, super::MAX_BODY_SIZE)
         .await
         .map_err(|e| Error::Http(format!("read body: {e}")))?;
-    let model = extract_model(&body_bytes);
+    let model = http_util::extract_model(&body_bytes);
 
     // Build the upstream URL.
-    let sanitized = sanitize_path(parts.uri.path())?;
+    let sanitized = http_util::sanitize_path(parts.uri.path())?;
     let upstream_url = format!("{}{}", state.config.backend.base_url, sanitized);
 
     // Build the upstream request with sanitized headers + master key.
-    let forward_headers = build_forward_headers(&parts.headers);
+    let forward_headers = http_util::build_forward_headers(&parts.headers);
     let mut upstream = state
         .client
         .request(parts.method, &upstream_url)
@@ -216,7 +196,7 @@ async fn forward_request(
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let is_stream = content_type.contains("text/event-stream");
+    let is_stream = http_util::is_sse_content_type(content_type);
 
     if !is_stream {
         // Buffer the response and extract token usage.
@@ -228,7 +208,7 @@ async fn forward_request(
         let mut response_builder = Response::builder().status(status);
         for (name, value) in &resp_headers {
             let name_lower = name.as_str().to_lowercase();
-            if !HOP_BY_HOP_HEADERS.contains(&name_lower.as_str()) {
+            if !http_util::is_response_header_stripped(&name_lower) {
                 response_builder = response_builder.header(name, value);
             }
         }
@@ -244,7 +224,7 @@ async fn forward_request(
     let mut response_builder = Response::builder().status(status);
     for (name, value) in &resp_headers {
         let name_lower = name.as_str().to_lowercase();
-        if !HOP_BY_HOP_HEADERS.contains(&name_lower.as_str()) {
+        if !http_util::is_response_header_stripped(&name_lower) {
             response_builder = response_builder.header(name, value);
         }
     }
@@ -261,12 +241,6 @@ async fn forward_request(
     // enhancement can use a oneshot channel to await the final usage.
     let _ = usage_handle;
     Ok((resp, model, status, is_stream, TokenUsage::default()))
-}
-
-/// Extracts the `model` field from a JSON request body (for audit logging).
-fn extract_model(body: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    value.get("model")?.as_str().map(String::from)
 }
 
 /// Extracts token usage from a JSON response body (OpenAI format).
@@ -355,94 +329,9 @@ fn extract_usage_from_sse_chunk(
     }
 }
 
-/// Sanitizes the request path to prevent SSRF.
-///
-/// # Errors
-///
-/// Returns [`Error::Http`] if the path is unsafe.
-fn sanitize_path(path: &str) -> Result<String> {
-    if path.contains("..") {
-        return Err(Error::Http(format!("path contains '..': {path}")));
-    }
-    if path.contains("//") {
-        return Err(Error::Http(format!("path contains '//': {path}")));
-    }
-    if path.starts_with("http://") || path.starts_with("https://") {
-        return Err(Error::Http(format!("path is absolute URL: {path}")));
-    }
-    Ok(path.to_string())
-}
-
-/// Builds the set of headers to forward to the upstream, stripping hop-by-hop
-/// headers and any headers named in the `Connection` header.
-fn build_forward_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
-    let connection_headers: Vec<String> = headers
-        .get("connection")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').map(|h| h.trim().to_lowercase()).collect())
-        .unwrap_or_default();
-
-    let mut result = Vec::new();
-    for name in FORWARDABLE_HEADERS {
-        if let Some(value) = headers.get(*name) {
-            if connection_headers.iter().any(|h| h == name) {
-                continue;
-            }
-            if let (Ok(n), Ok(v)) = (
-                HeaderName::try_from(*name),
-                HeaderValue::from_bytes(value.as_bytes()),
-            ) {
-                result.push((n, v));
-            }
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sanitize_path_accepts_normal_paths() {
-        assert_eq!(
-            sanitize_path("/v1/chat/completions").unwrap(),
-            "/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn sanitize_path_rejects_dot_dot() {
-        assert!(sanitize_path("/v1/../etc/passwd").is_err());
-    }
-
-    #[test]
-    fn sanitize_path_rejects_double_slash() {
-        assert!(sanitize_path("/v1//chat").is_err());
-    }
-
-    #[test]
-    fn sanitize_path_rejects_absolute_url() {
-        assert!(sanitize_path("http://evil.example.com/v1").is_err());
-    }
-
-    #[test]
-    fn extract_model_from_valid_body() {
-        let body = br#"{"model": "gpt-4", "messages": []}"#;
-        assert_eq!(extract_model(body), Some("gpt-4".into()));
-    }
-
-    #[test]
-    fn extract_model_from_body_without_model() {
-        let body = br#"{"messages": []}"#;
-        assert_eq!(extract_model(body), None);
-    }
-
-    #[test]
-    fn extract_model_from_invalid_json() {
-        let body = b"not json";
-        assert_eq!(extract_model(body), None);
-    }
 
     #[test]
     fn extract_token_usage_from_openai_response() {
@@ -518,37 +407,5 @@ mod tests {
         let guard = usage.lock().unwrap();
         let extracted = guard.as_ref().expect("usage must be extracted");
         assert_eq!(extracted.total, Some(30));
-    }
-
-    #[test]
-    fn build_forward_headers_strips_hop_by_hop() {
-        let mut headers = HeaderMap::new();
-        headers.insert("content-type", "application/json".parse().unwrap());
-        headers.insert("connection", "keep-alive".parse().unwrap());
-        headers.insert("transfer-encoding", "chunked".parse().unwrap());
-        headers.insert("authorization", "Bearer relay-token".parse().unwrap());
-
-        let forwarded = build_forward_headers(&headers);
-        let names: Vec<&str> = forwarded.iter().map(|(n, _)| n.as_str()).collect();
-
-        assert!(names.contains(&"content-type"));
-        assert!(!names.contains(&"connection"));
-        assert!(!names.contains(&"transfer-encoding"));
-        assert!(
-            !names.contains(&"authorization"),
-            "authorization must not be forwarded (replaced by master key)"
-        );
-    }
-
-    #[test]
-    fn hop_by_hop_headers_list_is_complete() {
-        assert!(HOP_BY_HOP_HEADERS.contains(&"connection"));
-        assert!(HOP_BY_HOP_HEADERS.contains(&"keep-alive"));
-        assert!(HOP_BY_HOP_HEADERS.contains(&"proxy-authenticate"));
-        assert!(HOP_BY_HOP_HEADERS.contains(&"proxy-authorization"));
-        assert!(HOP_BY_HOP_HEADERS.contains(&"te"));
-        assert!(HOP_BY_HOP_HEADERS.contains(&"trailer"));
-        assert!(HOP_BY_HOP_HEADERS.contains(&"transfer-encoding"));
-        assert!(HOP_BY_HOP_HEADERS.contains(&"upgrade"));
     }
 }

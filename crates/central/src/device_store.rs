@@ -11,10 +11,10 @@
 //! checks are skipped.
 
 use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter};
-use time::PrimitiveDateTime;
 use uuid::Uuid;
 
 use oidc_agent_common::error::{Error, Result};
+use oidc_agent_common::time_util;
 
 use crate::entity::device;
 
@@ -76,8 +76,8 @@ impl DeviceStore {
         user_email: Option<&str>,
     ) -> Result<device::Model> {
         let existing = self.get_device(cert_fingerprint).await?;
-        let now = now_utc();
-        let now_str = format_time(&now);
+        let now = time_util::now_utc();
+        let now_str = time_util::format_time(&now);
 
         if let Some(model) = existing {
             // Update last_seen_at and user_email.
@@ -190,20 +190,6 @@ impl DeviceStore {
         let device = self.get_device(fingerprint).await?;
         Ok(device.map(|d| d.revoked))
     }
-}
-
-/// Returns the current UTC time as a `PrimitiveDateTime`.
-fn now_utc() -> PrimitiveDateTime {
-    let offset = time::OffsetDateTime::now_utc();
-    PrimitiveDateTime::new(offset.date(), offset.time())
-}
-
-/// Formats a `PrimitiveDateTime` for SQLite.
-fn format_time(t: &PrimitiveDateTime) -> String {
-    t.format(time::macros::format_description!(
-        "[year]-[month]-[day] [hour]:[minute]:[second]"
-    ))
-    .unwrap_or_default()
 }
 
 #[cfg(test)]
