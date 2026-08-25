@@ -24,6 +24,7 @@ use oidc_agent_common::config::RelayConfig;
 use oidc_agent_common::error::Result;
 use tower_http::limit::RequestBodyLimitLayer;
 
+use crate::activity::ActivityLogger;
 use crate::keystore::KeyStore;
 
 /// The shared application state for the relay proxy.
@@ -37,6 +38,8 @@ pub struct AppState {
     pub client: reqwest::Client,
     /// The actual bound listen address (may differ from config if port 0).
     pub listen_addr: SocketAddr,
+    /// The relay-side activity logger.
+    pub activity: ActivityLogger,
 }
 
 /// The maximum request body size (10 MB).
@@ -87,11 +90,13 @@ pub async fn serve(config: RelayConfig, key_store: KeyStore) -> Result<()> {
     let listen_addr = listener
         .local_addr()
         .map_err(|e| oidc_agent_common::error::Error::Http(format!("local_addr: {e}")))?;
+    let activity = ActivityLogger::new(key_store.db.clone());
     let state = AppState {
         key_store,
         config: config.clone(),
         client,
         listen_addr,
+        activity,
     };
     let app = router(state);
     tracing::info!("relay listening on {}", listen_addr);

@@ -22,9 +22,16 @@ use zeroize::Zeroizing;
 
 /// Sets up the full system: mock backend + central proxy + relay.
 ///
-/// Returns the relay address, an HTTP client, a valid local API key, and the
-/// central proxy's audit logger (for verifying audit entries).
-async fn setup_full_system() -> (SocketAddr, reqwest::Client, String, AuditLogger) {
+/// Returns the relay address, an HTTP client, a valid local API key, the
+/// central proxy's audit logger (for verifying audit entries), and the
+/// relay's key store (for verifying relay activity log entries).
+async fn setup_full_system() -> (
+    SocketAddr,
+    reqwest::Client,
+    String,
+    AuditLogger,
+    oac_relay::keystore::KeyStore,
+) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -177,22 +184,23 @@ async fn setup_full_system() -> (SocketAddr, reqwest::Client, String, AuditLogge
         .expect("bind relay");
     let relay_addr = relay_listener.local_addr().expect("relay addr");
     let relay_state = relay_proxy::AppState {
-        key_store,
+        key_store: key_store.clone(),
         config: relay_config.clone(),
         client: relay_client,
         listen_addr: relay_addr,
+        activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
     };
     let relay_app = relay_proxy::router(relay_state);
     tokio::spawn(async {
         let _ = axum::serve(relay_listener, relay_app).await;
     });
 
-    (relay_addr, reqwest::Client::new(), local_key, audit)
+    (relay_addr, reqwest::Client::new(), local_key, audit, key_store)
 }
 
 #[tokio::test]
 async fn e2e_healthz() {
-    let (addr, client, _, _) = setup_full_system().await;
+    let (addr, client, _, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/healthz", addr.port());
     let resp = client.get(&url).send().await.expect("request");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -200,7 +208,7 @@ async fn e2e_healthz() {
 
 #[tokio::test]
 async fn e2e_get_models_through_full_chain() {
-    let (addr, client, key, _) = setup_full_system().await;
+    let (addr, client, key, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client
         .get(&url)
@@ -216,7 +224,7 @@ async fn e2e_get_models_through_full_chain() {
 
 #[tokio::test]
 async fn e2e_post_chat_completions_through_full_chain() {
-    let (addr, client, key, _) = setup_full_system().await;
+    let (addr, client, key, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
     let body = serde_json::json!({
         "model": "gpt-4",
@@ -241,7 +249,7 @@ async fn e2e_post_chat_completions_through_full_chain() {
 
 #[tokio::test]
 async fn e2e_post_embeddings_through_full_chain() {
-    let (addr, client, key, _) = setup_full_system().await;
+    let (addr, client, key, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/embeddings", addr.port());
     let body = serde_json::json!({
         "model": "text-embedding-ada-002",
@@ -262,7 +270,7 @@ async fn e2e_post_embeddings_through_full_chain() {
 
 #[tokio::test]
 async fn e2e_rejects_request_without_key() {
-    let (addr, client, _, _) = setup_full_system().await;
+    let (addr, client, _, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client.get(&url).send().await.expect("request");
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
@@ -270,7 +278,7 @@ async fn e2e_rejects_request_without_key() {
 
 #[tokio::test]
 async fn e2e_rejects_invalid_key() {
-    let (addr, client, _, _) = setup_full_system().await;
+    let (addr, client, _, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client
         .get(&url)
@@ -283,7 +291,7 @@ async fn e2e_rejects_invalid_key() {
 
 #[tokio::test]
 async fn e2e_rejects_non_loopback_host() {
-    let (addr, client, _, _) = setup_full_system().await;
+    let (addr, client, _, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client
         .get(&url)
@@ -296,7 +304,7 @@ async fn e2e_rejects_non_loopback_host() {
 
 #[tokio::test]
 async fn e2e_master_key_not_in_relay_response() {
-    let (addr, client, key, _) = setup_full_system().await;
+    let (addr, client, key, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
     let body = serde_json::json!({"model": "gpt-4", "messages": []});
     let resp = client
@@ -315,7 +323,7 @@ async fn e2e_master_key_not_in_relay_response() {
 
 #[tokio::test]
 async fn e2e_master_key_not_in_error_response() {
-    let (addr, client, _, _) = setup_full_system().await;
+    let (addr, client, _, _, _) = setup_full_system().await;
     // Send a request without auth to get an error response.
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client.get(&url).send().await.expect("request");
@@ -331,7 +339,7 @@ async fn e2e_identity_forwarded_and_audited() {
     use oac_central::entity::audit_log;
     use sea_orm::EntityTrait;
 
-    let (addr, client, key, audit) = setup_full_system().await;
+    let (addr, client, key, audit, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
     let body = serde_json::json!({
         "model": "gpt-4",
@@ -367,4 +375,95 @@ async fn e2e_identity_forwarded_and_audited() {
     );
     assert_eq!(last.model.as_deref(), Some("gpt-4"));
     assert_eq!(last.status, 200);
+    // Enrichment columns.
+    assert!(
+        last.identity_id.is_some(),
+        "audit log must record the identity_id"
+    );
+    assert_eq!(last.email.as_deref(), Some("e2e@example.com"));
+    assert_eq!(last.endpoint.as_deref(), Some("/v1/chat/completions"));
+    assert!(
+        last.request_id.is_some(),
+        "audit log must record the request_id"
+    );
+}
+
+#[tokio::test]
+async fn e2e_relay_activity_log_records_request() {
+    use oac_relay::entity::relay_activity_log;
+    use sea_orm::EntityTrait;
+
+    let (addr, client, key, _, key_store) = setup_full_system().await;
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Give the activity log a moment to flush.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Verify the relay activity log recorded the request.
+    let entries = relay_activity_log::Entity::find()
+        .all(&key_store.db)
+        .await
+        .expect("load relay activity log");
+    assert!(
+        !entries.is_empty(),
+        "relay activity log must contain at least one entry"
+    );
+    let last = entries.last().expect("at least one entry");
+    assert_eq!(last.method, "POST");
+    assert_eq!(last.endpoint, "/v1/chat/completions");
+    assert_eq!(last.model.as_deref(), Some("gpt-4"));
+    assert_eq!(last.central_status, Some(200));
+    assert!(
+        last.request_id.is_some(),
+        "relay activity log must record the request_id"
+    );
+}
+
+#[tokio::test]
+async fn e2e_request_id_correlates_relay_and_central() {
+    use oac_central::entity::audit_log;
+    use sea_orm::EntityTrait;
+
+    let (addr, client, key, audit, _) = setup_full_system().await;
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The central audit log must have a non-null request_id for the request.
+    let entries = audit_log::Entity::find()
+        .all(audit.db())
+        .await
+        .expect("load audit log");
+    assert!(!entries.is_empty());
+    let last = entries.last().expect("at least one entry");
+    assert!(
+        last.request_id.is_some(),
+        "central audit log must record the request_id forwarded by the relay"
+    );
 }
