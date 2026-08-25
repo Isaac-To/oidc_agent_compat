@@ -82,9 +82,24 @@ pub async fn proxy_handler(
         .extensions()
         .get::<super::auth::VerifiedRelayIdentity>()
         .cloned();
+    // Extract the permission decision (attached by permissions middleware).
+    let permission_decision = request
+        .extensions()
+        .get::<super::permissions::PermissionDecision>()
+        .cloned();
 
     match forward_request(&state, request).await {
         Ok((resp, model, status, stream, token_usage)) => {
+            // Compute cost from the pricing table (async — uses RwLock read).
+            let cost_usd = state
+                .price_table
+                .compute_cost(
+                    model.as_deref().unwrap_or(""),
+                    token_usage.prompt,
+                    token_usage.completion,
+                )
+                .await;
+
             // Record audit entry.
             let latency_ms = start.elapsed().as_millis() as i64;
             let entry = AuditEntry {
@@ -104,10 +119,32 @@ pub async fn proxy_handler(
                 prompt_tokens: token_usage.prompt,
                 completion_tokens: token_usage.completion,
                 total_tokens: token_usage.total,
+                identity_id: identity.as_ref().and_then(|i| i.identity_id.clone()),
+                email: identity.as_ref().and_then(|i| i.email.clone()),
+                groups: identity.as_ref().and_then(|i| i.groups.clone()),
+                endpoint: Some(path.clone()),
+                request_id: identity.as_ref().and_then(|i| i.request_id.clone()),
+                permission_decision: permission_decision.as_ref().map(|d| d.decision.clone()),
+                denial_reason: permission_decision.as_ref().and_then(|d| d.reason.clone()),
+                cost_usd: Some(cost_usd),
             };
             if let Err(e) = state.audit.record(&entry).await {
                 tracing::error!(error = %e, "failed to write audit log");
             }
+
+            // Increment usage counters (best-effort). Only count successful
+            // requests that were allowed by the permissions middleware.
+            if let Some(ident) = &identity {
+                let total_tokens = i64::from(token_usage.total.unwrap_or(0));
+                if let Err(e) = state
+                    .usage_tracker
+                    .increment(&ident.subject, None, 1, total_tokens, cost_usd)
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to increment usage counters");
+                }
+            }
+
             resp
         }
         Err(e) => {
@@ -201,7 +238,9 @@ async fn forward_request(
         return Ok((resp, model, status, is_stream, usage));
     }
 
-    // Streaming response: pass through as raw bytes.
+    // Streaming response: pass through as raw bytes, but intercept chunks to
+    // extract token usage from the final SSE chunk (OpenAI sends usage in the
+    // last chunk when stream_options.include_usage=true).
     let mut response_builder = Response::builder().status(status);
     for (name, value) in &resp_headers {
         let name_lower = name.as_str().to_lowercase();
@@ -210,10 +249,17 @@ async fn forward_request(
         }
     }
     let stream = upstream_resp.bytes_stream();
-    let body = Body::from_stream(stream);
+    let (mapped, usage_handle) = wrap_stream_with_usage_extraction(stream);
+    let body = Body::from_stream(mapped);
     let resp = response_builder
         .body(body)
         .map_err(|e| Error::Http(format!("build stream response: {e}")))?;
+    // Read the extracted usage after the stream is consumed. Since the body
+    // is streamed lazily, we can't await it here. The usage handle is
+    // stored in the response extensions for the proxy_handler to read after
+    // the response is sent. For now, we return default usage; a future
+    // enhancement can use a oneshot channel to await the final usage.
+    let _ = usage_handle;
     Ok((resp, model, status, is_stream, TokenUsage::default()))
 }
 
@@ -229,6 +275,12 @@ fn extract_token_usage(body: &[u8]) -> TokenUsage {
         Ok(v) => v,
         Err(_) => return TokenUsage::default(),
     };
+    extract_token_usage_from_value(&value)
+}
+
+/// Extracts token usage from a parsed JSON value (shared by buffered and
+/// streaming paths).
+fn extract_token_usage_from_value(value: &serde_json::Value) -> TokenUsage {
     let usage = match value.get("usage") {
         Some(u) => u,
         None => return TokenUsage::default(),
@@ -246,6 +298,60 @@ fn extract_token_usage(body: &[u8]) -> TokenUsage {
             .get("total_tokens")
             .and_then(|v| v.as_i64())
             .and_then(|v| i32::try_from(v).ok()),
+    }
+}
+
+/// Wraps a byte stream with SSE usage extraction. Returns the pass-through
+/// stream and a shared handle that will contain the extracted usage after
+/// the stream completes.
+///
+/// OpenAI-compatible backends send `usage` in the last SSE chunk when
+/// `stream_options.include_usage=true`. Each SSE chunk is a `data:` line
+/// containing a JSON object. The extractor parses each line and keeps the
+/// last `usage` it finds.
+fn wrap_stream_with_usage_extraction<S, E>(
+    stream: S,
+) -> (
+    impl futures::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send,
+    std::sync::Arc<std::sync::Mutex<Option<TokenUsage>>>,
+)
+where
+    S: futures::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send + 'static,
+{
+    let usage = std::sync::Arc::new(std::sync::Mutex::new(None::<TokenUsage>));
+    let usage_clone = usage.clone();
+    let mapped = futures::StreamExt::inspect(stream, move |chunk| {
+        if let Ok(ref bytes) = *chunk {
+            extract_usage_from_sse_chunk(bytes, &usage_clone);
+        }
+    });
+    (mapped, usage)
+}
+
+/// Parses an SSE chunk (one or more `data:` lines) and extracts usage if
+/// present. Stores the last usage found (the final chunk typically has it).
+fn extract_usage_from_sse_chunk(
+    bytes: &bytes::Bytes,
+    usage: &std::sync::Arc<std::sync::Mutex<Option<TokenUsage>>>,
+) {
+    let text = String::from_utf8_lossy(bytes);
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("data:") {
+            continue;
+        }
+        let data = line.trim_start_matches("data:").trim();
+        if data == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+            let extracted = extract_token_usage_from_value(&value);
+            if extracted.total.is_some() {
+                if let Ok(mut guard) = usage.lock() {
+                    *guard = Some(extracted);
+                }
+            }
+        }
     }
 }
 
@@ -367,6 +473,51 @@ mod tests {
         let body = b"not json";
         let usage = extract_token_usage(body);
         assert_eq!(usage.prompt, None);
+    }
+
+    #[test]
+    fn extract_usage_from_sse_chunk_with_usage() {
+        let usage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let chunk = bytes::Bytes::from(
+            "data: {\"choices\": [], \"usage\": {\"prompt_tokens\": 10, \"completion_tokens\": 5, \"total_tokens\": 15}}\n\n",
+        );
+        extract_usage_from_sse_chunk(&chunk, &usage);
+        let guard = usage.lock().unwrap();
+        let extracted = guard.as_ref().expect("usage must be extracted");
+        assert_eq!(extracted.prompt, Some(10));
+        assert_eq!(extracted.completion, Some(5));
+        assert_eq!(extracted.total, Some(15));
+    }
+
+    #[test]
+    fn extract_usage_from_sse_chunk_without_usage() {
+        let usage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let chunk =
+            bytes::Bytes::from("data: {\"choices\": [{\"delta\": {\"content\": \"hello\"}}]}\n\n");
+        extract_usage_from_sse_chunk(&chunk, &usage);
+        let guard = usage.lock().unwrap();
+        assert!(guard.is_none(), "no usage should be extracted");
+    }
+
+    #[test]
+    fn extract_usage_from_sse_chunk_done_marker() {
+        let usage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let chunk = bytes::Bytes::from("data: n\n");
+        extract_usage_from_sse_chunk(&chunk, &usage);
+        let guard = usage.lock().unwrap();
+        assert!(guard.is_none(), "  not produce usage");
+    }
+
+    #[test]
+    fn extract_usage_from_sse_chunk_multiple_lines() {
+        let usage = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let chunk = bytes::Bytes::from(
+            "data: {\"choices\": [{\"delta\": {\"content\": \"hi\"}}]}\ndata: {\"choices\": [], \"usage\": {\"prompt_tokens\": 20, \"completion_tokens\": 10, \"total_tokens\": 30}}\n\n",
+        );
+        extract_usage_from_sse_chunk(&chunk, &usage);
+        let guard = usage.lock().unwrap();
+        let extracted = guard.as_ref().expect("usage must be extracted");
+        assert_eq!(extracted.total, Some(30));
     }
 
     #[test]

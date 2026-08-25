@@ -35,6 +35,121 @@ pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// The default request timeout for OIDC HTTP calls (30 seconds).
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Additional OIDC claims beyond the standard set, used to extract group
+/// and role memberships from the IdP.
+///
+/// Many enterprise IdPs (e.g. Keycloak, Auth0, Okta) expose a non-standard
+/// `groups` claim in the ID token and/or userinfo response. Some also expose
+/// a `roles` claim. These are not part of the OIDC Core standard claims, so
+/// the `openidconnect` crate requires an [`AdditionalClaims`] implementation
+/// to deserialize them.
+///
+/// # Security
+///
+/// Group and role memberships are used for authorization decisions (model
+/// allowlists, endpoint restrictions, quotas). They are extracted from the
+/// IdP's signed ID token or TLS-protected userinfo response, so they cannot
+/// be spoofed by the end user.
+///
+/// # Serialization
+///
+/// Both fields are optional because not all IdPs provide both. Unknown
+/// additional claims are ignored (the struct only declares the ones we use).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct CustomAdditionalClaims {
+    /// Group memberships (e.g. `["engineering", "ai-users"]`).
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
+    /// Role memberships (e.g. `["admin", "developer"]`).
+    #[serde(default)]
+    pub roles: Option<Vec<String>>,
+}
+
+impl openidconnect::AdditionalClaims for CustomAdditionalClaims {}
+
+/// A type alias for the OIDC client parameterized with [`CustomAdditionalClaims`].
+///
+/// This is identical to `openidconnect::core::CoreClient` except that the
+/// additional-claims type is `CustomAdditionalClaims` instead of
+/// `EmptyAdditionalClaims`, so that group/role claims are deserialized from
+/// the ID token and userinfo response.
+pub type CustomClient = openidconnect::Client<
+    CustomAdditionalClaims,
+    openidconnect::core::CoreAuthDisplay,
+    openidconnect::core::CoreGenderClaim,
+    openidconnect::core::CoreJweContentEncryptionAlgorithm,
+    openidconnect::core::CoreJsonWebKey,
+    openidconnect::core::CoreAuthPrompt,
+    openidconnect::StandardErrorResponse<openidconnect::core::CoreErrorResponseType>,
+    openidconnect::StandardTokenResponse<
+        openidconnect::IdTokenFields<
+            CustomAdditionalClaims,
+            openidconnect::EmptyExtraTokenFields,
+            openidconnect::core::CoreGenderClaim,
+            openidconnect::core::CoreJweContentEncryptionAlgorithm,
+            openidconnect::core::CoreJwsSigningAlgorithm,
+        >,
+        openidconnect::core::CoreTokenType,
+    >,
+    openidconnect::StandardTokenIntrospectionResponse<
+        openidconnect::EmptyExtraTokenFields,
+        openidconnect::core::CoreTokenType,
+    >,
+    openidconnect::core::CoreRevocableToken,
+    openidconnect::core::CoreRevocationErrorResponse,
+    openidconnect::EndpointSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointMaybeSet,
+    openidconnect::EndpointMaybeSet,
+>;
+
+/// A type alias for the OIDC provider metadata parameterized with the Core
+/// types (the additional-claims type does not appear in provider metadata,
+/// so this is just `CoreProviderMetadata`).
+pub type CustomProviderMetadata = openidconnect::core::CoreProviderMetadata;
+
+/// A type alias for ID-token claims carrying [`CustomAdditionalClaims`].
+pub type CustomIdTokenClaims =
+    openidconnect::IdTokenClaims<CustomAdditionalClaims, openidconnect::core::CoreGenderClaim>;
+
+/// A type alias for userinfo claims carrying [`CustomAdditionalClaims`].
+pub type CustomUserInfoClaims =
+    openidconnect::UserInfoClaims<CustomAdditionalClaims, openidconnect::core::CoreGenderClaim>;
+
+/// Unions the `groups` and `roles` from [`CustomAdditionalClaims`] into a
+/// single deduplicated, sorted `Vec<String>`.
+///
+/// Roles are treated as groups for policy-matching purposes, since Keycloak
+/// and other IdPs expose both and policies are name-based. This keeps the
+/// downstream authorization logic operating on a single list.
+#[must_use]
+pub fn union_groups_roles(claims: &CustomAdditionalClaims) -> Vec<String> {
+    let mut combined: Vec<String> = Vec::new();
+    if let Some(g) = &claims.groups {
+        combined.extend(g.iter().cloned());
+    }
+    if let Some(r) = &claims.roles {
+        combined.extend(r.iter().cloned());
+    }
+    combined.sort();
+    combined.dedup();
+    combined
+}
+
+/// Serializes a list of group/role names as a JSON array string for storage
+/// in the `identities.groups` column (which is a `TEXT` holding a JSON array).
+///
+/// Returns `None` if the list is empty (so the column stays `NULL`).
+#[must_use]
+pub fn groups_to_json_string(groups: &[String]) -> Option<String> {
+    if groups.is_empty() {
+        return None;
+    }
+    serde_json::to_string(groups).ok()
+}
+
 /// Builds the HTTP client used for OIDC discovery and token exchange.
 ///
 /// # Security
@@ -254,5 +369,62 @@ mod tests {
         // "localhost" is a hostname, not an IP — the URL parser resolves it
         // as a domain, not a loopback IP. We only accept IP literals.
         assert!(validate_loopback_redirect("http://localhost:8787/cb").is_err());
+    }
+
+    #[test]
+    fn union_groups_roles_merges_and_dedups() {
+        let claims = CustomAdditionalClaims {
+            groups: Some(vec!["engineering".into(), "ai-users".into()]),
+            roles: Some(vec!["admin".into(), "ai-users".into()]),
+        };
+        let combined = union_groups_roles(&claims);
+        assert_eq!(combined, vec!["admin", "ai-users", "engineering"]);
+    }
+
+    #[test]
+    fn union_groups_roles_handles_empty() {
+        let claims = CustomAdditionalClaims::default();
+        assert!(union_groups_roles(&claims).is_empty());
+    }
+
+    #[test]
+    fn union_groups_roles_handles_groups_only() {
+        let claims = CustomAdditionalClaims {
+            groups: Some(vec!["g1".into()]),
+            roles: None,
+        };
+        assert_eq!(union_groups_roles(&claims), vec!["g1"]);
+    }
+
+    #[test]
+    fn groups_to_json_string_round_trips() {
+        let groups = vec!["a".to_string(), "b".to_string()];
+        let json = groups_to_json_string(&groups).expect("some");
+        let parsed: Vec<String> = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed, groups);
+    }
+
+    #[test]
+    fn groups_to_json_string_none_for_empty() {
+        assert!(groups_to_json_string(&[]).is_none());
+    }
+
+    #[test]
+    fn custom_additional_claims_deserializes_groups_and_roles() {
+        let json = r#"{"groups":["g1"],"roles":["r1"]}"#;
+        let claims: CustomAdditionalClaims = serde_json::from_str(json).expect("parse");
+        assert_eq!(
+            claims.groups.as_deref(),
+            Some(["g1".to_string()].as_slice())
+        );
+        assert_eq!(claims.roles.as_deref(), Some(["r1".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn custom_additional_claims_deserializes_missing_fields() {
+        let json = r#"{}"#;
+        let claims: CustomAdditionalClaims = serde_json::from_str(json).expect("parse");
+        assert!(claims.groups.is_none());
+        assert!(claims.roles.is_none());
     }
 }

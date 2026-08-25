@@ -1,0 +1,545 @@
+//! Group policy store and resolution.
+//!
+//! This module loads per-group authorization policies from the central
+//! database and resolves the effective policy for a user by merging the
+//! policies of all groups the user belongs to.
+//!
+//! # Merge semantics
+//!
+//! When a user belongs to multiple groups, the most-permissive policy wins:
+//! - **Model allowlists**: union of all groups' allowed models. If any group
+//!   has `None` (all allowed), the result is `None` (all allowed).
+//! - **Endpoint allowlists**: union of all groups' allowed endpoints. If any
+//!   group has `None`, the result is `None`.
+//! - **Quotas**: maximum of all groups' quotas (most generous). If any group
+//!   has `None` (unlimited), the result is `None` (unlimited).
+
+use std::collections::HashSet;
+
+use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use time::PrimitiveDateTime;
+use uuid::Uuid;
+
+use oidc_agent_common::error::{Error, Result};
+
+use crate::entity::group_policy;
+
+/// A resolved policy for a user, merging all their groups' policies.
+#[derive(Debug, Clone)]
+pub struct ResolvedPolicy {
+    /// The set of allowed models. `None` means all models are allowed.
+    pub allowed_models: Option<HashSet<String>>,
+    /// The set of allowed endpoints. `None` means all endpoints are allowed.
+    pub allowed_endpoints: Option<HashSet<String>>,
+    /// The daily token quota. `None` means unlimited.
+    pub daily_token_quota: Option<i64>,
+    /// The daily request quota. `None` means unlimited.
+    pub daily_request_quota: Option<i64>,
+}
+
+impl ResolvedPolicy {
+    /// Returns `true` if the given model is allowed by this policy.
+    #[must_use]
+    pub fn is_model_allowed(&self, model: &str) -> bool {
+        match &self.allowed_models {
+            None => true,
+            Some(models) => models.contains(model),
+        }
+    }
+
+    /// Returns `true` if the given endpoint is allowed by this policy.
+    #[must_use]
+    pub fn is_endpoint_allowed(&self, endpoint: &str) -> bool {
+        match &self.allowed_endpoints {
+            None => true,
+            Some(endpoints) => endpoints.contains(endpoint),
+        }
+    }
+}
+
+impl Default for ResolvedPolicy {
+    fn default() -> Self {
+        // No policies = everything allowed (most permissive).
+        Self {
+            allowed_models: None,
+            allowed_endpoints: None,
+            daily_token_quota: None,
+            daily_request_quota: None,
+        }
+    }
+}
+
+/// The policy store, backed by the central proxy's database.
+#[derive(Clone)]
+pub struct PolicyStore {
+    db: DatabaseConnection,
+}
+
+impl PolicyStore {
+    /// Creates a new `PolicyStore`.
+    #[must_use]
+    pub fn new(db: DatabaseConnection) -> Self {
+        Self { db }
+    }
+
+    /// Returns a reference to the underlying database connection.
+    #[must_use]
+    pub fn db(&self) -> &DatabaseConnection {
+        &self.db
+    }
+
+    /// Resolves the effective policy for a user belonging to the given
+    /// groups.
+    ///
+    /// Loads all group policies matching the user's groups and merges them
+    /// with most-permissive-wins semantics. If no policies exist for any of
+    /// the user's groups, returns the default (all-allowed) policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on query failure.
+    pub async fn resolve_policy(&self, groups: &[String]) -> Result<ResolvedPolicy> {
+        if groups.is_empty() {
+            return Ok(ResolvedPolicy::default());
+        }
+
+        // Load all policies for the user's groups.
+        let placeholders: Vec<String> = groups
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${}", i + 1))
+            .collect();
+        let placeholder_str = placeholders.join(", ");
+        let sql = format!(
+            "SELECT group_name, allowed_models, allowed_endpoints, \
+             daily_token_quota, daily_request_quota \
+             FROM group_policies WHERE group_name IN ({placeholder_str})"
+        );
+
+        let params: Vec<Value> = groups
+            .iter()
+            .map(|g| Value::String(Some(Box::new(g.clone()))))
+            .collect();
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                &sql,
+                params,
+            ))
+            .await
+            .map_err(|e| Error::Database(format!("query group policies: {e}")))?;
+
+        if rows.is_empty() {
+            return Ok(ResolvedPolicy::default());
+        }
+
+        let mut allowed_models: Option<HashSet<String>> = Some(HashSet::new());
+        let mut allowed_endpoints: Option<HashSet<String>> = Some(HashSet::new());
+        let mut daily_token_quota: Option<i64> = None;
+        let mut daily_request_quota: Option<i64> = None;
+
+        for row in rows {
+            let row_models: Option<String> = row.try_get("", "allowed_models").ok();
+            let row_endpoints: Option<String> = row.try_get("", "allowed_endpoints").ok();
+            let row_token_quota: Option<i64> = row.try_get("", "daily_token_quota").ok();
+            let row_request_quota: Option<i64> = row.try_get("", "daily_request_quota").ok();
+
+            // Models: union. None = all allowed.
+            match (row_models, &mut allowed_models) {
+                (None, _) => {
+                    allowed_models = None;
+                }
+                (Some(json), Some(acc)) => {
+                    if let Ok(models) = parse_json_array(&json) {
+                        acc.extend(models);
+                    }
+                }
+                (Some(_), None) => {} // already all-allowed
+            }
+
+            // Endpoints: union. None = all allowed.
+            match (row_endpoints, &mut allowed_endpoints) {
+                (None, _) => {
+                    allowed_endpoints = None;
+                }
+                (Some(json), Some(acc)) => {
+                    if let Ok(endpoints) = parse_json_array(&json) {
+                        acc.extend(endpoints);
+                    }
+                }
+                (Some(_), None) => {} // already all-allowed
+            }
+
+            // Quotas: max (most generous). None = unlimited.
+            daily_token_quota = match (daily_token_quota, row_token_quota) {
+                (None, Some(q)) => Some(q),
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, None) => a,
+            };
+            daily_request_quota = match (daily_request_quota, row_request_quota) {
+                (None, Some(q)) => Some(q),
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, None) => a,
+            };
+        }
+
+        Ok(ResolvedPolicy {
+            allowed_models,
+            allowed_endpoints,
+            daily_token_quota,
+            daily_request_quota,
+        })
+    }
+
+    /// Lists all group policies.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on query failure.
+    pub async fn list_policies(&self) -> Result<Vec<group_policy::Model>> {
+        use sea_orm::EntityTrait;
+        group_policy::Entity::find()
+            .all(&self.db)
+            .await
+            .map_err(|e| Error::Database(format!("list group policies: {e}")))
+    }
+
+    /// Gets a single group policy by group name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on query failure.
+    pub async fn get_policy(&self, group_name: &str) -> Result<Option<group_policy::Model>> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        group_policy::Entity::find()
+            .filter(group_policy::Column::GroupName.eq(group_name))
+            .one(&self.db)
+            .await
+            .map_err(|e| Error::Database(format!("get group policy: {e}")))
+    }
+
+    /// Upserts a group policy. If a policy for the group exists, it is
+    /// updated; otherwise a new one is inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on insert/update failure.
+    pub async fn upsert_policy(
+        &self,
+        group_name: &str,
+        allowed_models: Option<&str>,
+        allowed_endpoints: Option<&str>,
+        daily_token_quota: Option<i64>,
+        daily_request_quota: Option<i64>,
+    ) -> Result<group_policy::Model> {
+        let existing = self.get_policy(group_name).await?;
+        let now = now_utc();
+        let now_str = format_time(&now);
+
+        let models_val = allowed_models
+            .map(|v| Value::String(Some(Box::new(v.to_string()))))
+            .unwrap_or(Value::String(None));
+        let endpoints_val = allowed_endpoints
+            .map(|v| Value::String(Some(Box::new(v.to_string()))))
+            .unwrap_or(Value::String(None));
+        let token_quota_val = daily_token_quota
+            .map(|v| Value::BigInt(Some(v)))
+            .unwrap_or(Value::BigInt(None));
+        let request_quota_val = daily_request_quota
+            .map(|v| Value::BigInt(Some(v)))
+            .unwrap_or(Value::BigInt(None));
+
+        if let Some(model) = existing {
+            // Update existing.
+            let sql = "UPDATE group_policies SET allowed_models = $1, \
+                 allowed_endpoints = $2, daily_token_quota = $3, \
+                 daily_request_quota = $4, updated_at = $5 WHERE id = $6";
+            self.db
+                .execute(Statement::from_sql_and_values(
+                    self.db.get_database_backend(),
+                    sql,
+                    vec![
+                        models_val,
+                        endpoints_val,
+                        token_quota_val,
+                        request_quota_val,
+                        now_str.into(),
+                        model.id.clone().into(),
+                    ],
+                ))
+                .await
+                .map_err(|e| Error::Database(format!("update group policy: {e}")))?;
+            Ok(group_policy::Model {
+                id: model.id,
+                group_name: group_name.to_string(),
+                allowed_models: allowed_models.map(String::from),
+                allowed_endpoints: allowed_endpoints.map(String::from),
+                daily_token_quota,
+                daily_request_quota,
+                created_at: model.created_at,
+                updated_at: now,
+            })
+        } else {
+            // Insert new.
+            let id = Uuid::new_v4().to_string();
+            let sql = "INSERT INTO group_policies \
+                 (id, group_name, allowed_models, allowed_endpoints, \
+                 daily_token_quota, daily_request_quota, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+            self.db
+                .execute(Statement::from_sql_and_values(
+                    self.db.get_database_backend(),
+                    sql,
+                    vec![
+                        id.clone().into(),
+                        group_name.to_string().into(),
+                        models_val,
+                        endpoints_val,
+                        token_quota_val,
+                        request_quota_val,
+                        now_str.clone().into(),
+                        now_str.into(),
+                    ],
+                ))
+                .await
+                .map_err(|e| Error::Database(format!("insert group policy: {e}")))?;
+            Ok(group_policy::Model {
+                id,
+                group_name: group_name.to_string(),
+                allowed_models: allowed_models.map(String::from),
+                allowed_endpoints: allowed_endpoints.map(String::from),
+                daily_token_quota,
+                daily_request_quota,
+                created_at: now,
+                updated_at: now,
+            })
+        }
+    }
+
+    /// Deletes a group policy by group name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on delete failure.
+    pub async fn delete_policy(&self, group_name: &str) -> Result<bool> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let result = group_policy::Entity::delete_many()
+            .filter(group_policy::Column::GroupName.eq(group_name))
+            .exec(&self.db)
+            .await
+            .map_err(|e| Error::Database(format!("delete group policy: {e}")))?;
+        Ok(result.rows_affected > 0)
+    }
+}
+
+/// Parses a JSON array string into a `Vec<String>`.
+fn parse_json_array(json: &str) -> std::result::Result<Vec<String>, serde_json::Error> {
+    serde_json::from_str(json)
+}
+
+/// Returns the current UTC time as a `PrimitiveDateTime`.
+fn now_utc() -> PrimitiveDateTime {
+    let offset = time::OffsetDateTime::now_utc();
+    PrimitiveDateTime::new(offset.date(), offset.time())
+}
+
+/// Formats a `PrimitiveDateTime` for SQLite.
+fn format_time(t: &PrimitiveDateTime) -> String {
+    t.format(time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second]"
+    ))
+    .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn setup_test_db() -> PolicyStore {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-policy-test-{}-{counter}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let url = format!("sqlite://{}?mode=rwc", tmp.display());
+        let db = crate::db::setup(&url).await.expect("db setup");
+        PolicyStore::new(db)
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_no_groups_returns_default() {
+        let store = setup_test_db().await;
+        let policy = store.resolve_policy(&[]).await.expect("resolve");
+        assert!(policy.allowed_models.is_none());
+        assert!(policy.allowed_endpoints.is_none());
+        assert!(policy.daily_token_quota.is_none());
+        assert!(policy.daily_request_quota.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_no_matching_policies_returns_default() {
+        let store = setup_test_db().await;
+        let policy = store
+            .resolve_policy(&["nonexistent".into()])
+            .await
+            .expect("resolve");
+        assert!(policy.allowed_models.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_single_group_model_allowlist() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy(
+                "engineering",
+                Some(r#"["gpt-4o", "gpt-4o-mini"]"#),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("upsert");
+
+        let policy = store
+            .resolve_policy(&["engineering".into()])
+            .await
+            .expect("resolve");
+        assert!(policy.is_model_allowed("gpt-4o"));
+        assert!(policy.is_model_allowed("gpt-4o-mini"));
+        assert!(!policy.is_model_allowed("o1"));
+        assert!(policy.allowed_endpoints.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_multiple_groups_unions_models() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy("engineering", Some(r#"["gpt-4o"]"#), None, None, None)
+            .await
+            .expect("upsert eng");
+        store
+            .upsert_policy("research", Some(r#"["o1"]"#), None, None, None)
+            .await
+            .expect("upsert res");
+
+        let policy = store
+            .resolve_policy(&["engineering".into(), "research".into()])
+            .await
+            .expect("resolve");
+        assert!(policy.is_model_allowed("gpt-4o"));
+        assert!(policy.is_model_allowed("o1"));
+        assert!(!policy.is_model_allowed("gpt-3.5"));
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_none_models_means_all_allowed() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy("engineering", Some(r#"["gpt-4o"]"#), None, None, None)
+            .await
+            .expect("upsert eng");
+        store
+            .upsert_policy("admin", None, None, None, None)
+            .await
+            .expect("upsert admin");
+
+        let policy = store
+            .resolve_policy(&["engineering".into(), "admin".into()])
+            .await
+            .expect("resolve");
+        // admin has None = all allowed, so union is all allowed.
+        assert!(policy.allowed_models.is_none());
+        assert!(policy.is_model_allowed("anything"));
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_endpoint_restrictions() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy(
+                "restricted",
+                None,
+                Some(r#"["/v1/chat/completions"]"#),
+                None,
+                None,
+            )
+            .await
+            .expect("upsert");
+
+        let policy = store
+            .resolve_policy(&["restricted".into()])
+            .await
+            .expect("resolve");
+        assert!(policy.is_endpoint_allowed("/v1/chat/completions"));
+        assert!(!policy.is_endpoint_allowed("/v1/embeddings"));
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_quotas_take_max() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy("group-a", None, None, Some(1000), Some(100))
+            .await
+            .expect("upsert a");
+        store
+            .upsert_policy("group-b", None, None, Some(5000), Some(50))
+            .await
+            .expect("upsert b");
+
+        let policy = store
+            .resolve_policy(&["group-a".into(), "group-b".into()])
+            .await
+            .expect("resolve");
+        assert_eq!(policy.daily_token_quota, Some(5000));
+        assert_eq!(policy.daily_request_quota, Some(100));
+    }
+
+    #[tokio::test]
+    async fn upsert_policy_updates_existing() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy("engineering", Some(r#"["gpt-4o"]"#), None, None, None)
+            .await
+            .expect("upsert 1");
+
+        store
+            .upsert_policy("engineering", Some(r#"["gpt-4o", "o1"]"#), None, None, None)
+            .await
+            .expect("upsert 2");
+
+        let policies = store.list_policies().await.expect("list");
+        assert_eq!(policies.len(), 1, "upsert must not duplicate");
+        let policy = store
+            .get_policy("engineering")
+            .await
+            .expect("get")
+            .expect("exists");
+        let models =
+            parse_json_array(policy.allowed_models.as_deref().unwrap_or("[]")).expect("parse");
+        assert!(models.contains(&"gpt-4o".to_string()));
+        assert!(models.contains(&"o1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn delete_policy_removes_row() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy("engineering", None, None, None, None)
+            .await
+            .expect("upsert");
+
+        let deleted = store.delete_policy("engineering").await.expect("delete");
+        assert!(deleted);
+
+        let deleted_again = store.delete_policy("engineering").await.expect("delete");
+        assert!(!deleted_again);
+    }
+}

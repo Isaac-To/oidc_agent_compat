@@ -20,9 +20,11 @@ use oidc_agent_common::oidc;
 use crate::agent_config::{AgentConfig, inject};
 use crate::keystore::KeyStore;
 
-use openidconnect::core::{
-    CoreClient, CoreIdTokenClaims, CoreJwsSigningAlgorithm, CoreProviderMetadata, CoreResponseType,
+use oidc_agent_common::oidc::{
+    CustomClient, CustomIdTokenClaims, CustomProviderMetadata, CustomUserInfoClaims,
+    groups_to_json_string, union_groups_roles,
 };
+use openidconnect::core::{CoreJwsSigningAlgorithm, CoreResponseType};
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     OAuth2TokenResponse, PkceCodeChallenge, RedirectUrl, Scope, SubjectIdentifier,
@@ -132,7 +134,7 @@ pub async fn run_login(config: &RelayConfig, key_store: &KeyStore) -> Result<Log
     // 4. Discover the IdP metadata.
     let issuer_url = IssuerUrl::new(config.oidc.issuer.clone())
         .map_err(|e| Error::oidc(format!("invalid issuer URL: {e}")))?;
-    let provider_metadata = CoreProviderMetadata::discover_async(issuer_url, &http_client)
+    let provider_metadata = CustomProviderMetadata::discover_async(issuer_url, &http_client)
         .await
         .map_err(|e| Error::oidc(format!("OIDC discovery failed: {e}")))?;
 
@@ -151,7 +153,7 @@ pub async fn run_login(config: &RelayConfig, key_store: &KeyStore) -> Result<Log
         .map_err(|e| Error::oidc(format!("invalid redirect URL: {e}")))?;
 
     // 6. Build the OIDC client.
-    let client = CoreClient::from_provider_metadata(
+    let client = CustomClient::from_provider_metadata(
         provider_metadata,
         ClientId::new(config.oidc.client_id.clone()),
         Some(ClientSecret::new(client_secret)),
@@ -224,7 +226,7 @@ pub async fn run_login(config: &RelayConfig, key_store: &KeyStore) -> Result<Log
     }
 
     // 13b. Verify the ID token claims (iss, aud, exp, nonce, signature).
-    let id_token_claims: &CoreIdTokenClaims = id_token
+    let id_token_claims: &CustomIdTokenClaims = id_token
         .claims(&client.id_token_verifier(), &nonce)
         .map_err(|e| Error::oidc(format!("ID token validation failed: {e}")))?;
 
@@ -258,7 +260,7 @@ pub async fn run_login(config: &RelayConfig, key_store: &KeyStore) -> Result<Log
     ) {
         Ok(userinfo_request) => match userinfo_request.request_async(&http_client).await {
             Ok(userinfo) => {
-                let userinfo: openidconnect::core::CoreUserInfoClaims = userinfo;
+                let userinfo: CustomUserInfoClaims = userinfo;
                 let subject = userinfo.subject().to_string();
                 let email = userinfo.email().map(|e| e.as_str().to_string());
                 let display_name = userinfo
@@ -270,8 +272,13 @@ pub async fn run_login(config: &RelayConfig, key_store: &KeyStore) -> Result<Log
                             .preferred_username()
                             .map(|u| u.as_str().to_string())
                     });
-                // Groups are not a standard OIDC userinfo claim; left as None for now.
-                (subject, email, display_name, None)
+                // Extract groups + roles from the additional claims and union
+                // them into a single JSON array string.
+                let groups = {
+                    let combined = union_groups_roles(userinfo.additional_claims());
+                    groups_to_json_string(&combined)
+                };
+                (subject, email, display_name, groups)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "userinfo request failed, falling back to ID-token claims");
@@ -315,8 +322,12 @@ fn is_allowed_alg(alg: &CoreJwsSigningAlgorithm) -> bool {
 
 /// Extracts identity fields from the ID-token claims (fallback when userinfo
 /// is unavailable).
+///
+/// Group and role claims are extracted from the additional claims (via
+/// [`CustomAdditionalClaims`]) and unioned into a single JSON array string
+/// for storage in the `identities.groups` column.
 fn claims_from_id_token(
-    claims: &CoreIdTokenClaims,
+    claims: &CustomIdTokenClaims,
 ) -> (String, Option<String>, Option<String>, Option<String>) {
     let subject = claims.subject().to_string();
     let email = claims.email().map(|e| e.as_str().to_string());
@@ -327,11 +338,13 @@ fn claims_from_id_token(
         .and_then(|n| n.get(None))
         .map(|n| n.as_str().to_string())
         .or_else(|| claims.preferred_username().map(|u| u.as_str().to_string()));
-    // Groups are not a standard OIDC claim; only present if the IdP includes
-    // them in the ID token. We don't extract them here (would need
-    // AdditionalClaims). Userinfo may provide them.
+    // Extract groups + roles from the additional claims and union them.
+    let groups = {
+        let combined = union_groups_roles(claims.additional_claims());
+        groups_to_json_string(&combined)
+    };
     let _ = email_verified;
-    (subject, email, display_name, None)
+    (subject, email, display_name, groups)
 }
 
 /// Waits for a single OIDC callback on the loopback listener.
@@ -594,6 +607,72 @@ mod tests {
             &CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha384
         ));
         assert!(!is_allowed_alg(&CoreJwsSigningAlgorithm::EcdsaP384Sha384));
+    }
+
+    #[tokio::test]
+    async fn complete_login_persists_groups() {
+        let store = setup_test_db().await;
+        let config = test_config();
+        let groups_json = r#"["engineering","ai-users"]"#;
+        let _ = complete_login(
+            &store,
+            &config,
+            "https://idp.example.com",
+            "user-groups",
+            Some("user@example.com"),
+            None,
+            Some(groups_json),
+        )
+        .await
+        .expect("login");
+
+        use crate::entity::identity;
+        use sea_orm::EntityTrait;
+        let identities = identity::Entity::find().all(&store.db).await.expect("load");
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            identities[0].groups.as_deref(),
+            Some(groups_json),
+            "groups must be persisted in the identities table"
+        );
+    }
+
+    #[test]
+    fn claims_from_id_token_extracts_groups_and_roles() {
+        // Build a CustomIdTokenClaims from a JSON string containing groups + roles.
+        let json = r#"{
+            "iss": "https://idp.example.com",
+            "sub": "user-grp",
+            "aud": "test",
+            "exp": 9999999999,
+            "iat": 1000000000,
+            "groups": ["engineering", "ai-users"],
+            "roles": ["admin", "ai-users"]
+        }"#;
+        let claims: CustomIdTokenClaims = serde_json::from_str(json).expect("parse claims");
+        let (subject, _email, _display, groups) = claims_from_id_token(&claims);
+        assert_eq!(subject, "user-grp");
+        let groups = groups.expect("groups must be extracted");
+        let parsed: Vec<String> = serde_json::from_str(&groups).expect("parse groups json");
+        // Union of groups + roles, deduplicated and sorted.
+        assert_eq!(parsed, vec!["admin", "ai-users", "engineering"]);
+    }
+
+    #[test]
+    fn claims_from_id_token_no_groups_returns_none() {
+        let json = r#"{
+            "iss": "https://idp.example.com",
+            "sub": "user-nogrp",
+            "aud": "test",
+            "exp": 9999999999,
+            "iat": 1000000000
+        }"#;
+        let claims: CustomIdTokenClaims = serde_json::from_str(json).expect("parse claims");
+        let (_subject, _email, _display, groups) = claims_from_id_token(&claims);
+        assert!(
+            groups.is_none(),
+            "groups must be None when no claims present"
+        );
     }
 
     #[tokio::test]

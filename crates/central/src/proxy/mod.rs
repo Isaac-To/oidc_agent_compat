@@ -16,6 +16,7 @@
 
 pub mod auth;
 pub mod forward;
+pub mod permissions;
 pub mod rate_limit;
 
 use std::sync::Arc;
@@ -27,6 +28,10 @@ use tower_http::limit::RequestBodyLimitLayer;
 use zeroize::Zeroizing;
 
 use crate::audit::AuditLogger;
+use crate::device_store::DeviceStore;
+use crate::policy::PolicyStore;
+use crate::pricing::PriceTable;
+use crate::usage::UsageTracker;
 
 /// The shared application state for the central proxy.
 #[derive(Clone)]
@@ -41,6 +46,23 @@ pub struct AppState {
     pub audit: AuditLogger,
     /// The rate limiter (None in dev mode).
     pub rate_limiter: Option<rate_limit::RateLimiter>,
+    /// The group policy store.
+    pub policy_store: PolicyStore,
+    /// The device store.
+    pub device_store: DeviceStore,
+    /// The usage tracker (for quota enforcement and reporting).
+    pub usage_tracker: UsageTracker,
+    /// The pricing table (for cost tracking; empty if no pricing configured).
+    pub price_table: PriceTable,
+}
+
+impl AppState {
+    /// Returns the admin group name if the admin API is enabled, or `None`
+    /// if the admin config is absent (admin API disabled).
+    #[must_use]
+    pub fn admin_group(&self) -> Option<&str> {
+        self.config.admin.as_ref().map(|a| a.admin_group.as_str())
+    }
 }
 
 /// The maximum request body size (10 MB).
@@ -54,7 +76,7 @@ pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// identity headers) before the proxy handler. Body size limits are applied
 /// globally.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut proxy_router = Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .route(
             "/v1/chat/completions",
@@ -72,10 +94,28 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            permissions::permissions_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             auth::auth_middleware,
         ))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Merge the admin API router if an admin config is present.
+    if let Some(admin_group) = state.admin_group() {
+        let admin_state = crate::admin::AdminState {
+            policy_store: state.policy_store.clone(),
+            device_store: state.device_store.clone(),
+            audit: state.audit.clone(),
+            usage_tracker: state.usage_tracker.clone(),
+            admin_group: admin_group.to_string(),
+        };
+        proxy_router = proxy_router.merge(crate::admin::router(admin_state));
+    }
+
+    proxy_router
 }
 
 /// Starts the central proxy server.
@@ -104,12 +144,49 @@ pub async fn serve(
             rate_limit::DEFAULT_WINDOW,
         ))
     };
+    let policy_store = PolicyStore::new(audit.db().clone());
+    let device_store = DeviceStore::new(audit.db().clone());
+    let usage_tracker = UsageTracker::new(audit.db().clone());
+    let price_table = config
+        .pricing
+        .as_ref()
+        .map(PriceTable::from_config)
+        .unwrap_or_else(PriceTable::empty);
+
+    // Auto-fetch prices from the backend at startup (best-effort). Manual
+    // config overrides take precedence over fetched prices.
+    if let Err(e) = price_table
+        .fetch_from_backend(&client, &config.backend.base_url)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to fetch initial model prices from backend");
+    }
+    // Spawn a background task to refresh fetched prices periodically.
+    // The interval is configurable via [central.pricing] fetch_interval_secs
+    // (default 3600s = 1 hour; 0 disables auto-fetch).
+    let fetch_interval = config
+        .pricing
+        .as_ref()
+        .map(|p| p.fetch_interval_secs)
+        .unwrap_or(3600);
+    if fetch_interval > 0 {
+        price_table.spawn_refresh_task(
+            client.clone(),
+            config.backend.base_url.clone(),
+            std::time::Duration::from_secs(fetch_interval),
+        );
+    }
+
     let state = AppState {
         config: config.clone(),
         master_key: Arc::new(master_key),
         client,
         audit,
         rate_limiter,
+        policy_store,
+        device_store,
+        usage_tracker,
+        price_table,
     };
     let app = router(state);
 

@@ -56,7 +56,7 @@ pub struct RelayConfig {
 }
 
 /// Configuration for the central proxy component.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CentralConfig {
     /// The address to listen on (e.g. `0.0.0.0:8443` behind a load balancer).
     pub listen_addr: SocketAddr,
@@ -70,11 +70,66 @@ pub struct CentralConfig {
     pub mtls: MtlsServerConfig,
     /// Secret-manager settings for the master key.
     pub secret_store: SecretStoreConfig,
+    /// Admin API settings. Optional; if absent, the admin API is disabled.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
+    /// Pricing settings for cost tracking. Optional; if absent, costs are
+    /// not computed (cost_usd is always 0.0 in the audit log).
+    #[serde(default)]
+    pub pricing: Option<PricingConfig>,
     /// When true, allows requests without relay-forwarded identity headers
     /// (for the containerized dev stack). Defaults to false for production
     /// safety.
     #[serde(default)]
     pub dev_mode: bool,
+}
+
+/// Admin API configuration.
+///
+/// The admin API is authenticated via the IdP through the relay (same
+/// OIDC login flow as regular users). Access is authorized by checking
+/// the user's group memberships against the configured `admin_group`.
+/// No static admin token is used — the admin's OIDC identity is the auth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminConfig {
+    /// The group name that grants admin API access. Users who belong to
+    /// this group (via their IdP groups/roles claims) may call the admin
+    /// API; all others are denied (403).
+    pub admin_group: String,
+}
+
+/// Pricing configuration for cost tracking.
+///
+/// Maps model names to per-1K-token prices so the central proxy can compute
+/// the cost of each request and record it in the audit log + usage counters.
+/// Prices can also be auto-fetched from the backend's `/v1/models` endpoint
+/// (e.g. OpenRouter); manual entries act as overrides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PricingConfig {
+    /// Per-model price entries. These act as **overrides** — they take
+    /// precedence over any prices auto-fetched from the backend.
+    #[serde(default)]
+    pub models: Vec<ModelPriceConfig>,
+    /// Auto-fetch interval in seconds. If `0`, auto-fetch is disabled and
+    /// only manual config prices are used. Defaults to 3600 (1 hour).
+    #[serde(default = "default_fetch_interval")]
+    pub fetch_interval_secs: u64,
+}
+
+/// Default auto-fetch interval (1 hour).
+fn default_fetch_interval() -> u64 {
+    3600
+}
+
+/// A single model's pricing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelPriceConfig {
+    /// The model name (must match the `model` field in request bodies).
+    pub model: String,
+    /// Price per 1K input (prompt) tokens in USD.
+    pub input_per_1k_usd: f64,
+    /// Price per 1K output (completion) tokens in USD.
+    pub output_per_1k_usd: f64,
 }
 
 /// OIDC relying-party configuration shared by both components.

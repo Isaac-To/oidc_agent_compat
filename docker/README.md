@@ -121,6 +121,31 @@ conflicts with the Docker relay on `:8787`.
 
 ## Manual Operations
 
+### Admin API (policies, devices, audit)
+
+The dev central config (`docker/configs/central.toml`) enables the admin
+API with `admin_group = "oac-admins"`. To test it, log in via the relay
+with a user in the `oac-admins` group (configure the group in Keycloak),
+then use the admin CLI:
+
+```sh
+# Set the admin API key (from oac-relay login):
+export OAC_API_KEY="<key from oac-relay login>"
+
+# List group policies:
+./target/release/oac-central admin policy-list --key $OAC_API_KEY
+
+# Set a policy:
+./target/release/oac-central admin policy-set engineering --models gpt-4o --key $OAC_API_KEY
+
+# Query the audit log:
+./target/release/oac-central admin audit-query --key $OAC_API_KEY
+```
+
+> Note: the admin CLI sends requests through the relay (default
+> `http://127.0.0.1:8787`), which authenticates the user via OIDC and
+> forwards to central. The user must belong to the `oac-admins` group.
+
 ### Generate mTLS certs
 
 ```sh

@@ -89,10 +89,11 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String) {
         .expect("bind relay");
     let relay_addr = relay_listener.local_addr().expect("relay addr");
     let state = proxy::AppState {
-        key_store,
+        key_store: key_store.clone(),
         config: config.clone(),
         client,
         listen_addr: relay_addr,
+        activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
     };
     let app = proxy::router(state);
     tokio::spawn(async {

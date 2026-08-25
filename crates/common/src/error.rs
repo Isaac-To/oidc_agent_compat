@@ -56,6 +56,12 @@ pub enum Error {
     #[error("authentication error: {0}")]
     Auth(String),
 
+    /// Authorization failed (the user is authenticated but not permitted to
+    /// perform the requested action, e.g. model not in allowlist, endpoint
+    /// restricted, device revoked, quota exceeded).
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     /// An I/O error (file system, network).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -92,6 +98,12 @@ impl Error {
     #[must_use]
     pub fn auth(msg: impl std::fmt::Display) -> Self {
         Self::Auth(msg.to_string())
+    }
+
+    /// Creates a [`Error::Forbidden`] from any [`Display`][std::fmt::Display] value.
+    #[must_use]
+    pub fn forbidden(msg: impl std::fmt::Display) -> Self {
+        Self::Forbidden(msg.to_string())
     }
 
     /// Creates a [`Error::Internal`] from any [`Display`][std::fmt::Display] value.

@@ -170,6 +170,318 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(Migration)]
+        vec![
+            Box::new(Migration),
+            Box::new(Migration0002AuditEnrichment),
+            Box::new(Migration0003GroupPolicies),
+            Box::new(Migration0004UsageCounters),
+        ]
     }
+}
+
+/// Migration 0002: enrich the `audit_log` table with identity, groups,
+/// endpoint, request-id, permission-decision, and cost columns.
+///
+/// These columns support the permissions and user-activity-logging feature.
+/// All new columns are nullable so existing rows remain valid.
+pub struct Migration0002AuditEnrichment;
+
+impl MigrationName for Migration0002AuditEnrichment {
+    fn name(&self) -> &str {
+        "m000002_audit_enrichment"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0002AuditEnrichment {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Add nullable columns to audit_log. SQLite supports ALTER TABLE
+        // ADD COLUMN for nullable columns without a default.
+        let cols = [
+            ("identity_id", "TEXT"),
+            ("email", "TEXT"),
+            ("groups", "TEXT"),
+            ("endpoint", "TEXT"),
+            ("request_id", "TEXT"),
+            ("permission_decision", "TEXT"),
+            ("denial_reason", "TEXT"),
+            ("cost_usd", "REAL"),
+        ];
+        for (col, ty) in cols {
+            manager
+                .get_connection()
+                .execute_unprepared(&format!("ALTER TABLE audit_log ADD COLUMN {col} {ty};"))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // SQLite does not support DROP COLUMN before 3.35. Recreate the
+        // table without the new columns. For simplicity (and because this
+        // is a forward-only migration in practice), we no-op the down path.
+        let _ = manager;
+        Ok(())
+    }
+}
+
+/// Migration 0003: create the `group_policies` and `admin_audit_log` tables.
+///
+/// `group_policies` stores per-group authorization policies (model
+/// allowlists, endpoint restrictions, quotas) managed via the admin API.
+/// `admin_audit_log` is an append-only record of admin API mutations for
+/// accountability.
+pub struct Migration0003GroupPolicies;
+
+impl MigrationName for Migration0003GroupPolicies {
+    fn name(&self) -> &str {
+        "m000003_group_policies"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0003GroupPolicies {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(GroupPolicy::Table)
+                    .col(
+                        ColumnDef::new(GroupPolicy::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(GroupPolicy::GroupName)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(ColumnDef::new(GroupPolicy::AllowedModels).string().null())
+                    .col(
+                        ColumnDef::new(GroupPolicy::AllowedEndpoints)
+                            .string()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(GroupPolicy::DailyTokenQuota)
+                            .big_integer()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(GroupPolicy::DailyRequestQuota)
+                            .big_integer()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(GroupPolicy::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(GroupPolicy::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(AdminAuditLog::Table)
+                    .col(
+                        ColumnDef::new(AdminAuditLog::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(AdminAuditLog::AdminSubject)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(AdminAuditLog::Action).string().not_null())
+                    .col(ColumnDef::new(AdminAuditLog::Target).string().not_null())
+                    .col(ColumnDef::new(AdminAuditLog::Payload).string().null())
+                    .col(
+                        ColumnDef::new(AdminAuditLog::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Append-only triggers on admin_audit_log.
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE TRIGGER IF NOT EXISTS admin_audit_log_no_update \
+                 BEFORE UPDATE ON admin_audit_log \
+                 BEGIN SELECT RAISE(ABORT, 'admin_audit_log is append-only'); END;",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "CREATE TRIGGER IF NOT EXISTS admin_audit_log_no_delete \
+                 BEFORE DELETE ON admin_audit_log \
+                 BEGIN SELECT RAISE(ABORT, 'admin_audit_log is append-only'); END;",
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(AdminAuditLog::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(GroupPolicy::Table).to_owned())
+            .await
+    }
+}
+
+/// Iden for the `group_policies` table.
+#[derive(Iden)]
+pub enum GroupPolicy {
+    /// The table.
+    #[iden = "group_policies"]
+    Table,
+    /// Primary key (UUID).
+    Id,
+    /// The group name (unique).
+    GroupName,
+    /// JSON array of allowed models (NULL = all allowed).
+    AllowedModels,
+    /// JSON array of allowed endpoints (NULL = all allowed).
+    AllowedEndpoints,
+    /// Daily token quota (NULL = unlimited).
+    DailyTokenQuota,
+    /// Daily request quota (NULL = unlimited).
+    DailyRequestQuota,
+    /// Creation timestamp.
+    CreatedAt,
+    /// Last-update timestamp.
+    UpdatedAt,
+}
+
+/// Iden for the `admin_audit_log` table.
+#[derive(Iden)]
+pub enum AdminAuditLog {
+    /// The table.
+    #[iden = "admin_audit_log"]
+    Table,
+    /// Primary key (UUID).
+    Id,
+    /// The admin's subject (from the admin token).
+    AdminSubject,
+    /// The action performed (e.g. `upsert_policy`, `delete_policy`).
+    Action,
+    /// The target of the action (e.g. group name or device fingerprint).
+    Target,
+    /// The request payload (JSON), if any.
+    Payload,
+    /// Creation timestamp.
+    CreatedAt,
+}
+
+/// Migration 0004: create the `usage_counters` table for quota tracking.
+///
+/// Each row tracks a user's cumulative usage (request count, token count,
+/// cost) for a given period (daily or monthly). Updated incrementally per
+/// request via UPSERT.
+pub struct Migration0004UsageCounters;
+
+impl MigrationName for Migration0004UsageCounters {
+    fn name(&self) -> &str {
+        "m000004_usage_counters"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0004UsageCounters {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(UsageCounter::Table)
+                    .col(
+                        ColumnDef::new(UsageCounter::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(UsageCounter::UserSubject)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(UsageCounter::GroupName).string().null())
+                    .col(ColumnDef::new(UsageCounter::PeriodDate).date().not_null())
+                    .col(ColumnDef::new(UsageCounter::PeriodKind).string().not_null())
+                    .col(
+                        ColumnDef::new(UsageCounter::RequestCount)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(UsageCounter::TokenCount)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(UsageCounter::CostUsd)
+                            .float()
+                            .not_null()
+                            .default(0.0),
+                    )
+                    .index(
+                        Index::create()
+                            .name("idx_usage_counters_unique")
+                            .col(UsageCounter::UserSubject)
+                            .col(UsageCounter::PeriodDate)
+                            .col(UsageCounter::PeriodKind)
+                            .unique(),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(UsageCounter::Table).to_owned())
+            .await
+    }
+}
+
+/// Iden for the `usage_counters` table.
+#[derive(Iden)]
+pub enum UsageCounter {
+    /// The table.
+    #[iden = "usage_counters"]
+    Table,
+    /// Primary key (UUID).
+    Id,
+    /// The user subject.
+    UserSubject,
+    /// The group name (optional, for group-level reporting).
+    GroupName,
+    /// The period date (e.g. 2026-08-25 for daily).
+    PeriodDate,
+    /// The period kind: `daily` or `monthly`.
+    PeriodKind,
+    /// Cumulative request count for the period.
+    RequestCount,
+    /// Cumulative token count for the period.
+    TokenCount,
+    /// Cumulative cost in USD for the period.
+    CostUsd,
 }

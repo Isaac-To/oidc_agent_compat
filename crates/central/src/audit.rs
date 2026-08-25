@@ -39,6 +39,22 @@ pub struct AuditEntry {
     pub completion_tokens: Option<i32>,
     /// Token usage (total tokens), if reported.
     pub total_tokens: Option<i32>,
+    /// The relay-side identity database ID (enrichment).
+    pub identity_id: Option<String>,
+    /// The user email (enrichment).
+    pub email: Option<String>,
+    /// The group/role memberships as a JSON array string (enrichment).
+    pub groups: Option<String>,
+    /// The request endpoint/path (e.g. `/v1/chat/completions`).
+    pub endpoint: Option<String>,
+    /// The request ID for end-to-end correlation.
+    pub request_id: Option<String>,
+    /// The permission decision: `allowed` or `denied`.
+    pub permission_decision: Option<String>,
+    /// The reason a request was denied (set when denied).
+    pub denial_reason: Option<String>,
+    /// The estimated cost in USD (enrichment; populated in phase 3).
+    pub cost_usd: Option<f64>,
 }
 
 /// The audit logger, backed by the central proxy's database.
@@ -86,11 +102,53 @@ impl AuditLogger {
         let prompt_value = Value::Int(entry.prompt_tokens);
         let completion_value = Value::Int(entry.completion_tokens);
         let total_value = Value::Int(entry.total_tokens);
+        let identity_id_value = entry
+            .identity_id
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let email_value = entry
+            .email
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let groups_value = entry
+            .groups
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let endpoint_value = entry
+            .endpoint
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let request_id_value = entry
+            .request_id
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let permission_decision_value = entry
+            .permission_decision
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let denial_reason_value = entry
+            .denial_reason
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let cost_value = entry
+            .cost_usd
+            .map(|v| Value::Double(Some(v)))
+            .unwrap_or(Value::Double(None));
 
         let sql = "INSERT INTO audit_log \
              (id, device_id, user_subject, model, backend, status, latency_ms, stream, \
-             prompt_tokens, completion_tokens, total_tokens, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
+             prompt_tokens, completion_tokens, total_tokens, created_at, \
+             identity_id, email, groups, endpoint, request_id, \
+             permission_decision, denial_reason, cost_usd) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+             $13, $14, $15, $16, $17, $18, $19, $20)";
 
         self.db
             .execute(Statement::from_sql_and_values(
@@ -109,6 +167,14 @@ impl AuditLogger {
                     completion_value,
                     total_value,
                     now_str.into(),
+                    identity_id_value,
+                    email_value,
+                    groups_value,
+                    endpoint_value,
+                    request_id_value,
+                    permission_decision_value,
+                    denial_reason_value,
+                    cost_value,
                 ],
             ))
             .await
@@ -167,6 +233,14 @@ mod tests {
             prompt_tokens: Some(100),
             completion_tokens: Some(50),
             total_tokens: Some(150),
+            identity_id: Some("id-123".into()),
+            email: Some("user@example.com".into()),
+            groups: Some(r#"["engineering"]"#.into()),
+            endpoint: Some("/v1/chat/completions".into()),
+            request_id: Some("req-123".into()),
+            permission_decision: Some("allowed".into()),
+            denial_reason: None,
+            cost_usd: Some(0.0021),
         };
         logger.record(&entry).await.expect("record");
 
@@ -182,6 +256,15 @@ mod tests {
         assert_eq!(entries[0].model.as_deref(), Some("gpt-4"));
         assert_eq!(entries[0].status, 200);
         assert_eq!(entries[0].total_tokens, Some(150));
+        // Enrichment columns.
+        assert_eq!(entries[0].identity_id.as_deref(), Some("id-123"));
+        assert_eq!(entries[0].email.as_deref(), Some("user@example.com"));
+        assert_eq!(entries[0].groups.as_deref(), Some(r#"["engineering"]"#));
+        assert_eq!(entries[0].endpoint.as_deref(), Some("/v1/chat/completions"));
+        assert_eq!(entries[0].request_id.as_deref(), Some("req-123"));
+        assert_eq!(entries[0].permission_decision.as_deref(), Some("allowed"));
+        assert!(entries[0].denial_reason.is_none());
+        assert_eq!(entries[0].cost_usd, Some(0.0021));
     }
 
     #[tokio::test]
@@ -198,6 +281,14 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            identity_id: None,
+            email: None,
+            groups: None,
+            endpoint: None,
+            request_id: None,
+            permission_decision: None,
+            denial_reason: None,
+            cost_usd: None,
         };
         logger.record(&entry).await.expect("record");
 
@@ -227,6 +318,14 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            identity_id: None,
+            email: None,
+            groups: None,
+            endpoint: None,
+            request_id: None,
+            permission_decision: None,
+            denial_reason: None,
+            cost_usd: None,
         };
         logger.record(&entry).await.expect("record");
 

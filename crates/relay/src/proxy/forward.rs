@@ -106,16 +106,52 @@ pub async fn proxy_handler(
     State(state): State<AppState>,
     request: axum::extract::Request,
 ) -> Response<Body> {
+    let start = std::time::Instant::now();
+
+    // Generate a request ID for end-to-end correlation across relay and
+    // central. This is forwarded as the x-oac-request-id header and logged
+    // on both sides.
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    // Capture the method and path before the request is consumed.
+    let method = request.method().to_string();
+    let endpoint = request.uri().path().to_string();
+
     // Extract the verified identity (attached by auth middleware) before
     // the request body is consumed.
     let identity = request
         .extensions()
         .get::<super::auth::VerifiedIdentity>()
         .cloned();
-    match forward_request(&state, request, identity.as_ref()).await {
-        Ok(resp) => resp,
+
+    let result = forward_request(&state, request, identity.as_ref(), &request_id).await;
+
+    // Record a relay-side activity log entry (best-effort; log on failure).
+    let latency_ms = start.elapsed().as_millis() as i64;
+    let (central_status, model) = match &result {
+        Ok((resp, model)) => (Some(resp.status().as_u16() as i32), model.clone()),
+        Err(_) => (None, None),
+    };
+    if let Some(ident) = &identity {
+        let entry = crate::activity::RelayActivityEntry {
+            identity_id: ident.identity_id.clone(),
+            key_id: ident.key_id.clone(),
+            method,
+            endpoint,
+            model,
+            central_status,
+            latency_ms,
+            request_id: Some(request_id.clone()),
+        };
+        if let Err(e) = state.activity.record(&entry).await {
+            tracing::error!(error = %e, request_id = %request_id, "failed to write relay activity log");
+        }
+    }
+
+    match result {
+        Ok((resp, _)) => resp,
         Err(e) => {
-            tracing::error!(error = %e, "forward failed");
+            tracing::error!(error = %e, request_id = %request_id, "forward failed");
             let body = serde_json::json!({
                 "error": {
                     "message": "upstream request failed",
@@ -137,20 +173,27 @@ pub async fn proxy_handler(
 /// # Security
 ///
 /// The relay replaces the incoming `Authorization` (the local API key) with
-/// the verified user identity, forwarded as `X-OAC-User-Subject` and
-/// `X-OAC-User-Email` headers. The central proxy uses these for audit
-/// logging. The local key is never forwarded to the central proxy.
+/// the verified user identity, forwarded as `X-OAC-User-Subject`,
+/// `X-OAC-User-Email`, `X-OAC-User-Groups`, and `X-OAC-Identity-Id` headers.
+/// The central proxy uses these for audit logging and authorization. The
+/// local key is never forwarded to the central proxy.
+///
+/// Returns the response and the parsed model (for activity logging).
 async fn forward_request(
     state: &AppState,
     request: axum::extract::Request,
     identity: Option<&super::auth::VerifiedIdentity>,
-) -> Result<Response<Body>> {
+    request_id: &str,
+) -> Result<(Response<Body>, Option<String>)> {
     let (parts, body) = request.into_parts();
 
     // Read the body.
     let body_bytes = axum::body::to_bytes(body, super::MAX_BODY_SIZE)
         .await
         .map_err(|e| Error::Http(format!("read body: {e}")))?;
+
+    // Extract the model from the request body (for activity logging).
+    let model = extract_model(&body_bytes);
 
     // Build the upstream URL from the request path.
     let path = parts.uri.path();
@@ -169,9 +212,9 @@ async fn forward_request(
     }
 
     // Forward the verified user identity to the central proxy for audit
-    // logging. These headers are set by the relay ONLY from the
-    // auth-middleware-verified identity (never from the incoming request
-    // headers), so a client cannot spoof them.
+    // logging and authorization. These headers are set by the relay ONLY
+    // from the auth-middleware-verified identity (never from the incoming
+    // request headers), so a client cannot spoof them.
     if let Some(ident) = identity {
         if let Ok(v) = HeaderValue::from_str(&ident.subject) {
             upstream = upstream.header("x-oac-user-subject", v);
@@ -181,9 +224,19 @@ async fn forward_request(
                 upstream = upstream.header("x-oac-user-email", v);
             }
         }
+        if let Some(groups) = &ident.groups {
+            if let Ok(v) = HeaderValue::from_str(groups) {
+                upstream = upstream.header("x-oac-user-groups", v);
+            }
+        }
         if let Ok(v) = HeaderValue::from_str(&ident.identity_id) {
             upstream = upstream.header("x-oac-identity-id", v);
         }
+    }
+
+    // Forward the request ID for end-to-end correlation.
+    if let Ok(v) = HeaderValue::from_str(request_id) {
+        upstream = upstream.header("x-oac-request-id", v);
     }
 
     // Send the request.
@@ -220,19 +273,28 @@ async fn forward_request(
         // Stream the response body as raw bytes.
         let stream = upstream_resp.bytes_stream();
         let body = Body::from_stream(stream);
-        response_builder
+        let resp = response_builder
             .body(body)
-            .map_err(|e| Error::Http(format!("build stream response: {e}")))
+            .map_err(|e| Error::Http(format!("build stream response: {e}")))?;
+        Ok((resp, model))
     } else {
         // Buffer the response body.
         let body = upstream_resp
             .bytes()
             .await
             .map_err(|e| Error::Http(format!("read upstream body: {e}")))?;
-        response_builder
+        let resp = response_builder
             .body(Body::from(body))
-            .map_err(|e| Error::Http(format!("build response: {e}")))
+            .map_err(|e| Error::Http(format!("build response: {e}")))?;
+        Ok((resp, model))
     }
+}
+
+/// Extracts the `model` field from a JSON request body (for activity
+/// logging).
+fn extract_model(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get("model")?.as_str().map(String::from)
 }
 
 /// Sanitizes the request path to prevent SSRF and path traversal.
