@@ -1,5 +1,8 @@
 /target
 
+# mdBook generated output
+docs/book/
+
 # Secrets and local state — never commit
 config.toml
 *.db
