@@ -16,6 +16,7 @@
 
 pub mod auth;
 pub mod forward;
+pub mod rate_limit;
 
 use std::sync::Arc;
 
@@ -38,6 +39,8 @@ pub struct AppState {
     pub client: reqwest::Client,
     /// The audit logger.
     pub audit: AuditLogger,
+    /// The rate limiter (None in dev mode).
+    pub rate_limiter: Option<rate_limit::RateLimiter>,
 }
 
 /// The maximum request body size (10 MB).
@@ -65,6 +68,10 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            rate_limit::rate_limit_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             auth::auth_middleware,
         ))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
@@ -89,11 +96,20 @@ pub async fn serve(
     audit: AuditLogger,
 ) -> Result<()> {
     let client = forward::build_client()?;
+    let rate_limiter = if config.dev_mode {
+        None
+    } else {
+        Some(rate_limit::RateLimiter::new(
+            rate_limit::DEFAULT_RATE_LIMIT,
+            rate_limit::DEFAULT_WINDOW,
+        ))
+    };
     let state = AppState {
         config: config.clone(),
         master_key: Arc::new(master_key),
         client,
         audit,
+        rate_limiter,
     };
     let app = router(state);
 

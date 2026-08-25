@@ -43,9 +43,9 @@ Agent (Codex, etc.)
 | Threat | Control | Status |
 |---|---|---|
 | Attacker spoofs a local API key | 256-bit `OsRng` key, SHA-256 hash, constant-time compare (`subtle::ConstantTimeEq`) | ✅ Implemented |
-| Attacker spoofs the relay to the central proxy | mTLS with company CA (client cert required) | ⚠️ **TODO** — mTLS not yet wired (plain HTTP in dev) |
+| Attacker spoofs the relay to the central proxy | mTLS with company CA (client cert required) | ✅ Implemented |
 | Attacker spoofs the IdP | OIDC discovery + JWKS signature verification + alg pin {RS256, ES256} | ✅ Implemented |
-| Attacker spoofs the central proxy to the relay | mTLS with company CA (server cert verification) | ⚠️ **TODO** — mTLS not yet wired |
+| Attacker spoofs the central proxy to the relay | mTLS with company CA (server cert verification) | ✅ Implemented |
 | Attacker spoofs the user identity to the central proxy | `X-OAC-User-Subject` header set ONLY by relay auth middleware (never from incoming request headers) | ✅ Implemented |
 | Attacker spoofs the Host header (DNS rebinding) | Host header validation middleware (loopback only) | ✅ Implemented |
 | Attacker spoofs the OIDC redirect (mix-up) | `state` (CSRF) + `nonce` (replay) + loopback redirect only | ✅ Implemented |
@@ -54,7 +54,7 @@ Agent (Codex, etc.)
 
 | Threat | Control | Status |
 |---|---|---|
-| Attacker tampers with the request in transit (relay → central) | mTLS (TLS 1.3 integrity) | ⚠️ **TODO** — mTLS not yet wired |
+| Attacker tampers with the request in transit (relay → central) | mTLS (TLS 1.3 integrity) | ✅ Implemented |
 | Attacker tampers with the audit log | Append-only triggers (SQLite `BEFORE UPDATE/DELETE` → `RAISE(ABORT)`) | ✅ Implemented |
 | Attacker tampers with the local key store (SQLite) | `0600` file permissions, parameterized SQL (no injection) | ✅ Implemented |
 | Attacker tampers with the agent config file | `0600` permissions, written by relay only | ✅ Implemented |
@@ -105,7 +105,7 @@ Agent (Codex, etc.)
 
 | Item | Severity | Notes |
 |---|---|---|
-| **mTLS relay ↔ central** | High | Plain HTTP in dev; mTLS builders exist in `common::mtls` but are not wired into `axum::serve` / `reqwest::Client`. |
+| **mTLS relay ↔ central** | High | ✅ **DONE** — Wired in merge 3e23986. Central serves over mTLS (`axum_server::bind_rustls`) in prod mode; relay builds `reqwest` client with mTLS. Dev mode uses plain HTTP. |
 | **Rate limiting on central** | Medium | No rate limiting; rely on mTLS + network ACLs for v1. |
 | **at_hash validation** | Low | OIDC Core §3.1.3.7 recommends; `openidconnect` crate exposes helper but check is manual. Deferred. |
 | **Groups extraction** | Low | Not a standard OIDC claim; would need `AdditionalClaims`. Deferred. |

@@ -94,6 +94,7 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
         master_key: std::sync::Arc::new(master_key),
         client,
         audit: audit.clone(),
+        rate_limiter: None,
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -228,6 +229,7 @@ async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
         master_key: std::sync::Arc::new(master_key),
         client,
         audit: audit.clone(),
+        rate_limiter: None,
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -439,6 +441,7 @@ async fn setup_mtls_central() -> SocketAddr {
         master_key: std::sync::Arc::new(master_key),
         client,
         audit: audit.clone(),
+        rate_limiter: None,
     };
     let app = proxy::router(state);
 

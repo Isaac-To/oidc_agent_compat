@@ -111,6 +111,7 @@ async fn setup_full_system() -> (SocketAddr, reqwest::Client, String, AuditLogge
         master_key: std::sync::Arc::new(master_key),
         client: central_client,
         audit: audit.clone(),
+        rate_limiter: None,
     };
     let central_app = central_proxy::router(central_state);
     let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
