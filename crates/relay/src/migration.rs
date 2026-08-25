@@ -169,16 +169,8 @@ impl MigrationTrait for Migration0002RelayActivityLog {
                             .string()
                             .not_null(),
                     )
-                    .col(
-                        ColumnDef::new(RelayActivityLog::KeyId)
-                            .string()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(RelayActivityLog::Method)
-                            .string()
-                            .not_null(),
-                    )
+                    .col(ColumnDef::new(RelayActivityLog::KeyId).string().not_null())
+                    .col(ColumnDef::new(RelayActivityLog::Method).string().not_null())
                     .col(
                         ColumnDef::new(RelayActivityLog::Endpoint)
                             .string()

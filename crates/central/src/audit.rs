@@ -260,15 +260,9 @@ mod tests {
         assert_eq!(entries[0].identity_id.as_deref(), Some("id-123"));
         assert_eq!(entries[0].email.as_deref(), Some("user@example.com"));
         assert_eq!(entries[0].groups.as_deref(), Some(r#"["engineering"]"#));
-        assert_eq!(
-            entries[0].endpoint.as_deref(),
-            Some("/v1/chat/completions")
-        );
+        assert_eq!(entries[0].endpoint.as_deref(), Some("/v1/chat/completions"));
         assert_eq!(entries[0].request_id.as_deref(), Some("req-123"));
-        assert_eq!(
-            entries[0].permission_decision.as_deref(),
-            Some("allowed")
-        );
+        assert_eq!(entries[0].permission_decision.as_deref(), Some("allowed"));
         assert!(entries[0].denial_reason.is_none());
         assert_eq!(entries[0].cost_usd, Some(0.0021));
     }

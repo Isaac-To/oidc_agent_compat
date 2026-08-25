@@ -205,9 +205,7 @@ impl MigrationTrait for Migration0002AuditEnrichment {
         for (col, ty) in cols {
             manager
                 .get_connection()
-                .execute_unprepared(&format!(
-                    "ALTER TABLE audit_log ADD COLUMN {col} {ty};"
-                ))
+                .execute_unprepared(&format!("ALTER TABLE audit_log ADD COLUMN {col} {ty};"))
                 .await?;
         }
         Ok(())

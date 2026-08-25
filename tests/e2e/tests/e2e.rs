@@ -195,7 +195,13 @@ async fn setup_full_system() -> (
         let _ = axum::serve(relay_listener, relay_app).await;
     });
 
-    (relay_addr, reqwest::Client::new(), local_key, audit, key_store)
+    (
+        relay_addr,
+        reqwest::Client::new(),
+        local_key,
+        audit,
+        key_store,
+    )
 }
 
 #[tokio::test]

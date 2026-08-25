@@ -20,14 +20,14 @@ use oidc_agent_common::oidc;
 use crate::agent_config::{AgentConfig, inject};
 use crate::keystore::KeyStore;
 
+use oidc_agent_common::oidc::{
+    CustomClient, CustomIdTokenClaims, CustomProviderMetadata, CustomUserInfoClaims,
+    groups_to_json_string, union_groups_roles,
+};
 use openidconnect::core::{CoreJwsSigningAlgorithm, CoreResponseType};
 use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     OAuth2TokenResponse, PkceCodeChallenge, RedirectUrl, Scope, SubjectIdentifier,
-};
-use oidc_agent_common::oidc::{
-    CustomClient, CustomIdTokenClaims, CustomProviderMetadata, CustomUserInfoClaims,
-    groups_to_json_string, union_groups_roles,
 };
 
 /// The maximum time to wait for the user to complete the browser login (5 min).
@@ -669,7 +669,10 @@ mod tests {
         }"#;
         let claims: CustomIdTokenClaims = serde_json::from_str(json).expect("parse claims");
         let (_subject, _email, _display, groups) = claims_from_id_token(&claims);
-        assert!(groups.is_none(), "groups must be None when no claims present");
+        assert!(
+            groups.is_none(),
+            "groups must be None when no claims present"
+        );
     }
 
     #[tokio::test]

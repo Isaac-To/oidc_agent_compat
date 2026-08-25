@@ -413,7 +413,10 @@ mod tests {
     fn custom_additional_claims_deserializes_groups_and_roles() {
         let json = r#"{"groups":["g1"],"roles":["r1"]}"#;
         let claims: CustomAdditionalClaims = serde_json::from_str(json).expect("parse");
-        assert_eq!(claims.groups.as_deref(), Some(["g1".to_string()].as_slice()));
+        assert_eq!(
+            claims.groups.as_deref(),
+            Some(["g1".to_string()].as_slice())
+        );
         assert_eq!(claims.roles.as_deref(), Some(["r1".to_string()].as_slice()));
     }
 
