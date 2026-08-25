@@ -170,6 +170,54 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(Migration)]
+        vec![Box::new(Migration), Box::new(Migration0002AuditEnrichment)]
+    }
+}
+
+/// Migration 0002: enrich the `audit_log` table with identity, groups,
+/// endpoint, request-id, permission-decision, and cost columns.
+///
+/// These columns support the permissions and user-activity-logging feature.
+/// All new columns are nullable so existing rows remain valid.
+pub struct Migration0002AuditEnrichment;
+
+impl MigrationName for Migration0002AuditEnrichment {
+    fn name(&self) -> &str {
+        "m000002_audit_enrichment"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0002AuditEnrichment {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Add nullable columns to audit_log. SQLite supports ALTER TABLE
+        // ADD COLUMN for nullable columns without a default.
+        let cols = [
+            ("identity_id", "TEXT"),
+            ("email", "TEXT"),
+            ("groups", "TEXT"),
+            ("endpoint", "TEXT"),
+            ("request_id", "TEXT"),
+            ("permission_decision", "TEXT"),
+            ("denial_reason", "TEXT"),
+            ("cost_usd", "REAL"),
+        ];
+        for (col, ty) in cols {
+            manager
+                .get_connection()
+                .execute_unprepared(&format!(
+                    "ALTER TABLE audit_log ADD COLUMN {col} {ty};"
+                ))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // SQLite does not support DROP COLUMN before 3.35. Recreate the
+        // table without the new columns. For simplicity (and because this
+        // is a forward-only migration in practice), we no-op the down path.
+        let _ = manager;
+        Ok(())
     }
 }

@@ -104,6 +104,14 @@ pub async fn proxy_handler(
                 prompt_tokens: token_usage.prompt,
                 completion_tokens: token_usage.completion,
                 total_tokens: token_usage.total,
+                identity_id: identity.as_ref().and_then(|i| i.identity_id.clone()),
+                email: identity.as_ref().and_then(|i| i.email.clone()),
+                groups: identity.as_ref().and_then(|i| i.groups.clone()),
+                endpoint: Some(path.clone()),
+                request_id: identity.as_ref().and_then(|i| i.request_id.clone()),
+                permission_decision: None,
+                denial_reason: None,
+                cost_usd: None,
             };
             if let Err(e) = state.audit.record(&entry).await {
                 tracing::error!(error = %e, "failed to write audit log");
