@@ -87,7 +87,13 @@ pub async fn proxy_handler(
     State(state): State<AppState>,
     request: axum::extract::Request,
 ) -> Response<Body> {
-    match forward_request(&state, request).await {
+    // Extract the verified identity (attached by auth middleware) before
+    // the request body is consumed.
+    let identity = request
+        .extensions()
+        .get::<super::auth::VerifiedIdentity>()
+        .cloned();
+    match forward_request(&state, request, identity.as_ref()).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!(error = %e, "forward failed");
@@ -108,9 +114,17 @@ pub async fn proxy_handler(
 }
 
 /// Forwards a single request to the central proxy.
+///
+/// # Security
+///
+/// The relay replaces the incoming `Authorization` (the local API key) with
+/// the verified user identity, forwarded as `X-OAC-User-Subject` and
+/// `X-OAC-User-Email` headers. The central proxy uses these for audit
+/// logging. The local key is never forwarded to the central proxy.
 async fn forward_request(
     state: &AppState,
     request: axum::extract::Request,
+    identity: Option<&super::auth::VerifiedIdentity>,
 ) -> Result<Response<Body>> {
     let (parts, body) = request.into_parts();
 
@@ -133,6 +147,24 @@ async fn forward_request(
 
     for (name, value) in &forward_headers {
         upstream = upstream.header(name, value);
+    }
+
+    // Forward the verified user identity to the central proxy for audit
+    // logging. These headers are set by the relay ONLY from the
+    // auth-middleware-verified identity (never from the incoming request
+    // headers), so a client cannot spoof them.
+    if let Some(ident) = identity {
+        if let Ok(v) = HeaderValue::from_str(&ident.subject) {
+            upstream = upstream.header("x-oac-user-subject", v);
+        }
+        if let Some(email) = &ident.email {
+            if let Ok(v) = HeaderValue::from_str(email) {
+                upstream = upstream.header("x-oac-user-email", v);
+            }
+        }
+        if let Ok(v) = HeaderValue::from_str(&ident.identity_id) {
+            upstream = upstream.header("x-oac-identity-id", v);
+        }
     }
 
     // Send the request.

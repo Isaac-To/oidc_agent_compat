@@ -76,13 +76,26 @@ pub async fn proxy_handler(
     let start = Instant::now();
     let path = request.uri().path().to_string();
 
+    // Extract the verified relay identity (attached by auth middleware)
+    // before the request body is consumed.
+    let identity = request
+        .extensions()
+        .get::<super::auth::VerifiedRelayIdentity>()
+        .cloned();
+
     match forward_request(&state, request).await {
         Ok((resp, model, status, stream, token_usage)) => {
             // Record audit entry.
             let latency_ms = start.elapsed().as_millis() as i64;
             let entry = AuditEntry {
-                device_id: "relay".into(),      // TODO: extract from mTLS cert
-                user_subject: "unknown".into(), // TODO: extract from user token
+                device_id: identity
+                    .as_ref()
+                    .map(|i| i.identity_id.clone().unwrap_or_else(|| i.subject.clone()))
+                    .unwrap_or_else(|| "relay".into()),
+                user_subject: identity
+                    .as_ref()
+                    .map(|i| i.subject.clone())
+                    .unwrap_or_else(|| "unknown".into()),
                 model,
                 backend: state.config.backend.name.clone(),
                 status: status.as_u16() as i32,

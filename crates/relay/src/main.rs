@@ -41,6 +41,8 @@ enum Command {
     Login,
     /// Revoke local keys and clear agent config.
     Logout,
+    /// Re-display the local API key from the agent config file.
+    PrintKey,
 }
 
 fn main() -> Result<()> {
@@ -57,6 +59,7 @@ fn main() -> Result<()> {
             Command::Serve => serve(config).await,
             Command::Login => login_cmd(config).await,
             Command::Logout => logout_cmd(config).await,
+            Command::PrintKey => print_key_cmd().await,
         }
     })
 }
@@ -157,5 +160,18 @@ async fn logout_cmd(config: RelayConfig) -> Result<()> {
             .unwrap_or(0);
     }
     println!("oac-relay: revoked {total} key(s)");
+    Ok(())
+}
+
+/// Re-displays the local API key from the agent config file.
+///
+/// The key is read from the agent config file (where `login` wrote it), not
+/// from the database (which only stores the hash). This is useful when the
+/// employee needs to reconfigure their agent manually.
+async fn print_key_cmd() -> Result<()> {
+    let config = oac_relay::agent_config::read()?;
+    println!("oac-relay: agent config:");
+    println!("  base_url = {}", config.base_url);
+    println!("  api_key  = {}", config.api_key);
     Ok(())
 }

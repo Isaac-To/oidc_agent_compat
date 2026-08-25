@@ -95,6 +95,94 @@ pub fn inject(config: &AgentConfig) -> Result<InjectionResult> {
     Ok(InjectionResult { agent, path })
 }
 
+/// Reads the previously-injected agent config (base URL + API key) from the
+/// detected config file.
+///
+/// This is used by the `print-key` subcommand to re-display the key the
+/// employee configured during `login`. The key is read from the agent config
+/// file (where `login` wrote it), not from the database (which only stores
+/// the hash).
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if the config file does not exist or cannot be
+/// parsed.
+pub fn read() -> Result<AgentConfig> {
+    let (agent, path) = detect_agent()?;
+    match agent {
+        AgentKind::Codex => read_codex(&path),
+        AgentKind::GenericEnv => read_generic_env(&path),
+    }
+}
+
+/// Reads the base URL and API key from a Codex `config.json` file.
+fn read_codex(path: &Path) -> Result<AgentConfig> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+    let json: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
+    let base_url = json
+        .get("api_base_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "{} does not contain api_base_url; run `oac-relay login` first",
+                path.display()
+            ))
+        })?
+        .to_string();
+    let api_key = json
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::Config(format!(
+                "{} does not contain api_key; run `oac-relay login` first",
+                path.display()
+            ))
+        })?
+        .to_string();
+    Ok(AgentConfig { base_url, api_key })
+}
+
+/// Reads the base URL and API key from a generic env file (`agent-env.sh`).
+fn read_generic_env(path: &Path) -> Result<AgentConfig> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+    let base_url = extract_env_var(&contents, "OPENAI_API_BASE").ok_or_else(|| {
+        Error::Config(format!(
+            "{} does not contain OPENAI_API_BASE; run `oac-relay login` first",
+            path.display()
+        ))
+    })?;
+    let api_key = extract_env_var(&contents, "OPENAI_API_KEY").ok_or_else(|| {
+        Error::Config(format!(
+            "{} does not contain OPENAI_API_KEY; run `oac-relay login` first",
+            path.display()
+        ))
+    })?;
+    Ok(AgentConfig { base_url, api_key })
+}
+
+/// Extracts a `export VAR='value'` (or `export VAR="value"`) assignment from
+/// a shell env file.
+fn extract_env_var(contents: &str, var_name: &str) -> Option<String> {
+    let prefix = format!("export {var_name}=");
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix(&prefix) {
+            // Strip surrounding single or double quotes.
+            let rest = rest.trim();
+            if (rest.starts_with('\'') && rest.ends_with('\''))
+                || (rest.starts_with('"') && rest.ends_with('"'))
+            {
+                return Some(rest[1..rest.len() - 1].to_string());
+            }
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
 /// Injects config into a Codex `config.json` file.
 ///
 /// Reads the existing JSON (or creates a new object), updates `api_base_url`
@@ -332,5 +420,91 @@ mod tests {
         write_secure(&nested, b"test").expect("write");
         assert!(nested.exists(), "file must be created");
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn extract_env_var_finds_single_quoted_value() {
+        let contents = "# comment\nexport OPENAI_API_BASE='http://127.0.0.1:8787/v1'\nexport OPENAI_API_KEY='oac_abc'\n";
+        assert_eq!(
+            extract_env_var(contents, "OPENAI_API_BASE"),
+            Some("http://127.0.0.1:8787/v1".into())
+        );
+        assert_eq!(
+            extract_env_var(contents, "OPENAI_API_KEY"),
+            Some("oac_abc".into())
+        );
+    }
+
+    #[test]
+    fn extract_env_var_finds_double_quoted_value() {
+        let contents = "export OPENAI_API_KEY=\"oac_xyz\"\n";
+        assert_eq!(
+            extract_env_var(contents, "OPENAI_API_KEY"),
+            Some("oac_xyz".into())
+        );
+    }
+
+    #[test]
+    fn extract_env_var_returns_none_for_missing_var() {
+        let contents = "export OTHER_VAR='value'\n";
+        assert_eq!(extract_env_var(contents, "OPENAI_API_KEY"), None);
+    }
+
+    #[test]
+    fn read_generic_env_round_trips_with_inject() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-env-{}-{}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let config = test_config();
+        inject_generic_env(&tmp, &config).expect("inject");
+        let read_back = read_generic_env(&tmp).expect("read");
+        assert_eq!(read_back.base_url, config.base_url);
+        assert_eq!(read_back.api_key, config.api_key);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_codex_round_trips_with_inject() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-codex-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let config = test_config();
+        inject_codex(&tmp, &config).expect("inject");
+        let read_back = read_codex(&tmp).expect("read");
+        assert_eq!(read_back.base_url, config.base_url);
+        assert_eq!(read_back.api_key, config.api_key);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_codex_missing_file_returns_error() {
+        let err = read_codex(Path::new("/nonexistent/config.json")).unwrap_err();
+        assert!(err.to_string().contains("read"), "{err}");
+    }
+
+    #[test]
+    fn read_codex_missing_api_key_returns_error() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-codex-missing-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&tmp, r#"{"api_base_url": "http://localhost"}"#).expect("write");
+        let err = read_codex(&tmp).unwrap_err();
+        assert!(err.to_string().contains("api_key"), "{err}");
+        let _ = std::fs::remove_file(&tmp);
     }
 }

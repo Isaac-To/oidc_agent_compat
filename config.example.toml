@@ -32,6 +32,9 @@
 # [central]
 # listen_addr = "0.0.0.0:8443"
 # database_url = "postgres://central.example.com/oac"
+# # When true, allows requests without relay-forwarded identity headers
+# # (for dev/testing only). Defaults to false.
+# dev_mode = false
 #
 # [central.oidc]
 # issuer = "https://idp.example.com"

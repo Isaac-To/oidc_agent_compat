@@ -54,6 +54,14 @@ impl AuditLogger {
         Self { db }
     }
 
+    /// Returns a reference to the underlying database connection.
+    ///
+    /// Used by integration tests to verify audit entries were recorded.
+    #[must_use]
+    pub fn db(&self) -> &DatabaseConnection {
+        &self.db
+    }
+
     /// Records an audit entry.
     ///
     /// # Security

@@ -1628,6 +1628,7 @@ dependencies = [
  "oac-relay",
  "oidc-agent-common",
  "reqwest",
+ "sea-orm",
  "serde_json",
  "tokio",
  "zeroize",
