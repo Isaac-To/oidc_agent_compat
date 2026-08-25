@@ -1,115 +1,212 @@
 # Quickstart
 
-This guide walks you through a complete end-to-end run using the bundled
-Docker dev stack (Keycloak + mock backend + central + relay + Goose). It
-takes about 5 minutes once Docker is running.
+This guide walks you through setting up a **production** deployment from
+scratch: a central proxy in Docker on a company server, and a relay binary
+on an employee laptop. It takes about 10 minutes once prerequisites are
+in place.
+
+> Want to try the dev stack first (bundled Keycloak + mock backend)?
+> See [Docker: Dev Stack](./docker-dev.md).
 
 ## Prerequisites
 
-- **Docker** and **Docker Compose** installed.
-- **Rust 1.85+** (stable) — for building the relay binary on the host for
-  the OIDC login test. Install via [rustup](https://rustup.rs/).
-- **curl** — for the test requests.
+- **Rust 1.85+** (stable) — for building the relay binary. Install via
+  [rustup](https://rustup.rs/).
+- **Docker** and **Docker Compose** — for running the central proxy
+  container.
+- **An OIDC Identity Provider** — Okta, Entra ID, Keycloak, Auth0, or any
+  OIDC-compliant IdP. You need: an issuer URL, a client ID, a client
+  secret, and the ability to register a loopback redirect URI
+  (`http://127.0.0.1:*`).
+- **An OpenAI-compatible backend** — OpenAI, Azure OpenAI, OpenRouter,
+  Ollama, vLLM, etc. You need: the base URL and a master API key.
+- **curl** — for test requests.
 
-## Step 1: Start the dev stack
+## Step 1: Generate mTLS certificates
 
-From the repository root:
-
-```sh
-./docker/dev.sh up
-```
-
-This will:
-
-1. Generate mTLS certificates (if not already present).
-2. Build and start all containers: Keycloak (IdP), mock backend, central
-   proxy, relay, and Goose.
-3. Wait for all healthchecks to pass.
-4. Load the mock master key into the central proxy.
-5. Print service URLs and test user credentials.
-
-You should see output ending with:
-
-```
-✓ All services are healthy.
-
-Services:
-  Keycloak:     http://localhost:8080  (admin / admin)
-  Mock backend: http://localhost:8090
-  Central:      http://localhost:8443
-  Relay:        http://127.0.0.1:8787
-
-Test users (realm: oac-dev):
-  alice   / alice-pass-123
-  bob     / bob-pass-456
-  charlie / charlie-pass-789
-  admin   / admin-pass-000
-```
-
-## Step 2: Verify the full chain
-
-Run the built-in test suite:
+The relay and central proxy communicate over mutual TLS. Generate a CA,
+server cert, and client cert:
 
 ```sh
-./docker/dev.sh test
+./docker/generate-certs.sh
 ```
 
-This exercises the full chain — healthchecks, auth rejection, DNS
-rebinding defense, model listing, chat completions (non-streaming and
-SSE), and a master-key-leak check. All tests should pass.
-
-## Step 3: Make a manual request
-
-The relay auto-mints a dev key `oac_test_key_alice` when `dev_mode = true`.
-Use it to make a request through the full chain:
+This creates `docker/certs/{ca,server,client}.{crt,key}`. Copy them into
+the production cert directory:
 
 ```sh
-# List models (relay → central → mock backend):
-curl -H 'Authorization: Bearer oac_test_key_alice' \
+mkdir -p docker/prod/certs
+cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/
+```
+
+Distribute `ca.crt`, `client.crt`, and `client.key` to each employee
+laptop for the relay config.
+
+## Step 2: Configure the central proxy
+
+Copy the reference config and edit it for your environment:
+
+```sh
+cp docker/prod/configs/central.toml docker/prod/configs/central.toml
+```
+
+Edit `docker/prod/configs/central.toml`:
+
+```toml
+listen_addr = "0.0.0.0:8443"
+database_url = "sqlite:///data/central.db"
+dev_mode = false
+
+[oidc]
+issuer = "https://idp.example.com/realms/your-realm"   # ← your IdP
+client_id = "oac-relay"
+client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+redirect_uri = "http://127.0.0.1:0/callback"
+scopes = ["openid", "email", "profile"]
+
+[backend]
+name = "openai"
+base_url = "https://api.openai.com"   # ← your backend
+
+[mtls]
+ca_cert_path = "/certs/ca.crt"
+server_cert_path = "/certs/server.crt"
+server_key_path = "/certs/server.key"
+
+[secret_store]
+kind = "file"
+path = "/run/secrets/master-key"
+
+[admin]
+admin_group = "oac-admins"   # ← your admin group (optional)
+```
+
+## Step 3: Provide secrets
+
+Set the OIDC client secret via an `.env` file:
+
+```sh
+echo "OAC_OIDC_CLIENT_SECRET=your-oidc-client-secret" > docker/prod/.env
+```
+
+Store the master backend key as a Docker secret (preferred) or a mounted
+file. With Docker Swarm:
+
+```sh
+echo -n 'sk-your-master-key' | docker secret create oac_master_key -
+```
+
+Without Swarm, edit `docker/prod/docker-compose.yml` `secrets:` section to
+use a `file:` source instead of `external: true`.
+
+## Step 4: Deploy the central proxy
+
+```sh
+cd docker/prod
+docker compose up -d --build
+docker compose logs -f central
+```
+
+The central proxy serves mTLS on `:8443` with client cert required. Verify
+it's running:
+
+```sh
+docker compose ps
+```
+
+## Step 5: Install the relay on a laptop
+
+Build the relay binary:
+
+```sh
+cargo build --release -p oac-relay
+# → target/release/oac-relay
+```
+
+Copy the binary, config, and certs to the laptop:
+
+```sh
+# Binary:
+cp target/release/oac-relay /usr/local/bin/oac-relay
+
+# Config:
+mkdir -p ~/.oac
+cp docker/prod/configs/relay.toml ~/.oac/relay.toml
+
+# mTLS certs (distributed by your admin):
+mkdir -p ~/.oac/certs
+cp ca.crt ~/.oac/certs/
+cp client.crt ~/.oac/certs/
+cp client.key ~/.oac/certs/
+chmod 600 ~/.oac/certs/client.key
+```
+
+Edit `~/.oac/relay.toml` to point at your central proxy:
+
+```toml
+listen_addr = "127.0.0.1:8787"
+database_url = "sqlite:///data/relay.db"
+dev_mode = false
+
+[oidc]
+issuer = "https://idp.example.com/realms/your-realm"
+client_id = "oac-relay"
+client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+redirect_uri = "http://127.0.0.1:0/callback"
+scopes = ["openid", "email", "profile"]
+
+[central]
+url = "https://central.example.com:8443"   # ← your central proxy
+ca_cert_path = "~/.oac/certs/ca.crt"
+client_cert_path = "~/.oac/certs/client.crt"
+client_key_path = "~/.oac/certs/client.key"
+```
+
+## Step 6: Log in and start the relay
+
+```sh
+# Set the OIDC client secret:
+export OAC_OIDC_CLIENT_SECRET="your-oidc-client-secret"
+
+# Log in (opens browser, runs OIDC auth-code + PKCE flow):
+oac-relay --config ~/.oac/relay.toml login
+
+# Source the agent config (if using generic env format):
+source ~/.oac/agent-env.sh
+
+# Start the relay server:
+oac-relay --config ~/.oac/relay.toml serve
+```
+
+After `login`, the relay writes the base URL + local API key directly into
+the agent's config file (`~/.codex/config.json` or `~/.oac/agent-env.sh`).
+The employee never sees or copies a key.
+
+## Step 7: Make a request
+
+The agent should now point at `http://127.0.0.1:8787/v1` with the
+auto-injected API key. Test with curl:
+
+```sh
+# List models (laptop → relay → mTLS → central → backend):
+curl -H "Authorization: Bearer $OPENAI_API_KEY" \
   http://127.0.0.1:8787/v1/models
 
-# Chat completion (non-streaming):
+# Chat completion:
 curl -X POST http://127.0.0.1:8787/v1/chat/completions \
-  -H 'Authorization: Bearer oac_test_key_alice' \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"mock-gpt-4","messages":[{"role":"user","content":"hello"}]}'
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-## Step 4: Run Goose through the chain
-
-Goose is pre-configured to talk to the relay. Run a headless prompt:
-
-```sh
-./docker/dev.sh goose-run "Hello from Goose!"
-```
-
-Goose → relay (`relay:8787`) → central (`:8443`) → mock backend. You should
-see a mock response.
-
-## Step 5: Test the real OIDC login flow (optional)
-
-The containerized relay can't open a host browser or receive a loopback
-callback, so to test the real OIDC login flow, run the relay binary **on
-the host** against the dev Keycloak:
-
-```sh
-# Build the relay binary:
-cargo build --release -p oac-relay
-
-# Run login against dev Keycloak:
-OAC_OIDC_CLIENT_SECRET="oac-relay-secret" \
-  ./target/release/oac-relay \
-    --config docker/dev/configs/relay-login-test.toml login
-```
-
-A browser window opens to the Keycloak login page. Sign in as
-`alice` / `alice-pass-123`. The relay validates the ID token (alg pin
-RS256/ES256, iss, aud, exp, nonce, signature), fetches userinfo, mints a
-local API key, and injects it into `~/.oac/agent-env.sh`.
+The request flows: agent → relay (loopback) → mTLS → central proxy (master
+key injection + policy enforcement) → backend. The master key never touches
+the laptop.
 
 ## Next steps
 
 - [Relay Setup](./relay-setup.md) — full relay lifecycle and commands.
 - [Central Proxy Setup](./central-setup.md) — central proxy lifecycle.
 - [Configuration Reference](./configuration.md) — all TOML fields.
-- [Docker: Dev Stack](./docker-dev.md) — dev stack in depth.
+- [Docker: Production](./docker-prod.md) — production deployment in depth.
+- [Admin API](./admin-api.md) — managing policies, devices, audit.
