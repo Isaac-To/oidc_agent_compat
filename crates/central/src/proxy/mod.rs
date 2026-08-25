@@ -73,6 +73,13 @@ pub fn router(state: AppState) -> Router {
 
 /// Starts the central proxy server.
 ///
+/// # Security
+///
+/// In production mode (`dev_mode = false`), the server binds with mTLS
+/// (TLS 1.3) using the company CA, requiring relay client certificates. In
+/// dev mode, it serves plain HTTP (for the containerized dev stack where
+/// mTLS is not needed).
+///
 /// # Errors
 ///
 /// Returns [`Error`] if the server fails to bind or start.
@@ -89,12 +96,48 @@ pub async fn serve(
         audit,
     };
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(&config.listen_addr)
-        .await
-        .map_err(|e| oidc_agent_common::error::Error::Http(format!("bind: {e}")))?;
-    tracing::info!("central proxy listening on {}", config.listen_addr);
-    axum::serve(listener, app)
-        .with_graceful_shutdown(oidc_agent_common::shutdown::shutdown_signal())
+
+    if config.dev_mode {
+        // Dev mode: plain HTTP (for containerized dev stack).
+        let listener = tokio::net::TcpListener::bind(&config.listen_addr)
+            .await
+            .map_err(|e| oidc_agent_common::error::Error::Http(format!("bind: {e}")))?;
+        tracing::info!(
+            "central proxy listening on {} (dev HTTP)",
+            config.listen_addr
+        );
+        axum::serve(listener, app)
+            .with_graceful_shutdown(oidc_agent_common::shutdown::shutdown_signal())
+            .await
+            .map_err(|e| oidc_agent_common::error::Error::Http(format!("serve: {e}")))?;
+        return Ok(());
+    }
+
+    // Production mode: mTLS (TLS 1.3, client cert required).
+    let server_config = oidc_agent_common::mtls::build_server_config(
+        &config.mtls.ca_cert_path,
+        &config.mtls.server_cert_path,
+        &config.mtls.server_key_path,
+    )?;
+
+    // Set ALPN protocols for HTTP/1.1 (axum-server requires this when
+    // building from a raw ServerConfig).
+    let mut server_config = server_config;
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        let _ = oidc_agent_common::shutdown::shutdown_signal().await;
+        shutdown_handle.shutdown();
+    });
+
+    tracing::info!("central proxy listening on {} (mTLS)", config.listen_addr);
+    axum_server::bind_rustls(config.listen_addr, tls_config)
+        .handle(handle)
+        .serve(app.into_make_service())
         .await
         .map_err(|e| oidc_agent_common::error::Error::Http(format!("serve: {e}")))?;
     Ok(())

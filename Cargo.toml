@@ -41,6 +41,7 @@ openidconnect = "4"
 # TLS
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 
 # OpenAI types (types only)
 async-openai = { version = "0.41", default-features = false, features = ["types"] }
@@ -82,6 +83,9 @@ time = "0.3"
 
 # Internal
 oidc-agent-common = { path = "crates/common" }
+
+# Test cert generation (dev-dependency)
+rcgen = "0.13"
 
 [profile.release]
 lto = true

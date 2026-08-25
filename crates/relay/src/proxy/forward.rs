@@ -55,20 +55,39 @@ pub const FORWARDABLE_HEADERS: &[&str] = &[
 /// - `rustls-tls` for certificate verification.
 /// - No `danger_accept_invalid_certs`.
 /// - Timeouts to prevent hanging.
+/// - In production mode (`dev_mode = false`), uses mTLS with the relay's
+///   client cert and the company CA for server verification.
+/// - In dev mode, uses plain HTTP (no mTLS) for the containerized dev stack.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Http`] if the client cannot be built.
-pub fn build_client(_config: &RelayConfig) -> Result<reqwest::Client> {
-    // TODO: load mTLS client cert from config.central.{ca_cert_path,
-    // client_cert_path, client_key_path} once we have test certs.
-    reqwest::Client::builder()
+pub fn build_client(config: &RelayConfig) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         // Never follow redirects — prevents SSRF amplification if the central
         // returns a redirect to an internal service.
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(300))
-        .connect_timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(10));
+
+    if !config.dev_mode {
+        // Production mode: mTLS client cert + CA for server verification.
+        let client_config = oidc_agent_common::mtls::build_client_config(
+            &config.central.ca_cert_path,
+            &config.central.client_cert_path,
+            &config.central.client_key_path,
+        )?;
+
+        // Convert the rustls ClientConfig into a reqwest identity + root cert.
+        // reqwest's rustls backend accepts a pre-built ClientConfig via
+        // `use_preconfigured_tls`.
+        builder = builder
+            .use_preconfigured_tls(client_config)
+            .https_only(true);
+    }
+
+    builder
         .build()
         .map_err(|e| Error::Http(format!("build forward client: {e}")))
 }

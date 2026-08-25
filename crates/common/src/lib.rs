@@ -36,3 +36,6 @@ pub mod logging;
 pub mod mtls;
 pub mod oidc;
 pub mod shutdown;
+
+#[cfg(feature = "test-certs")]
+pub mod test_certs;

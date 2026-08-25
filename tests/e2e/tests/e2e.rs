@@ -167,7 +167,7 @@ async fn setup_full_system() -> (SocketAddr, reqwest::Client, String, AuditLogge
             client_cert_path: "/client.pem".into(),
             client_key_path: "/client.key".into(),
         },
-        dev_mode: false,
+        dev_mode: true,
     };
 
     let relay_client = relay_proxy::forward::build_client(&relay_config).expect("relay client");
