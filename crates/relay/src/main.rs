@@ -54,14 +54,20 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = load_config(&cli.config)?;
 
     // Initialize logging.
     let _ = oidc_agent_common::logging::init();
 
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| oidc_agent_common::error::Error::Internal(format!("tokio runtime: {e}")))?;
-    rt.block_on(async {
+    rt.block_on(async move {
+        // `print-key` reads from the agent config file (written by `login`),
+        // not from the relay TOML config or the database, so it does not need
+        // to load a config file. All other subcommands require the config.
+        if matches!(cli.command, Some(Command::PrintKey)) {
+            return print_key_cmd().await;
+        }
+        let config = load_config(&cli.config)?;
         match cli.command.unwrap_or(Command::Serve) {
             Command::Serve => serve(config).await,
             Command::Login => login_cmd(config).await,
