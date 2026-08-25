@@ -2,12 +2,13 @@
 # Production deployment for the OIDC Agent Compatibility Server.
 #
 # This is a reference compose file for hosting the CENTRAL proxy in
-# production. The RELAY runs on employee laptops (see docker/prod/README.md
-# for the laptop install flow), so it is NOT included here.
+# production. It ships only our own server — you bring your own OIDC IdP
+# and OpenAI-compatible backend. The RELAY runs on employee laptops (see
+# docker/prod/README.md for the laptop install flow), so it is NOT included
+# here.
 #
 # Differences from the dev stack (docker/docker-compose.yml):
-#   - No Keycloak, no mock-backend, no Goose — you bring your own IdP and
-#     OpenAI-compatible backend.
+#   - Only our own server component — no bundled IdP or mock backend.
 #   - dev_mode = false everywhere (mTLS enforced, relay must bind loopback).
 #   - Master key loaded via a secret (Docker secret or mounted file), never
 #     an env var, never baked into the image.

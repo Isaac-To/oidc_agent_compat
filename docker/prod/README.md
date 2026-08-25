@@ -1,8 +1,10 @@
 # Production Deployment
 
 This directory contains the **production** containerization for the OIDC
-Agent Compatibility Server. It is separate from the [dev stack](../README.md)
-(Keycloak, mock-backend, Goose) which is for local testing only.
+Agent Compatibility Server. It ships only our own server components — you
+bring your own OIDC IdP and OpenAI-compatible backend. It is separate from
+the [dev stack](../README.md), which bundles a test IdP and mock backend
+for local development only.
 
 ## Architecture (production)
 
@@ -95,8 +97,9 @@ source ~/.oac/agent-env.sh
 oac-relay --config ~/.oac/relay.toml serve
 ```
 
-The agent (Codex, Goose, etc.) points at `http://127.0.0.1:8787` with the
-minted API key. The relay forwards over mTLS to the central proxy.
+The agent (Codex, Goose, or any OpenAI-compatible client) points at
+`http://127.0.0.1:8787` with the minted API key. The relay forwards over
+mTLS to the central proxy.
 
 ## Files
 
