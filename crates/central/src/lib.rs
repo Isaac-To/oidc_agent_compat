@@ -15,6 +15,7 @@
 
 pub mod audit;
 pub mod db;
+pub mod device_store;
 pub mod entity;
 pub mod migration;
 pub mod policy;
