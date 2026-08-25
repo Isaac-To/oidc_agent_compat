@@ -101,43 +101,28 @@ cmd_shell() {
 }
 
 cmd_goose() {
-    info "Configuring Goose to use the relay..."
-
-    GOOSE_CONFIG_DIR="$HOME/.config/goose"
-    GOOSE_PROVIDERS_DIR="$GOOSE_CONFIG_DIR/custom_providers"
-    mkdir -p "$GOOSE_PROVIDERS_DIR"
-
-    cat > "$GOOSE_PROVIDERS_DIR/local_relay.json" << 'EOF'
-{
-  "name": "local_relay",
-  "engine": "openai",
-  "display_name": "Local Relay (OAC)",
-  "description": "OpenAI-compatible relay at 127.0.0.1:8787 with OIDC auth",
-  "api_key_env": "LOCAL_RELAY_API_KEY",
-  "base_url": "http://127.0.0.1:8787/v1/chat/completions",
-  "models": [
-    { "name": "mock-gpt-4", "context_limit": 128000 },
-    { "name": "mock-gpt-4o", "context_limit": 128000 }
-  ],
-  "supports_streaming": true,
-  "requires_auth": true
+    info "Goose is now containerized. Usage:"
+    echo ""
+    echo "  # Run a headless prompt through Goose → relay → central → backend:"
+    echo "  ./docker/dev.sh goose-run \"Summarize the files in /workspace\""
+    echo ""
+    echo "  # Open an interactive Goose session:"
+    echo "  docker compose -f docker/docker-compose.yml run --rm goose session"
+    echo ""
+    echo "  # Goose is configured to use the relay at http://relay:8787"
+    echo "  # with the test key 'oac_test_key_alice' and model 'mock-gpt-4'."
+    echo ""
+    echo "  # To use a different key, edit the OPENAI_API_KEY env var in"
+    echo "  # docker/docker-compose.yml under the 'goose' service."
 }
-EOF
-    ok "Goose provider config written to $GOOSE_PROVIDERS_DIR/local_relay.json"
 
-    cat > "$GOOSE_CONFIG_DIR/config.yaml" << 'EOF'
-GOOSE_PROVIDER: custom_local_relay
-GOOSE_MODEL: mock-gpt-4
-EOF
-    ok "Goose config written to $GOOSE_CONFIG_DIR/config.yaml"
-
+cmd_goose_run() {
+    local prompt="${2:-Hello from Goose!}"
+    info "Running Goose headless: $prompt"
+    info "  Goose → relay (relay:8787) → central (central:8443) → mock-backend"
     echo ""
-    warn "You need to set LOCAL_RELAY_API_KEY to a valid relay key."
-    echo "  For now, use the test key (the relay accepts any key in dev mode):"
-    echo "    export LOCAL_RELAY_API_KEY=\"oac_dev_test_key\""
-    echo ""
-    echo "  Then start Goose:"
-    echo "    goose session"
+    docker compose -f "$COMPOSE_FILE" run --rm \
+        goose run --no-session -t "$prompt"
 }
 
 cmd_test() {
@@ -259,23 +244,25 @@ wait_for_https() {
 # ─── Main ────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
-    up)     cmd_up ;;
-    down)   cmd_down ;;
-    status) cmd_status ;;
-    logs)   cmd_logs ;;
-    shell)  cmd_shell ;;
-    goose)  cmd_goose ;;
-    test)   cmd_test ;;
+    up)        cmd_up ;;
+    down)      cmd_down ;;
+    status)    cmd_status ;;
+    logs)      cmd_logs ;;
+    shell)     cmd_shell ;;
+    goose)     cmd_goose ;;
+    goose-run) cmd_goose_run "$@" ;;
+    test)      cmd_test ;;
     *)
-        echo "Usage: $0 {up|down|status|logs|shell|goose|test}"
+        echo "Usage: $0 {up|down|status|logs|shell|goose|goose-run|test}"
         echo ""
-        echo "  up      — generate certs, build and start all containers"
-        echo "  down    — stop all containers"
-        echo "  status  — show container status"
-        echo "  logs    — tail logs from all services"
-        echo "  shell   — open a shell in the relay container"
-        echo "  goose   — configure Goose to use the relay"
-        echo "  test    — send test requests through the full chain"
+        echo "  up         — generate certs, build and start all containers"
+        echo "  down       — stop all containers"
+        echo "  status     — show container status"
+        echo "  logs       — tail logs from all services"
+        echo "  shell      — open a shell in the relay container"
+        echo "  goose      — show Goose usage info"
+        echo "  goose-run  — run a headless Goose prompt (e.g. ./docker/dev.sh goose-run \"Hello\")"
+        echo "  test       — send test requests through the full chain"
         exit 1
         ;;
 esac

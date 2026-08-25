@@ -107,15 +107,22 @@ pub async fn serve(config: RelayConfig, key_store: KeyStore) -> Result<()> {
 /// # Security
 ///
 /// Used by the Host header validation middleware to reject DNS rebinding
-/// attacks. Only loopback addresses are allowed.
+/// attacks. Only loopback addresses are allowed. In dev mode, the Docker
+/// service name `relay` is also allowed so containerized agents (e.g. Goose)
+/// can connect via the Docker network.
 #[must_use]
-pub fn allowed_hosts(listen_addr: &SocketAddr) -> Vec<String> {
+pub fn allowed_hosts(listen_addr: &SocketAddr, dev_mode: bool) -> Vec<String> {
     let port = listen_addr.port();
-    vec![
+    let mut hosts = vec![
         format!("127.0.0.1:{port}"),
         format!("localhost:{port}"),
         format!("[::1]:{port}"),
-    ]
+    ];
+    if dev_mode {
+        // Allow the Docker service name for containerized agents.
+        hosts.push(format!("relay:{port}"));
+    }
+    hosts
 }
 
 #[cfg(test)]
@@ -125,9 +132,23 @@ mod tests {
     #[test]
     fn allowed_hosts_includes_loopback_variants() {
         let addr: SocketAddr = "127.0.0.1:8787".parse().unwrap();
-        let hosts = allowed_hosts(&addr);
+        let hosts = allowed_hosts(&addr, false);
         assert!(hosts.contains(&"127.0.0.1:8787".to_string()));
         assert!(hosts.contains(&"localhost:8787".to_string()));
         assert!(hosts.contains(&"[::1]:8787".to_string()));
+    }
+
+    #[test]
+    fn allowed_hosts_includes_relay_in_dev_mode() {
+        let addr: SocketAddr = "0.0.0.0:8787".parse().unwrap();
+        let hosts = allowed_hosts(&addr, true);
+        assert!(hosts.contains(&"relay:8787".to_string()));
+    }
+
+    #[test]
+    fn allowed_hosts_excludes_relay_in_prod_mode() {
+        let addr: SocketAddr = "127.0.0.1:8787".parse().unwrap();
+        let hosts = allowed_hosts(&addr, false);
+        assert!(!hosts.contains(&"relay:8787".to_string()));
     }
 }

@@ -31,7 +31,7 @@ pub async fn host_guard_middleware(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let allowed = super::allowed_hosts(&state.listen_addr);
+    let allowed = super::allowed_hosts(&state.listen_addr, state.config.dev_mode);
     let host = request
         .headers()
         .get(axum::http::header::HOST)

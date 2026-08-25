@@ -1,13 +1,15 @@
 # Docker dev stack for the OIDC Agent Compatibility Server.
 #
-# All services run in containers. The relay is exposed on 127.0.0.1:8787
-# so Goose (on the host) can connect to it.
+# All services run in containers — no host dependencies beyond Docker.
+# Goose runs headless in a container and connects to the relay via the
+# Docker network.
 #
 # Services:
 #   keycloak      — OIDC IdP (pre-configured realm with test users)
 #   mock-backend  — OpenAI-compatible mock API (Flask)
 #   central       — Central proxy (holds master key, forwards to mock-backend)
-#   relay         — Laptop relay (forwards to central over mTLS)
+#   relay         — Laptop relay (forwards to central, exposed on 127.0.0.1:8787)
+#   goose         — AI agent (headless CLI, connects to relay)
 
 services:
   keycloak:
@@ -98,7 +100,36 @@ services:
       timeout: 3s
       retries: 10
 
+  # Goose AI agent — runs headless in a container.
+  # Connects to the relay via the Docker network at http://relay:8787.
+  # Uses the built-in 'openai' provider with a custom host pointing at the relay.
+  goose:
+    image: ghcr.io/aaif-goose/goose:latest
+    environment:
+      # Use the built-in openai provider pointing at the relay.
+      GOOSE_PROVIDER: openai
+      GOOSE_MODEL: mock-gpt-4
+      OPENAI_API_KEY: oac_test_key_alice
+      OPENAI_HOST: http://relay:8787
+      OPENAI_BASE_PATH: v1/chat/completions
+      # Headless mode — auto-approve tools, no prompts.
+      GOOSE_MODE: auto
+      GOOSE_DISABLE_SESSION_NAMING: "true"
+      GOOSE_CONTEXT_STRATEGY: summarize
+    volumes:
+      - goose-config:/home/goose/.config/goose
+      - ./workspace:/workspace
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    depends_on:
+      relay:
+        condition: service_healthy
+    # Default command prints help; use `run -t "prompt"` for headless execution.
+    # Example: docker compose run --rm goose run --no-session -t "Hello!"
+
 volumes:
   central-data:
   central-secrets:
   relay-data:
+  goose-config:
