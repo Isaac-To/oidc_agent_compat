@@ -195,17 +195,14 @@ pub async fn serve(
 
     if config.dev_mode {
         // Dev mode: plain HTTP (for containerized dev stack).
-        let listener = tokio::net::TcpListener::bind(&config.listen_addr)
-            .await
-            .map_err(|e| oidc_agent_common::error::Error::Http(format!("bind: {e}")))?;
+        let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
         tracing::info!(
             "central proxy listening on {} (dev HTTP)",
             config.listen_addr
         );
         axum::serve(listener, app)
             .with_graceful_shutdown(oidc_agent_common::shutdown::shutdown_signal())
-            .await
-            .map_err(|e| oidc_agent_common::error::Error::Http(format!("serve: {e}")))?;
+            .await?;
         return Ok(());
     }
 
@@ -234,7 +231,6 @@ pub async fn serve(
     axum_server::bind_rustls(config.listen_addr, tls_config)
         .handle(handle)
         .serve(app.into_make_service())
-        .await
-        .map_err(|e| oidc_agent_common::error::Error::Http(format!("serve: {e}")))?;
+        .await?;
     Ok(())
 }

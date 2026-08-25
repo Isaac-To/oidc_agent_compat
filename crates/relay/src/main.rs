@@ -222,10 +222,7 @@ async fn revoke_key_cmd(config: RelayConfig, key_id: &str) -> Result<()> {
     let db = oac_relay::db::setup(&config.database_url).await?;
     let key_store = oac_relay::keystore::KeyStore::new(db);
 
-    let revoked = key_store
-        .revoke_key(key_id)
-        .await
-        .map_err(|e| oidc_agent_common::error::Error::Database(format!("revoke key: {e}")))?;
+    let revoked = key_store.revoke_key(key_id).await?;
 
     if revoked {
         println!("oac-relay: revoked key {key_id}");
