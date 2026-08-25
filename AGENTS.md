@@ -98,7 +98,7 @@ verified; `at_hash` validation is implemented (step 13c). See
 `/memories/repo/oidc-security-research.md` for the full RFC citation list.
 
 Manual verification: run `oac-relay login` on the **host** against dev
-Keycloak using `docker/configs/relay-login-test.toml` (`dev_mode=true`,
+Keycloak using `docker/dev/configs/relay-login-test.toml` (`dev_mode=true`,
 port 8788). The containerized relay cannot do login (no host browser /
 loopback callback).
 

@@ -43,8 +43,8 @@ services:
 
   central:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
+      context: ../..
+      dockerfile: docker/dev/Dockerfile
     command: ["oac-central", "--config", "/config/central.toml", "serve"]
     environment:
       OAC_OIDC_CLIENT_SECRET: "oac-relay-secret"
@@ -53,7 +53,7 @@ services:
       - "8443:8443"
     volumes:
       - ./configs/central.toml:/config/central.toml:ro
-      - ./certs:/certs:ro
+      - ../certs:/certs:ro
       - central-data:/data
       - central-secrets:/secrets
     depends_on:
@@ -79,8 +79,8 @@ services:
 
   relay:
     build:
-      context: ..
-      dockerfile: docker/Dockerfile
+      context: ../..
+      dockerfile: docker/dev/Dockerfile
     command: ["oac-relay", "--config", "/config/relay.toml", "serve"]
     environment:
       OAC_OIDC_CLIENT_SECRET: "oac-relay-secret"
@@ -89,7 +89,7 @@ services:
       - "127.0.0.1:8787:8787"
     volumes:
       - ./configs/relay.toml:/config/relay.toml:ro
-      - ./certs:/certs:ro
+      - ../certs:/certs:ro
       - relay-data:/data
     depends_on:
       central:

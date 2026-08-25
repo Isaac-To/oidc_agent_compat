@@ -7,7 +7,7 @@
 # docker/prod/README.md for the laptop install flow), so it is NOT included
 # here.
 #
-# Differences from the dev stack (docker/docker-compose.yml):
+# Differences from the dev stack (docker/dev/docker-compose.yml):
 #   - Only our own server component — no bundled IdP or mock backend.
 #   - dev_mode = false everywhere (mTLS enforced, relay must bind loopback).
 #   - Master key loaded via a secret (Docker secret or mounted file), never
