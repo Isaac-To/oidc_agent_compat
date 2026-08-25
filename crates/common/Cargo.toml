@@ -30,3 +30,7 @@ rand = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
+rcgen = { workspace = true, optional = true }
+
+[features]
+test-certs = ["dep:rcgen"]

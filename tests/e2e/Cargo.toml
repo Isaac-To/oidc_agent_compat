@@ -12,13 +12,14 @@ workspace = true
 [dependencies]
 oac-relay = { path = "../../crates/relay" }
 oac-central = { path = "../../crates/central" }
-oidc-agent-common = { path = "../../crates/common" }
+oidc-agent-common = { path = "../../crates/common", features = ["test-certs"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
 sea-orm = { workspace = true }
+rcgen = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

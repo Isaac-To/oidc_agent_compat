@@ -18,7 +18,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
-oidc-agent-common = { workspace = true }
+oidc-agent-common = { workspace = true, features = ["test-certs"] }
 axum = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
@@ -48,4 +48,5 @@ uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 
 [dev-dependencies]
+rcgen = { workspace = true }
 tokio = { workspace = true }
