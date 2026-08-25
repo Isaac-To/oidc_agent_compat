@@ -1,0 +1,20 @@
+[book]
+title = "OIDC Agent Compatibility Server"
+authors = ["OIDC Agent Compatibility Server Contributors"]
+language = "en"
+multilingual = false
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/isaac-to/oidc-agent-compat"
+edit-url-template = "https://github.com/isaac-to/oidc-agent-compat/edit/main/docs/src/{path}"
+no-section-label = false
+
+[output.html.search]
+limit-results = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
