@@ -492,9 +492,8 @@ mod tests {
     #[test]
     fn extract_usage_from_sse_chunk_without_usage() {
         let usage = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let chunk = bytes::Bytes::from(
-            "data: {\"choices\": [{\"delta\": {\"content\": \"hello\"}}]}\n\n",
-        );
+        let chunk =
+            bytes::Bytes::from("data: {\"choices\": [{\"delta\": {\"content\": \"hello\"}}]}\n\n");
         extract_usage_from_sse_chunk(&chunk, &usage);
         let guard = usage.lock().unwrap();
         assert!(guard.is_none(), "no usage should be extracted");

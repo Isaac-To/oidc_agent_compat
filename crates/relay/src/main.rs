@@ -43,6 +43,13 @@ enum Command {
     Logout,
     /// Re-display the local API key from the agent config file.
     PrintKey,
+    /// List all local API keys.
+    ListKeys,
+    /// Revoke a local API key by its ID.
+    RevokeKey {
+        /// The key ID to revoke.
+        key_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -60,6 +67,8 @@ fn main() -> Result<()> {
             Command::Login => login_cmd(config).await,
             Command::Logout => logout_cmd(config).await,
             Command::PrintKey => print_key_cmd().await,
+            Command::ListKeys => list_keys_cmd(config).await,
+            Command::RevokeKey { key_id } => revoke_key_cmd(config, &key_id).await,
         }
     })
 }
@@ -173,5 +182,55 @@ async fn print_key_cmd() -> Result<()> {
     println!("oac-relay: agent config:");
     println!("  base_url = {}", config.base_url);
     println!("  api_key  = {}", config.api_key);
+    Ok(())
+}
+
+/// Lists all local API keys (key ID, label, creation time, last used).
+async fn list_keys_cmd(config: RelayConfig) -> Result<()> {
+    let db = oac_relay::db::setup(&config.database_url).await?;
+    let key_store = oac_relay::keystore::KeyStore::new(db);
+
+    use oac_relay::entity::api_key;
+    use sea_orm::EntityTrait;
+    let keys = api_key::Entity::find()
+        .all(&key_store.db)
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Database(format!("list keys: {e}")))?;
+
+    if keys.is_empty() {
+        println!("oac-relay: no keys found");
+        return Ok(());
+    }
+
+    println!("oac-relay: {} key(s):", keys.len());
+    for key in &keys {
+        println!(
+            "  id={} label={} created={} last_used={}",
+            key.id,
+            key.label,
+            key.created_at,
+            key.last_used_at
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "never".into()),
+        );
+    }
+    Ok(())
+}
+
+/// Revokes a local API key by its ID (deletes it from the database).
+async fn revoke_key_cmd(config: RelayConfig, key_id: &str) -> Result<()> {
+    let db = oac_relay::db::setup(&config.database_url).await?;
+    let key_store = oac_relay::keystore::KeyStore::new(db);
+
+    let revoked = key_store
+        .revoke_key(key_id)
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Database(format!("revoke key: {e}")))?;
+
+    if revoked {
+        println!("oac-relay: revoked key {key_id}");
+    } else {
+        println!("oac-relay: key {key_id} not found");
+    }
     Ok(())
 }
