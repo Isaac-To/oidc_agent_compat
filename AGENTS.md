@@ -30,6 +30,13 @@ Cargo workspace, edition 2024, resolver 2. Four members:
 | `oac-central` | `crates/central` | Central proxy binary + lib |
 | `oac-e2e-tests` | `tests/e2e` | In-process end-to-end tests (spins up mock backend + central + relay) |
 
+**Documentation:** The project uses an [mdBook](https://rust-lang.github.io/mdBook/)
+documentation suite under `docs/`. The sidebar tree (navigation entry point)
+is `docs/src/SUMMARY.md`. To preview: `mdbook serve docs/ --open`. Three
+sections: User Guide, Developer Guide, Reference. Rust API type signatures
+are delegated to `cargo doc --workspace --open` (rustdoc), not hand-maintained
+in the mdBook.
+
 Key modules:
 - `crates/common/src/config.rs` — `RelayConfig` / `CentralConfig` TOML schemas + validation (relay rejects `0.0.0.0`).
 - `crates/common/src/error.rs` — unified `Error` enum + `Result` alias. Use this, not `anyhow`, in library code.
