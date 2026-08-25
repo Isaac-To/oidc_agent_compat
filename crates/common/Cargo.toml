@@ -36,3 +36,4 @@ rcgen = { workspace = true, optional = true }
 
 [features]
 test-certs = ["dep:rcgen"]
+test-utils = []

@@ -25,7 +25,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use oidc_agent_common::error::Error;
+use oidc_agent_common::http_util;
 
 use super::AppState;
 use crate::audit::AuditEntry;
@@ -140,7 +140,7 @@ pub async fn permissions_middleware(
             StatusCode::BAD_REQUEST
         })?;
 
-        let model = extract_model(&body_bytes);
+        let model = http_util::extract_model(&body_bytes);
 
         if let Some(ref model_name) = model {
             if !policy.is_model_allowed(model_name) {
@@ -253,17 +253,4 @@ async fn deny(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(response)
-}
-
-/// Extracts the `model` field from a JSON request body.
-fn extract_model(body: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    value.get("model")?.as_str().map(String::from)
-}
-
-// Unused import suppression — Error is used in deny's error mapping path
-// indirectly via tracing. Keep for future use.
-#[allow(dead_code)]
-fn _error_forbidden(msg: &str) -> Error {
-    Error::forbidden(msg)
 }

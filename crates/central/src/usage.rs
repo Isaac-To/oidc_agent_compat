@@ -194,18 +194,7 @@ mod tests {
     use super::*;
 
     async fn setup_test_db() -> UsageTracker {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let tmp = std::env::temp_dir().join(format!(
-            "oac-usage-test-{}-{counter}-{}.db",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
-        let url = format!("sqlite://{}?mode=rwc", tmp.display());
+        let url = oidc_agent_common::persistence::temp_sqlite_url("usage");
         let db = crate::db::setup(&url).await.expect("db setup");
         UsageTracker::new(db)
     }

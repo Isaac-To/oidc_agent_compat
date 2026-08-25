@@ -36,9 +36,19 @@ pub enum Error {
     #[error("database error: {0}")]
     Database(String),
 
+    /// A database error from sea-orm, preserving the source for error
+    /// chaining. Use [`Error::database`] to add a context prefix.
+    #[error("database error: {0}")]
+    Db(#[from] sea_orm::DbErr),
+
     /// An HTTP client or server error.
     #[error("http error: {0}")]
     Http(String),
+
+    /// An HTTP client error from reqwest, preserving the source for error
+    /// chaining. Use [`Error::http`] to add a context prefix.
+    #[error("http error: {0}")]
+    Reqwest(#[from] reqwest::Error),
 
     /// A cryptographic error (key generation, hashing, comparison).
     #[error("crypto error: {0}")]
@@ -110,6 +120,30 @@ impl Error {
     #[must_use]
     pub fn internal(msg: impl std::fmt::Display) -> Self {
         Self::Internal(msg.to_string())
+    }
+
+    /// Creates a [`Error::Database`] with a context prefix from any
+    /// [`Display`][std::fmt::Display] value.
+    ///
+    /// Prefer this over `Error::Database(format!("...: {e}"))` when you have a
+    /// concrete `sea_orm::DbErr` — use `?` or `.map_err(Error::from)` to get
+    /// [`Error::Db`] (which preserves the source), or this helper when you
+    /// need a descriptive prefix.
+    #[must_use]
+    pub fn database(msg: impl std::fmt::Display) -> Self {
+        Self::Database(msg.to_string())
+    }
+
+    /// Creates a [`Error::Http`] with a context prefix from any
+    /// [`Display`][std::fmt::Display] value.
+    ///
+    /// Prefer this over `Error::Http(format!("...: {e}"))` when you have a
+    /// concrete `reqwest::Error` — use `?` or `.map_err(Error::from)` to get
+    /// [`Error::Reqwest`] (which preserves the source), or this helper when
+    /// you need a descriptive prefix.
+    #[must_use]
+    pub fn http(msg: impl std::fmt::Display) -> Self {
+        Self::Http(msg.to_string())
     }
 }
 

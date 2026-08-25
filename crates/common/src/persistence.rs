@@ -54,10 +54,13 @@ fn normalize_sqlite_url(database_url: &str) -> String {
 }
 
 /// Extracts the filesystem path from a `sqlite://` URL, expanding `~` to
-/// the user's home directory. Returns `None` for non-sqlite URLs.
+/// the user's home directory. Returns `None` for non-sqlite URLs. Any query
+/// string (e.g. `?mode=rwc`) is stripped.
 #[must_use]
 pub fn sqlite_path(url: &str) -> Option<PathBuf> {
     let path = url.strip_prefix("sqlite://")?;
+    // Strip any query string (e.g. "?mode=rwc").
+    let path = path.split('?').next().unwrap_or(path);
     let expanded = shellexpand(path);
     Some(PathBuf::from(expanded))
 }
@@ -80,6 +83,31 @@ fn shellexpand(path: &str) -> String {
 /// Returns [`Error::Database`] if the permissions cannot be set.
 pub fn enforce_db_perms(path: &Path) -> Result<()> {
     enforce_db_perms_inner(path)
+}
+
+/// Generates a unique temporary SQLite database URL for tests.
+///
+/// Returns a `sqlite://<temp_dir>/oac-<prefix>-<pid>-<counter>-<nanos>.db?mode=rwc`
+/// URL. Each call returns a distinct path via a process-local atomic counter
+/// plus a nanosecond timestamp, so parallel tests never collide.
+///
+/// This is gated behind the `test-utils` feature so it is only compiled into
+/// test builds of dependent crates.
+#[cfg(feature = "test-utils")]
+#[must_use]
+pub fn temp_sqlite_url(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-{prefix}-test-{}-{counter}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    format!("sqlite://{}?mode=rwc", tmp.display())
 }
 
 #[cfg(unix)]
@@ -129,6 +157,12 @@ mod tests {
     #[test]
     fn sqlite_path_extracts_path() {
         let path = sqlite_path("sqlite:///tmp/test.db").unwrap();
+        assert_eq!(path, PathBuf::from("/tmp/test.db"));
+    }
+
+    #[test]
+    fn sqlite_path_strips_query_string() {
+        let path = sqlite_path("sqlite:///tmp/test.db?mode=rwc").unwrap();
         assert_eq!(path, PathBuf::from("/tmp/test.db"));
     }
 
