@@ -17,7 +17,8 @@ This book has three top-level sections. Pick the one that matches your role:
 | **[Reference](./reference/architecture.md)** | Everyone | System diagrams, threat model, request data flow, API docs pointer |
 
 **New here?** Start with the [Quickstart](./user-guide/quickstart.md) for a
-5-minute end-to-end walkthrough using the bundled dev stack.
+production deployment walkthrough, or try the bundled dev stack via
+[Docker: Dev Stack](./user-guide/docker-dev.md).
 
 ## Architecture at a glance
 
@@ -36,9 +37,8 @@ Agent → [127.0.0.1 relay] → mTLS → [central proxy] → [OpenAI-compatible 
 ## Status
 
 🚧 **Under development.** This documentation covers only implemented
-features. Items not yet built (Vault/AWS/GCP/Azure secret stores, rate
-limiting, refresh token handling) are intentionally omitted to avoid
-misleading readers.
+features. Items not yet built (Vault/AWS/GCP/Azure secret stores, refresh
+token handling) are intentionally omitted to avoid misleading readers.
 
 ## API type reference
 

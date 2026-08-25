@@ -10,8 +10,8 @@ requests to the OpenAI-compatible backend.
 
 ## Configuration
 
-The central proxy reads the `[central]` section of the config file. A
-minimal production config:
+The central proxy config uses flat top-level fields (no `[central]`
+wrapper). A minimal production config:
 
 ```toml
 listen_addr = "0.0.0.0:8443"

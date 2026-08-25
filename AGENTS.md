@@ -288,10 +288,11 @@ See `docker/README.md` for the full service table and quick start.
 
 ## Out of scope (TODOs — don't assume implemented)
 
-- Rate limiting on central proxy (rely on mTLS + network ACLs for v1).
 - Vault/AWS/GCP/Azure secret-store backends (only `kind = "file"` works).
 - Groups extraction from userinfo (not a standard OIDC claim).
 - Refresh token handling (v1 re-login on expiry; no token storage).
+- Token-quota enforcement (request-count quotas are enforced pre-flight;
+  token quotas are tracked in the usage counters but not yet blocked).
 
 ---
 
