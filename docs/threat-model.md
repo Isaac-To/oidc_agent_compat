@@ -107,7 +107,7 @@ Agent (Codex, etc.)
 |---|---|---|
 | **mTLS relay ↔ central** | High | ✅ **DONE** — Wired in merge 3e23986. Central serves over mTLS (`axum_server::bind_rustls`) in prod mode; relay builds `reqwest` client with mTLS. Dev mode uses plain HTTP. |
 | **Rate limiting on central** | Medium | No rate limiting; rely on mTLS + network ACLs for v1. |
-| **at_hash validation** | Low | OIDC Core §3.1.3.7 recommends; `openidconnect` crate exposes helper but check is manual. Deferred. |
+| **at_hash validation** | Low | ✅ **DONE** — Implemented in login.rs step 13c. Verifies the at_hash claim against the access token when the IdP includes it (OIDC Core §3.1.3.7 step 3). |
 | **Groups extraction** | Low | Not a standard OIDC claim; would need `AdditionalClaims`. Deferred. |
 | **Vault/AWS/GCP/Azure secret stores** | Medium | Only `file` backend implemented; production needs Vault or AWS SM. |
 | **Refresh token handling** | Low | v1 re-login on expiry (no token storage); RFC 9700 §4.14.2 rotation deferred. |
