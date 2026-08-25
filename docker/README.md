@@ -64,14 +64,27 @@ docker compose -f docker/docker-compose.yml run --rm goose session
 | `./docker/dev.sh shell` | Open a shell in the relay container |
 | `./docker/dev.sh goose` | Show Goose usage info |
 | `./docker/dev.sh goose-run "prompt"` | Run a headless Goose prompt |
-| `./docker/dev.sh test` | Send test requests through the full chain |
+| `./docker/dev.sh test` | Send test requests through the full chain (infra + full chain + SSE) |
 
 ## Goose Configuration
 
-`./docker/dev.sh goose` creates a custom provider at
-`~/.config/goose/custom_providers/local_relay.json` that points Goose at
-`http://127.0.0.1:8787/v1/chat/completions`. The API key is read from the
-`LOCAL_RELAY_API_KEY` environment variable.
+Goose runs headless in a container and connects to the relay over the
+Docker network at `http://relay:8787`. It uses the built-in `openai`
+provider with `GOOSE_MODEL=mock-gpt-4` and `OPENAI_API_KEY=oac_test_key_alice`
+(see the `goose` service in `docker/docker-compose.yml`).
+
+The dev API key `oac_test_key_alice` is **auto-minted** by the relay on
+startup when `dev_mode=true` (see `crates/relay/src/main.rs`), so Goose
+works out of the box without running the OIDC login flow. The same key
+works for manual `curl`:
+
+```sh
+curl -H 'Authorization: Bearer oac_test_key_alice' http://127.0.0.1:8787/v1/models
+```
+
+> Note: the central proxy serves **plain HTTP** on `:8443` in this dev
+> stack (mTLS between relay and central is not yet wired). The generated
+> certs in `docker/certs/` are unused until mTLS is implemented.
 
 ## Manual Operations
 
