@@ -675,3 +675,91 @@ async fn e2e_permissions_deny_disallowed_endpoint() {
         Some("endpoint_not_allowed")
     );
 }
+
+#[tokio::test]
+async fn e2e_device_revocation_blocks_request() {
+    // Register a device (using identity_id as the device identifier),
+    // revoke it, then verify subsequent requests are denied with 403.
+    let (addr, client, _, audit, key_store) = setup_full_system().await;
+
+    // Create an identity and key.
+    let ident = key_store
+        .upsert_identity(
+            "https://idp.example.com",
+            "e2e-user-device",
+            Some("e2e-device@example.com"),
+            None,
+            None,
+        )
+        .await
+        .expect("upsert");
+    let minted = key_store
+        .mint_key(&ident.id, "e2e-device-test")
+        .await
+        .expect("mint");
+    let key = minted.plaintext.to_string();
+
+    // Register the device using the identity_id as the device identifier.
+    let device_store = oac_central::device_store::DeviceStore::new(audit.db().clone());
+    device_store
+        .upsert_device(&ident.id, "e2e-user-device", Some("e2e-device@example.com"))
+        .await
+        .expect("upsert device");
+
+    // Verify the request works before revocation.
+    let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Revoke the device.
+    device_store.revoke(&ident.id).await.expect("revoke");
+
+    // Verify the request is now denied.
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "request from revoked device must be denied"
+    );
+
+    // Verify the denial was audited.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    use oac_central::entity::audit_log;
+    use sea_orm::EntityTrait;
+    let entries = audit_log::Entity::find()
+        .all(audit.db())
+        .await
+        .expect("load audit log");
+    let denied = entries
+        .iter()
+        .find(|e| e.denial_reason.as_deref() == Some("device_revoked"));
+    assert!(
+        denied.is_some(),
+        "audit log must contain a device_revoked denial entry"
+    );
+
+    // Reinstate the device and verify the request works again.
+    device_store.reinstate(&ident.id).await.expect("reinstate");
+
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {key}"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "request from reinstated device must succeed"
+    );
+}

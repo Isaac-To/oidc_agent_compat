@@ -99,10 +99,84 @@ The agent should use:
 - **Base URL:** `http://127.0.0.1:8787/v1`
 - **API key:** (auto-injected by `oac-relay login`)
 
+## Permissions & Admin API
+
+The central proxy enforces group-based authorization policies. Users are
+assigned to groups via the IdP (e.g. Keycloak groups/roles), and admins
+configure what each group can access via the admin API.
+
+### Prerequisites
+
+1. Add the `groups` scope to the relay's OIDC config so group memberships
+   are extracted at login:
+   ```toml
+   [relay.oidc]
+   scopes = ["openid", "email", "profile", "groups"]
+   ```
+
+2. Enable the admin API in the central config with the group that grants
+   admin access:
+   ```toml
+   [central.admin]
+   admin_group = "oac-admins"
+   ```
+
+### Managing policies
+
+Admins authenticate via the IdP through the relay (same OIDC login flow as
+regular users). Use the admin CLI with a local API key obtained via
+`oac-relay login`:
+
+```sh
+# Set a policy allowing the "engineering" group to use only gpt-4o:
+oac-central admin policy-set engineering \
+  --models gpt-4o,gpt-4o-mini \
+  --key $OAC_API_KEY
+
+# Restrict the "limited" group to chat completions only:
+oac-central admin policy-set limited \
+  --endpoints /v1/chat/completions \
+  --key $OAC_API_KEY
+
+# Set a daily request quota:
+oac-central admin policy-set engineering \
+  --request-quota 1000 \
+  --key $OAC_API_KEY
+
+# List all policies:
+oac-central admin policy-list --key $OAC_API_KEY
+
+# Delete a policy:
+oac-central admin policy-delete engineering --key $OAC_API_KEY
+```
+
+### Managing devices
+
+```sh
+# List registered devices:
+oac-central admin device-list --key $OAC_API_KEY
+
+# Revoke a device:
+oac-central admin device-revoke <fingerprint> --key $OAC_API_KEY
+
+# Reinstate a revoked device:
+oac-central admin device-reinstate <fingerprint> --key $OAC_API_KEY
+```
+
+### Querying the audit log
+
+```sh
+# Query recent activity:
+oac-central admin audit-query --limit 50 --key $OAC_API_KEY
+
+# Filter by user:
+oac-central admin audit-query --subject alice@example.com --key $OAC_API_KEY
+```
+
 ## Development
 
 ```sh
-# Run all tests (129 tests across all crates)
+# Run all tests
 cargo test
 
 # Lint

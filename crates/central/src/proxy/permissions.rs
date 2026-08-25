@@ -89,6 +89,33 @@ pub async fn permissions_middleware(
         }
     };
 
+    // Check device revocation. In production (mTLS), the device is identified
+    // by its client cert fingerprint. In dev mode, we use the identity_id as a
+    // proxy device identifier. If the device is revoked, deny with 403.
+    if let Some(device_id) = identity
+        .identity_id
+        .as_deref()
+        .or(Some(identity.subject.as_str()))
+    {
+        match state.device_store.is_revoked(device_id).await {
+            Ok(Some(true)) => {
+                return deny(
+                    &state,
+                    &identity,
+                    &endpoint,
+                    None,
+                    "device_revoked",
+                    StatusCode::FORBIDDEN,
+                )
+                .await;
+            }
+            Ok(Some(false)) | Ok(None) => {} // not revoked or not registered
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to check device revocation; allowing");
+            }
+        }
+    }
+
     // Check endpoint restriction.
     if !policy.is_endpoint_allowed(&endpoint) {
         return deny(
