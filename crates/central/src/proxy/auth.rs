@@ -20,6 +20,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
+use oidc_agent_common::identity;
 
 use super::AppState;
 
@@ -55,27 +56,27 @@ pub async fn auth_middleware(
 
     let headers = request.headers();
     let subject = headers
-        .get("x-oac-user-subject")
+        .get(identity::HEADER_USER_SUBJECT)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
     let email = headers
-        .get("x-oac-user-email")
+        .get(identity::HEADER_USER_EMAIL)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
     let identity_id = headers
-        .get("x-oac-identity-id")
+        .get(identity::HEADER_IDENTITY_ID)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
     let groups = headers
-        .get("x-oac-user-groups")
+        .get(identity::HEADER_USER_GROUPS)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
     let request_id = headers
-        .get("x-oac-request-id")
+        .get(identity::HEADER_REQUEST_ID)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 

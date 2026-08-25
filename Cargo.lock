@@ -1770,6 +1770,8 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pemfile",
+ "sea-orm",
+ "sea-orm-migration",
  "serde",
  "serde_json",
  "sha2",

@@ -1,10 +1,8 @@
 //! Database setup and migration runner for the relay.
 
-use std::path::Path;
-
-use oidc_agent_common::error::{Error, Result};
-use sea_orm::{ConnectOptions, DatabaseConnection};
-use sea_orm_migration::MigratorTrait;
+use oidc_agent_common::error::Result;
+use oidc_agent_common::persistence;
+use sea_orm::DatabaseConnection;
 
 use crate::migration::Migrator;
 
@@ -17,88 +15,24 @@ use crate::migration::Migrator;
 ///
 /// # Errors
 ///
-/// Returns [`Error::Database`] if the connection fails or migrations error.
+/// Returns [`oidc_agent_common::error::Error::Database`] if the connection
+/// fails or migrations error.
 pub async fn setup(database_url: &str) -> Result<DatabaseConnection> {
-    // For sqlite:// URLs, append ?mode=rwc so sqlx creates the file if it
-    // doesn't exist.
-    let url = if database_url.starts_with("sqlite://") && !database_url.contains('?') {
-        format!("{database_url}?mode=rwc")
-    } else {
-        database_url.to_string()
-    };
-    let options = ConnectOptions::new(url);
-    let db = sea_orm::Database::connect(options)
-        .await
-        .map_err(|e| Error::Database(format!("connect: {e}")))?;
-
-    Migrator::up(&db, None)
-        .await
-        .map_err(|e| Error::Database(format!("migrate: {e}")))?;
+    let db = persistence::setup_database::<Migrator>(database_url).await?;
 
     // On Unix, tighten the file permissions if this is a sqlite:// URL.
     #[cfg(unix)]
-    if let Some(path) = sqlite_path(database_url) {
-        enforce_db_perms(&path)?;
+    if let Some(path) = persistence::sqlite_path(database_url) {
+        persistence::enforce_db_perms(&path)?;
     }
 
     Ok(db)
-}
-
-/// Extracts the filesystem path from a `sqlite://` URL.
-fn sqlite_path(url: &str) -> Option<std::path::PathBuf> {
-    let path = url.strip_prefix("sqlite://")?;
-    let expanded = shellexpand(path);
-    Some(std::path::PathBuf::from(expanded))
-}
-
-/// Expands `~` in a path.
-fn shellexpand(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return format!("{}/{}", home.to_string_lossy(), rest);
-        }
-    }
-    path.to_string()
-}
-
-/// Enforces `0600` permissions on the database file.
-#[cfg(unix)]
-fn enforce_db_perms(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    if path.exists() {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| Error::Database(format!("chmod {}: {e}", path.display())))?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-#[allow(clippy::missing_docs_in_private_items)]
-fn enforce_db_perms(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sea_orm::ConnectionTrait;
-
-    #[test]
-    fn sqlite_path_extracts_path() {
-        let path = sqlite_path("sqlite:///tmp/test.db").unwrap();
-        assert_eq!(path, std::path::PathBuf::from("/tmp/test.db"));
-    }
-
-    #[test]
-    fn sqlite_path_returns_none_for_non_sqlite() {
-        assert!(sqlite_path("postgres://localhost/db").is_none());
-    }
-
-    #[test]
-    fn shellexpand_passes_through_absolute_paths() {
-        let result = shellexpand("/absolute/path");
-        assert_eq!(result, "/absolute/path");
-    }
 
     #[tokio::test]
     async fn setup_creates_and_migrates_temp_db() {
