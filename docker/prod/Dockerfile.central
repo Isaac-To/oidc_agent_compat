@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Production image for oac-central
+#
+# Slim, single-binary image. The central proxy holds the master backend key
+# in a secret store and serves mTLS on :8443. It is designed to run behind
+# (or as) a network ingress with mTLS-enforced relay clients.
+#
+# Build:
+#   docker build -f docker/prod/Dockerfile.central -t oac-central:latest .
+# (context is the repo root)
+#
+# Run:
+#   docker run -d \
+#     -p 8443:8443 \
+#     -v /etc/oac/central.toml:/config/central.toml:ro \
+#     -v /etc/oac/certs:/certs:ro \
+#     -e OAC_OIDC_CLIENT_SECRET=... \
+#     oac-central:latest
+#
+# The master key is NEVER baked into the image. Mount it via a secret:
+#   -v /run/secrets/master-key:/secrets/master-key:ro
+# ─────────────────────────────────────────────────────────────────────────
+
+FROM rust:1.98-slim AS builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY tests/ tests/
+# Build only the central binary to keep the layer small and the build fast.
+RUN cargo build --release -p oac-central
+
+# trixie-slim matches the rust:1.98-slim builder's glibc 2.41.
+# Do NOT switch to bookworm-slim (glibc 2.36) — the binary will fail to load.
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/oac-central /usr/local/bin/oac-central
+
+# Non-root user. The config and certs are mounted read-only.
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin oac
+USER oac
+
+EXPOSE 8443
+
+# Default config path; override with --config if needed.
+ENTRYPOINT ["oac-central", "--config", "/config/central.toml", "serve"]

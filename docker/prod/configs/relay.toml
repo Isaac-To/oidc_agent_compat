@@ -1,0 +1,28 @@
+# Relay config — PRODUCTION reference (laptop, native binary).
+#
+# The relay runs as a NATIVE binary on each employee's laptop, NOT in a
+# container and NOT in the central deployment. Install the binary via your
+# internal package registry (see docker/prod/README.md for the install flow).
+# Copy this file to ~/.oac/relay.toml and edit for your environment.
+#
+# The relay listens on 127.0.0.1 ONLY. The config validator rejects 0.0.0.0
+# unless dev_mode=true (which you should NOT set in production).
+
+listen_addr = "127.0.0.1:8787"
+database_url = "sqlite:///data/relay.db"
+dev_mode = false
+
+[oidc]
+issuer = "https://idp.example.com/realms/your-realm"
+client_id = "oac-relay"
+client_secret_env = "OAC_OIDC_CLIENT_SECRET"
+# Loopback redirect, any port (RFC 8252). The relay picks a free port at login.
+redirect_uri = "http://127.0.0.1:0/callback"
+scopes = ["openid", "email", "profile"]
+
+[central]
+# The company-hosted central proxy. mTLS is required in production.
+url = "https://central.example.com:8443"
+ca_cert_path = "/etc/oac/ca.crt"
+client_cert_path = "/etc/oac/client.crt"
+client_key_path = "/etc/oac/client.key"

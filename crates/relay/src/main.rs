@@ -100,7 +100,7 @@ async fn serve(config: RelayConfig) -> Result<()> {
 /// The well-known plaintext dev API key minted when `dev_mode` is enabled.
 ///
 /// This matches the `OPENAI_API_KEY` configured for the Goose service in
-/// `docker/docker-compose.yml`. It is intentionally a constant (not random)
+/// `docker/dev/docker-compose.yml`. It is intentionally a constant (not random)
 /// so the dev stack works out of the box without any login step.
 const DEV_KEY_PLAINTEXT: &str = "oac_test_key_alice";
 

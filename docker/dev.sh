@@ -16,7 +16,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
+COMPOSE_FILE="$SCRIPT_DIR/dev/docker-compose.yml"
 CERT_DIR="$SCRIPT_DIR/certs"
 
 # ─── Colors ──────────────────────────────────────────────────────────────
@@ -107,13 +107,13 @@ cmd_goose() {
     echo "  ./docker/dev.sh goose-run \"Summarize the files in /workspace\""
     echo ""
     echo "  # Open an interactive Goose session:"
-    echo "  docker compose -f docker/docker-compose.yml run --rm goose session"
+    echo "  docker compose -f docker/dev/docker-compose.yml run --rm goose session"
     echo ""
     echo "  # Goose is configured to use the relay at http://relay:8787"
     echo "  # with the test key 'oac_test_key_alice' and model 'mock-gpt-4'."
     echo ""
     echo "  # To use a different key, edit the OPENAI_API_KEY env var in"
-    echo "  # docker/docker-compose.yml under the 'goose' service."
+    echo "  # docker/dev/docker-compose.yml under the 'goose' service."
 }
 
 cmd_goose_run() {
