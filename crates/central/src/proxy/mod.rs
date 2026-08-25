@@ -14,6 +14,7 @@
 //! - **Raw byte SSE passthrough** for streaming responses.
 //! - **Audit logging**: every request is recorded.
 
+pub mod auth;
 pub mod forward;
 
 use std::sync::Arc;
@@ -43,6 +44,12 @@ pub struct AppState {
 pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
 /// Builds the Axum router for the central proxy.
+///
+/// # Security
+///
+/// The router applies the auth middleware (validating relay-forwarded
+/// identity headers) before the proxy handler. Body size limits are applied
+/// globally.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
@@ -56,6 +63,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/embeddings",
             axum::routing::post(forward::proxy_handler),
         )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .with_state(state)
 }

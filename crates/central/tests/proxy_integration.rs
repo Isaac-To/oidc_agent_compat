@@ -84,6 +84,7 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
             kind: oidc_agent_common::config::SecretStoreKind::Vault,
             path: "test".into(),
         },
+        dev_mode: true,
     };
 
     let master_key = Zeroizing::new("sk-test-master-key-12345".into());
@@ -158,5 +159,145 @@ async fn master_key_not_in_response_body() {
     assert!(
         !resp_text.contains("sk-test-master-key-12345"),
         "master key must never appear in response body"
+    );
+}
+
+// ─── Auth middleware tests (non-dev-mode) ──────────────────────────────────
+
+/// Sets up a central proxy in **production mode** (`dev_mode = false`) so the
+/// auth middleware enforces the `X-OAC-User-Subject` header.
+async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    let mock_backend = Router::new().route(
+        "/v1/models",
+        axum::routing::get(|| async { r#"{"data": [{"id": "gpt-4"}]}"# }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async {
+        let _ = axum::serve(mock_listener, mock_backend).await;
+    });
+
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-central-prod-{}-{counter}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let url = format!("sqlite://{}?mode=rwc", tmp.display());
+    let db = oac_central::db::setup(&url).await.expect("db setup");
+    let audit = AuditLogger::new(db);
+
+    let config = oidc_agent_common::config::CentralConfig {
+        listen_addr: "127.0.0.1:0".parse().expect("addr"),
+        database_url: "sqlite://test.db".into(),
+        oidc: oidc_agent_common::config::OidcConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "test".into(),
+            client_secret_env: "TEST".into(),
+            redirect_uri: "http://127.0.0.1:0/callback".into(),
+            scopes: vec!["openid".into()],
+        },
+        backend: oidc_agent_common::config::BackendConfig {
+            name: "mock".into(),
+            base_url: format!("http://{}", mock_addr),
+        },
+        mtls: oidc_agent_common::config::MtlsServerConfig {
+            ca_cert_path: "/ca.pem".into(),
+            server_cert_path: "/server.pem".into(),
+            server_key_path: "/server.key".into(),
+        },
+        secret_store: oidc_agent_common::config::SecretStoreConfig {
+            kind: oidc_agent_common::config::SecretStoreKind::Vault,
+            path: "test".into(),
+        },
+        dev_mode: false,
+    };
+
+    let master_key = Zeroizing::new("sk-test-master-key-12345".into());
+    let client = proxy::forward::build_client().expect("client");
+    let state = proxy::AppState {
+        config: config.clone(),
+        master_key: std::sync::Arc::new(master_key),
+        client,
+        audit: audit.clone(),
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind central");
+    let addr = listener.local_addr().expect("central addr");
+    tokio::spawn(async {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (addr, reqwest::Client::new())
+}
+
+#[tokio::test]
+async fn prod_mode_rejects_request_without_identity_headers() {
+    let (addr, client) = setup_prod_central().await;
+    let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
+    // No X-OAC-User-Subject header → must be rejected.
+    let resp = client.get(&url).send().await.expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "prod-mode central must reject requests without X-OAC-User-Subject"
+    );
+}
+
+#[tokio::test]
+async fn prod_mode_accepts_request_with_identity_headers() {
+    let (addr, client) = setup_prod_central().await;
+    let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
+    let resp = client
+        .get(&url)
+        .header("X-OAC-User-Subject", "user-123")
+        .header("X-OAC-User-Email", "user@example.com")
+        .header("X-OAC-Identity-Id", "id-456")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "prod-mode central must accept requests with valid identity headers"
+    );
+}
+
+#[tokio::test]
+async fn prod_mode_healthz_bypasses_auth() {
+    let (addr, client) = setup_prod_central().await;
+    let url = format!("http://127.0.0.1:{}/healthz", addr.port());
+    let resp = client.get(&url).send().await.expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "healthz must bypass auth even in prod mode"
+    );
+}
+
+#[tokio::test]
+async fn prod_mode_rejects_empty_subject() {
+    let (addr, client) = setup_prod_central().await;
+    let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
+    let resp = client
+        .get(&url)
+        .header("X-OAC-User-Subject", "")
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "empty X-OAC-User-Subject must be rejected"
     );
 }

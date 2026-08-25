@@ -18,6 +18,7 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
+sea-orm = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

@@ -70,6 +70,11 @@ pub struct CentralConfig {
     pub mtls: MtlsServerConfig,
     /// Secret-manager settings for the master key.
     pub secret_store: SecretStoreConfig,
+    /// When true, allows requests without relay-forwarded identity headers
+    /// (for the containerized dev stack). Defaults to false for production
+    /// safety.
+    #[serde(default)]
+    pub dev_mode: bool,
 }
 
 /// OIDC relying-party configuration shared by both components.
