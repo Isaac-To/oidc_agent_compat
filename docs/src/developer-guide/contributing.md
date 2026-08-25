@@ -1,0 +1,91 @@
+# Contributing
+
+## Commit conventions
+
+- **Make regular commits** during coding tasks — don't wait until the end
+  to commit everything at once.
+- **Commit messages must include a description (body)**, not just a
+  subject line. The body should explain what changed and why.
+
+Example:
+
+```
+docs: add mdBook scaffolding and User Guide
+
+Set up mdBook-based documentation suite with tree-based expandable
+sidebar navigation. This commit adds:
+
+- docs/book.toml: mdBook configuration
+- docs/src/SUMMARY.md: sidebar tree (navigation entry point)
+- docs/src/user-guide/: 12 pages covering overview, quickstart, ...
+
+Content is sourced from exhaustive codebase exploration and covers
+only implemented features (TODOs excluded to avoid misleading users).
+```
+
+## Branch flow
+
+- Create a feature branch from `main` (e.g. `docs/mdbook-suite`).
+- Keep branches focused — one logical change per branch.
+- Squash-merge or rebase-merge into `main`.
+
+## PR checklist
+
+Before requesting review, ensure all of the following pass:
+
+- [ ] `cargo test --workspace` — all tests pass.
+- [ ] `cargo clippy --workspace --all-targets` — no warnings.
+- [ ] `cargo fmt --all --check` — formatting is clean.
+- [ ] `cargo build --release` — release build succeeds.
+- [ ] No secrets in the diff (no API keys, passwords, tokens).
+- [ ] No `unsafe` code added.
+- [ ] No `unwrap()` / `expect()` / `panic!()` in library code (use `?`,
+  `get()`, explicit error variants).
+- [ ] Public items have doc comments (`///`).
+- [ ] `mdbook build docs/` — no warnings (if docs changed).
+- [ ] `./docker/dev.sh test` — full chain passes (if Docker available).
+
+## Code style
+
+- Follow the workspace clippy lints (see
+  [Conventions](./conventions.md)).
+- Use `oidc_agent_common::error::Result` in library code, not `anyhow`.
+- Use `get()` / `get_mut()` instead of indexing.
+- Document all public items.
+- Never log raw secrets — the redaction layer is a safety net, not a
+  license to log secrets.
+- Enforce `0600` on security-sensitive files.
+
+## Documentation
+
+If you change user-facing behavior (CLI, config, endpoints), update the
+relevant docs:
+
+- CLI changes → `docs/src/user-guide/cli-reference.md`
+- Config changes → `docs/src/user-guide/configuration.md`
+- Admin API changes → `docs/src/user-guide/admin-api.md`
+- Architecture changes → `docs/src/developer-guide/README.md` and
+  `docs/src/reference/architecture.md`
+
+Build and preview the docs:
+
+```sh
+mdbook serve docs/ --open
+```
+
+Generate Rust API docs:
+
+```sh
+cargo doc --workspace --open
+```
+
+## Known caveats (do not "fix" without asking)
+
+- `cargo audit` flags 2 pre-existing transitive advisories (`rsa 0.9.10`,
+  `rustls-pemfile 2.2.0`) — not our code, no fix available.
+- `cargo deny check` is broken on master: `deny.toml` line 32
+  `allow-build-scripts = true` is incompatible with cargo-deny 0.20.2
+  (expects an array). Fix would be `allow-build-scripts = []`. Do not
+  loosen policy without explicit user approval.
+- Dockerfile runtime base must be `debian:trixie-slim` (not
+  `bookworm-slim`) to match the `rust:1.98-slim` builder's glibc 2.41.
