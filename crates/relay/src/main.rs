@@ -39,7 +39,7 @@ enum Command {
     Serve,
     /// Authenticate via OIDC and configure the agent.
     Login,
-    /// Revoke local keys and clear agent config.
+    /// Revoke all local API keys (does not delete the agent config file).
     Logout,
     /// Re-display the local API key from the agent config file.
     PrintKey,
