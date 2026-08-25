@@ -175,6 +175,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migration0002AuditEnrichment),
             Box::new(Migration0003GroupPolicies),
             Box::new(Migration0004UsageCounters),
+            Box::new(Migration0005Providers),
         ]
     }
 }
@@ -460,6 +461,220 @@ impl MigrationTrait for Migration0004UsageCounters {
             .drop_table(Table::drop().table(UsageCounter::Table).to_owned())
             .await
     }
+}
+
+/// Migration 0005: create the `providers`, `provider_keys`, and
+/// `provider_key_access` tables for runtime-managed multi-provider support.
+///
+/// Providers are OpenAI-compatible backends managed via the admin API
+/// (not config). Each provider declares the models it serves so central
+/// can route by model name. Provider API keys are encrypted at rest with
+/// AES-256-GCM; only ciphertext and nonce are stored. Group-based access
+/// control on individual keys is enforced via `provider_key_access`.
+pub struct Migration0005Providers;
+
+impl MigrationName for Migration0005Providers {
+    fn name(&self) -> &str {
+        "m000005_providers"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0005Providers {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(Provider::Table)
+                    .col(
+                        ColumnDef::new(Provider::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Provider::Name).string().not_null())
+                    .col(ColumnDef::new(Provider::BaseUrl).string().not_null())
+                    .col(
+                        ColumnDef::new(Provider::Enabled)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(Provider::IsDefault)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(ColumnDef::new(Provider::Models).string().null())
+                    .col(
+                        ColumnDef::new(Provider::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Provider::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ProviderKey::Table)
+                    .col(
+                        ColumnDef::new(ProviderKey::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(ProviderKey::ProviderId).string().not_null())
+                    .col(ColumnDef::new(ProviderKey::Label).string().not_null())
+                    .col(
+                        ColumnDef::new(ProviderKey::Priority)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(ColumnDef::new(ProviderKey::Ciphertext).blob().not_null())
+                    .col(ColumnDef::new(ProviderKey::Nonce).blob().not_null())
+                    .col(ColumnDef::new(ProviderKey::KeyDigest).string().not_null())
+                    .col(
+                        ColumnDef::new(ProviderKey::Enabled)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderKey::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderKey::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_provider_keys_provider")
+                            .from(ProviderKey::Table, ProviderKey::ProviderId)
+                            .to(Provider::Table, Provider::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(ProviderKeyAccess::Table)
+                    .col(
+                        ColumnDef::new(ProviderKeyAccess::ProviderKeyId)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(ProviderKeyAccess::GroupName)
+                            .string()
+                            .not_null(),
+                    )
+                    .primary_key(
+                        Index::create()
+                            .col(ProviderKeyAccess::ProviderKeyId)
+                            .col(ProviderKeyAccess::GroupName),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_provider_key_access_key")
+                            .from(ProviderKeyAccess::Table, ProviderKeyAccess::ProviderKeyId)
+                            .to(ProviderKey::Table, ProviderKey::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(ProviderKeyAccess::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(ProviderKey::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(Provider::Table).to_owned())
+            .await
+    }
+}
+
+/// Iden for the `providers` table.
+#[derive(Iden)]
+pub enum Provider {
+    /// The table.
+    #[iden = "providers"]
+    Table,
+    /// Primary key.
+    Id,
+    /// Human-readable name.
+    Name,
+    /// Base URL of the backend.
+    BaseUrl,
+    /// Whether the provider is enabled.
+    Enabled,
+    /// Whether this is the default provider.
+    IsDefault,
+    /// JSON array of model patterns (NULL = all models).
+    Models,
+    /// Creation timestamp.
+    CreatedAt,
+    /// Last-update timestamp.
+    UpdatedAt,
+}
+
+/// Iden for the `provider_keys` table.
+#[derive(Iden)]
+pub enum ProviderKey {
+    /// The table.
+    #[iden = "provider_keys"]
+    Table,
+    /// Primary key (UUID).
+    Id,
+    /// The provider this key belongs to.
+    ProviderId,
+    /// Human-readable label.
+    Label,
+    /// Priority for selection (lower = higher priority).
+    Priority,
+    /// AES-256-GCM ciphertext.
+    Ciphertext,
+    /// 12-byte GCM nonce.
+    Nonce,
+    /// SHA-256 digest of plaintext (hex).
+    KeyDigest,
+    /// Whether the key is enabled.
+    Enabled,
+    /// Creation timestamp.
+    CreatedAt,
+    /// Last-update timestamp.
+    UpdatedAt,
+}
+
+/// Iden for the `provider_key_access` table.
+#[derive(Iden)]
+pub enum ProviderKeyAccess {
+    /// The table.
+    #[iden = "provider_key_access"]
+    Table,
+    /// The provider key ID.
+    ProviderKeyId,
+    /// The group name.
+    GroupName,
 }
 
 /// Iden for the `usage_counters` table.
