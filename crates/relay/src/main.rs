@@ -106,13 +106,7 @@ const DEV_KEY_PLAINTEXT: &str = "oac_test_key_alice";
 async fn seed_dev_key(key_store: &KeyStore) -> Result<()> {
     // Upsert a dev identity (issuer "dev", subject "dev-user").
     let identity = key_store
-        .upsert_identity(
-            "dev",
-            "dev-user",
-            None,
-            Some("Dev User"),
-            None,
-        )
+        .upsert_identity("dev", "dev-user", None, Some("Dev User"), None)
         .await?;
 
     // Only mint if the dev key is not already present (idempotent across
