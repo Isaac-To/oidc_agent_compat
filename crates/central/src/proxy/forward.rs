@@ -90,6 +90,16 @@ pub async fn proxy_handler(
 
     match forward_request(&state, request).await {
         Ok((resp, model, status, stream, token_usage)) => {
+            // Compute cost from the pricing table (async — uses RwLock read).
+            let cost_usd = state
+                .price_table
+                .compute_cost(
+                    model.as_deref().unwrap_or(""),
+                    token_usage.prompt,
+                    token_usage.completion,
+                )
+                .await;
+
             // Record audit entry.
             let latency_ms = start.elapsed().as_millis() as i64;
             let entry = AuditEntry {
@@ -116,11 +126,25 @@ pub async fn proxy_handler(
                 request_id: identity.as_ref().and_then(|i| i.request_id.clone()),
                 permission_decision: permission_decision.as_ref().map(|d| d.decision.clone()),
                 denial_reason: permission_decision.as_ref().and_then(|d| d.reason.clone()),
-                cost_usd: None,
+                cost_usd: Some(cost_usd),
             };
             if let Err(e) = state.audit.record(&entry).await {
                 tracing::error!(error = %e, "failed to write audit log");
             }
+
+            // Increment usage counters (best-effort). Only count successful
+            // requests that were allowed by the permissions middleware.
+            if let Some(ident) = &identity {
+                let total_tokens = i64::from(token_usage.total.unwrap_or(0));
+                if let Err(e) = state
+                    .usage_tracker
+                    .increment(&ident.subject, None, 1, total_tokens, cost_usd)
+                    .await
+                {
+                    tracing::warn!(error = %e, "failed to increment usage counters");
+                }
+            }
+
             resp
         }
         Err(e) => {

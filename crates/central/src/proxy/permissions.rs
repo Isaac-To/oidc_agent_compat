@@ -160,6 +160,30 @@ pub async fn permissions_middleware(
         request = Request::from_parts(parts, Body::from(body_bytes));
     }
 
+    // Check request-count quota (pre-flight). Token quotas are enforced
+    // post-hoc since streaming usage is only known after completion.
+    if let Some(daily_request_quota) = policy.daily_request_quota {
+        match state.usage_tracker.get_usage(&identity.subject).await {
+            Ok(Some(usage)) => {
+                if usage.request_count >= daily_request_quota {
+                    return deny(
+                        &state,
+                        &identity,
+                        &endpoint,
+                        None,
+                        "quota_exceeded",
+                        StatusCode::TOO_MANY_REQUESTS,
+                    )
+                    .await;
+                }
+            }
+            Ok(None) => {} // no usage yet
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to check usage; allowing");
+            }
+        }
+    }
+
     // All checks passed — insert the permission decision for the forward
     // handler to log.
     request.extensions_mut().insert(PermissionDecision {

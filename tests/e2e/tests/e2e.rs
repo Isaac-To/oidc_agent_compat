@@ -109,6 +109,7 @@ async fn setup_full_system() -> (
             path: "test".into(),
         },
         admin: None,
+        pricing: None,
         dev_mode: true,
     };
 
@@ -122,6 +123,8 @@ async fn setup_full_system() -> (
         rate_limiter: None,
         policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
         device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
+        usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
+        price_table: oac_central::pricing::PriceTable::empty(),
     };
     let central_app = central_proxy::router(central_state);
     let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")

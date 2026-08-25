@@ -30,6 +30,8 @@ use zeroize::Zeroizing;
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
 use crate::policy::PolicyStore;
+use crate::pricing::PriceTable;
+use crate::usage::UsageTracker;
 
 /// The shared application state for the central proxy.
 #[derive(Clone)]
@@ -48,6 +50,10 @@ pub struct AppState {
     pub policy_store: PolicyStore,
     /// The device store.
     pub device_store: DeviceStore,
+    /// The usage tracker (for quota enforcement and reporting).
+    pub usage_tracker: UsageTracker,
+    /// The pricing table (for cost tracking; empty if no pricing configured).
+    pub price_table: PriceTable,
 }
 
 impl AppState {
@@ -139,6 +145,37 @@ pub async fn serve(
     };
     let policy_store = PolicyStore::new(audit.db().clone());
     let device_store = DeviceStore::new(audit.db().clone());
+    let usage_tracker = UsageTracker::new(audit.db().clone());
+    let price_table = config
+        .pricing
+        .as_ref()
+        .map(PriceTable::from_config)
+        .unwrap_or_else(PriceTable::empty);
+
+    // Auto-fetch prices from the backend at startup (best-effort). Manual
+    // config overrides take precedence over fetched prices.
+    if let Err(e) = price_table
+        .fetch_from_backend(&client, &config.backend.base_url)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to fetch initial model prices from backend");
+    }
+    // Spawn a background task to refresh fetched prices periodically.
+    // The interval is configurable via [central.pricing] fetch_interval_secs
+    // (default 3600s = 1 hour; 0 disables auto-fetch).
+    let fetch_interval = config
+        .pricing
+        .as_ref()
+        .map(|p| p.fetch_interval_secs)
+        .unwrap_or(3600);
+    if fetch_interval > 0 {
+        price_table.spawn_refresh_task(
+            client.clone(),
+            config.backend.base_url.clone(),
+            std::time::Duration::from_secs(fetch_interval),
+        );
+    }
+
     let state = AppState {
         config: config.clone(),
         master_key: Arc::new(master_key),
@@ -147,6 +184,8 @@ pub async fn serve(
         rate_limiter,
         policy_store,
         device_store,
+        usage_tracker,
+        price_table,
     };
     let app = router(state);
 

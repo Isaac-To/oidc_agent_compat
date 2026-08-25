@@ -174,6 +174,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migration),
             Box::new(Migration0002AuditEnrichment),
             Box::new(Migration0003GroupPolicies),
+            Box::new(Migration0004UsageCounters),
         ]
     }
 }
@@ -387,4 +388,100 @@ pub enum AdminAuditLog {
     Payload,
     /// Creation timestamp.
     CreatedAt,
+}
+
+/// Migration 0004: create the `usage_counters` table for quota tracking.
+///
+/// Each row tracks a user's cumulative usage (request count, token count,
+/// cost) for a given period (daily or monthly). Updated incrementally per
+/// request via UPSERT.
+pub struct Migration0004UsageCounters;
+
+impl MigrationName for Migration0004UsageCounters {
+    fn name(&self) -> &str {
+        "m000004_usage_counters"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0004UsageCounters {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(UsageCounter::Table)
+                    .col(
+                        ColumnDef::new(UsageCounter::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(UsageCounter::UserSubject)
+                            .string()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(UsageCounter::GroupName).string().null())
+                    .col(ColumnDef::new(UsageCounter::PeriodDate).date().not_null())
+                    .col(ColumnDef::new(UsageCounter::PeriodKind).string().not_null())
+                    .col(
+                        ColumnDef::new(UsageCounter::RequestCount)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(UsageCounter::TokenCount)
+                            .big_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(UsageCounter::CostUsd)
+                            .float()
+                            .not_null()
+                            .default(0.0),
+                    )
+                    .index(
+                        Index::create()
+                            .name("idx_usage_counters_unique")
+                            .col(UsageCounter::UserSubject)
+                            .col(UsageCounter::PeriodDate)
+                            .col(UsageCounter::PeriodKind)
+                            .unique(),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(UsageCounter::Table).to_owned())
+            .await
+    }
+}
+
+/// Iden for the `usage_counters` table.
+#[derive(Iden)]
+pub enum UsageCounter {
+    /// The table.
+    #[iden = "usage_counters"]
+    Table,
+    /// Primary key (UUID).
+    Id,
+    /// The user subject.
+    UserSubject,
+    /// The group name (optional, for group-level reporting).
+    GroupName,
+    /// The period date (e.g. 2026-08-25 for daily).
+    PeriodDate,
+    /// The period kind: `daily` or `monthly`.
+    PeriodKind,
+    /// Cumulative request count for the period.
+    RequestCount,
+    /// Cumulative token count for the period.
+    TokenCount,
+    /// Cumulative cost in USD for the period.
+    CostUsd,
 }
