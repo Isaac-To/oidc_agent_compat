@@ -13,6 +13,7 @@
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
+pub mod admin;
 pub mod audit;
 pub mod db;
 pub mod device_store;

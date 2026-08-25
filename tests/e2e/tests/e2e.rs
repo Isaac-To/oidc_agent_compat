@@ -108,6 +108,7 @@ async fn setup_full_system() -> (
             kind: oidc_agent_common::config::SecretStoreKind::Vault,
             path: "test".into(),
         },
+        admin: None,
         dev_mode: true,
     };
 
@@ -120,6 +121,7 @@ async fn setup_full_system() -> (
         audit: audit.clone(),
         rate_limiter: None,
         policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
+        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
     };
     let central_app = central_proxy::router(central_state);
     let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")

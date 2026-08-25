@@ -28,6 +28,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use zeroize::Zeroizing;
 
 use crate::audit::AuditLogger;
+use crate::device_store::DeviceStore;
 use crate::policy::PolicyStore;
 
 /// The shared application state for the central proxy.
@@ -45,6 +46,25 @@ pub struct AppState {
     pub rate_limiter: Option<rate_limit::RateLimiter>,
     /// The group policy store.
     pub policy_store: PolicyStore,
+    /// The device store.
+    pub device_store: DeviceStore,
+}
+
+impl AppState {
+    /// Resolves the admin token from the config, if the admin API is
+    /// enabled. Returns `None` if the admin config is absent or the env
+    /// var is not set (in which case the admin API is disabled).
+    #[must_use]
+    pub fn admin_token(&self) -> Option<String> {
+        let admin_config = self.config.admin.as_ref()?;
+        match crate::admin::resolve_admin_token(admin_config) {
+            Ok(token) => Some(token),
+            Err(e) => {
+                tracing::warn!(error = %e, "admin API disabled: admin token not resolvable");
+                None
+            }
+        }
+    }
 }
 
 /// The maximum request body size (10 MB).
@@ -58,7 +78,7 @@ pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 /// identity headers) before the proxy handler. Body size limits are applied
 /// globally.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let mut proxy_router = Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
         .route(
             "/v1/chat/completions",
@@ -83,7 +103,20 @@ pub fn router(state: AppState) -> Router {
             auth::auth_middleware,
         ))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Merge the admin API router if an admin config is present.
+    if let Some(admin_token) = state.admin_token() {
+        let admin_state = crate::admin::AdminState {
+            policy_store: state.policy_store.clone(),
+            device_store: state.device_store.clone(),
+            audit: state.audit.clone(),
+            admin_token,
+        };
+        proxy_router = proxy_router.merge(crate::admin::router(admin_state));
+    }
+
+    proxy_router
 }
 
 /// Starts the central proxy server.
@@ -113,6 +146,7 @@ pub async fn serve(
         ))
     };
     let policy_store = PolicyStore::new(audit.db().clone());
+    let device_store = DeviceStore::new(audit.db().clone());
     let state = AppState {
         config: config.clone(),
         master_key: Arc::new(master_key),
@@ -120,6 +154,7 @@ pub async fn serve(
         audit,
         rate_limiter,
         policy_store,
+        device_store,
     };
     let app = router(state);
 

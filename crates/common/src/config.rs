@@ -70,11 +70,25 @@ pub struct CentralConfig {
     pub mtls: MtlsServerConfig,
     /// Secret-manager settings for the master key.
     pub secret_store: SecretStoreConfig,
+    /// Admin API settings. Optional; if absent, the admin API is disabled.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
     /// When true, allows requests without relay-forwarded identity headers
     /// (for the containerized dev stack). Defaults to false for production
     /// safety.
     #[serde(default)]
     pub dev_mode: bool,
+}
+
+/// Admin API configuration.
+///
+/// The admin API is protected by mTLS (in production) plus a static admin
+/// token referenced by environment variable name (the token itself is never
+/// in the config file).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdminConfig {
+    /// The name of the environment variable holding the admin token.
+    pub admin_token_env: String,
 }
 
 /// OIDC relying-party configuration shared by both components.
