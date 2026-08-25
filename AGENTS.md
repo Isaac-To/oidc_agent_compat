@@ -90,7 +90,7 @@ Minimum Rust 1.85; edition 2024.
 editing, follow RFC 8252 (loopback redirect, any port), RFC 7636/9700 (PKCE
 S256 mandatory), OIDC Core §3.1.3.7 (ID-token validation). The ID-token alg
 is pinned to {RS256, ES256}; `none` is disallowed. `state`/`nonce` are
-verified; `at_hash` validation is a known TODO (deferred). See
+verified; `at_hash` validation is implemented (step 13c). See
 `/memories/repo/oidc-security-research.md` for the full RFC citation list.
 
 Manual verification: run `oac-relay login` on the **host** against dev
@@ -127,7 +127,6 @@ See `docker/README.md` for the full service table and quick start.
 
 - Rate limiting on central proxy (rely on mTLS + network ACLs for v1).
 - Vault/AWS/GCP/Azure secret-store backends (only `kind = "file"` works).
-- `at_hash` validation.
 - Groups extraction from userinfo (not a standard OIDC claim).
 - Refresh token handling (v1 re-login on expiry; no token storage).
 

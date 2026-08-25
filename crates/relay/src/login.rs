@@ -228,6 +228,28 @@ pub async fn run_login(config: &RelayConfig, key_store: &KeyStore) -> Result<Log
         .claims(&client.id_token_verifier(), &nonce)
         .map_err(|e| Error::oidc(format!("ID token validation failed: {e}")))?;
 
+    // 13c. Verify the at_hash claim (OIDC Core §3.1.3.7 step 3).
+    // If the IdP includes an at_hash in the ID token, we verify it against
+    // the access token to prevent token substitution attacks.
+    if let Some(expected_at_hash) = id_token_claims.access_token_hash() {
+        let id_token_verifier = client.id_token_verifier();
+        let signing_key = id_token
+            .signing_key(&id_token_verifier)
+            .map_err(|e| Error::oidc(format!("ID token signing key lookup failed: {e}")))?;
+        let actual_at_hash = openidconnect::AccessTokenHash::from_token(
+            token_response.access_token(),
+            signing_alg,
+            signing_key,
+        )
+        .map_err(|e| Error::oidc(format!("at_hash computation failed: {e}")))?;
+        if actual_at_hash != *expected_at_hash {
+            return Err(Error::oidc(
+                "at_hash mismatch — access token may have been substituted",
+            ));
+        }
+        tracing::debug!("at_hash verified successfully");
+    }
+
     // 14. Fetch userinfo (email, name, groups); fall back to ID-token claims.
     let expected_subject = SubjectIdentifier::new(id_token_claims.subject().to_string());
     let (subject, email, display_name, groups) = match client.user_info(
