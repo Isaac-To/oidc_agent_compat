@@ -59,18 +59,21 @@ pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/admin/v1/group-policies", get(list_policies))
         .route(
-            "/admin/v1/group-policies/:name",
+            "/admin/v1/group-policies/{name}",
             get(get_policy).put(upsert_policy).delete(delete_policy),
         )
         .route("/admin/v1/devices", get(list_devices))
-        .route("/admin/v1/devices/:fingerprint/revoke", post(revoke_device))
         .route(
-            "/admin/v1/devices/:fingerprint/reinstate",
+            "/admin/v1/devices/{fingerprint}/revoke",
+            post(revoke_device),
+        )
+        .route(
+            "/admin/v1/devices/{fingerprint}/reinstate",
             post(reinstate_device),
         )
         .route("/admin/v1/audit", get(query_audit))
         .route("/admin/v1/usage", get(query_usage))
-        .route("/admin/v1/quotas/:subject", get(get_quota))
+        .route("/admin/v1/quotas/{subject}", get(get_quota))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
