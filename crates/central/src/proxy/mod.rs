@@ -92,11 +92,11 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            rate_limit::rate_limit_middleware,
+            permissions::permissions_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            permissions::permissions_middleware,
+            rate_limit::rate_limit_middleware,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

@@ -109,6 +109,85 @@ impl UsageTracker {
         Ok(())
     }
 
+    /// Atomically reserves one request against a daily request quota.
+    ///
+    /// This closes the check-then-forward race in the permissions middleware:
+    /// concurrent requests cannot all observe the same remaining capacity.
+    /// The reservation is converted into the normal usage row when the
+    /// request completes; callers must call [`Self::release_request`] when a
+    /// request cannot be forwarded at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on insert/update failure.
+    pub async fn try_reserve_request(
+        &self,
+        user_subject: &str,
+        group_name: Option<&str>,
+        daily_request_quota: i64,
+    ) -> Result<bool> {
+        if daily_request_quota <= 0 {
+            return Ok(false);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let period_date = today_date();
+        let group_val = group_name
+            .map(|g| Value::String(Some(Box::new(g.to_string()))))
+            .unwrap_or(Value::String(None));
+        let sql = "INSERT INTO usage_counters \
+             (id, user_subject, group_name, period_date, period_kind, \
+             request_count, token_count, cost_usd) \
+             VALUES ($1, $2, $3, $4, $5, 1, 0, 0) \
+             ON CONFLICT(user_subject, period_date, period_kind) DO UPDATE SET \
+             group_name = $3, \
+             request_count = request_count + 1 \
+             WHERE request_count < $6";
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                vec![
+                    id.into(),
+                    user_subject.to_string().into(),
+                    group_val,
+                    period_date.into(),
+                    PERIOD_DAILY.into(),
+                    Value::BigInt(Some(daily_request_quota)),
+                ],
+            ))
+            .await
+            .map_err(|e| Error::Database(format!("reserve usage request: {e}")))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Releases a request reservation when forwarding fails before a normal
+    /// usage outcome can be recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on update failure.
+    pub async fn release_request(&self, user_subject: &str) -> Result<()> {
+        let period_date = today_date();
+        let sql = "UPDATE usage_counters SET request_count = request_count - 1 \
+             WHERE user_subject = $1 AND period_date = $2 AND period_kind = $3 \
+             AND request_count > 0";
+        self.db
+            .execute(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                vec![
+                    user_subject.to_string().into(),
+                    period_date.into(),
+                    PERIOD_DAILY.into(),
+                ],
+            ))
+            .await
+            .map_err(|e| Error::Database(format!("release usage request: {e}")))?;
+        Ok(())
+    }
+
     /// Gets the current usage snapshot for a user for today.
     ///
     /// Returns `None` if no usage has been recorded for the period.
@@ -308,5 +387,46 @@ mod tests {
         );
         assert_eq!(usage.request_count, 2);
         assert_eq!(usage.token_count, 15);
+    }
+
+    #[tokio::test]
+    async fn request_reservation_is_atomic_and_respectful_of_quota() {
+        let tracker = setup_test_db().await;
+        assert!(
+            tracker
+                .try_reserve_request("reserved-user", Some(r#"["engineering"]"#), 2)
+                .await
+                .expect("reserve 1")
+        );
+        assert!(
+            tracker
+                .try_reserve_request("reserved-user", Some(r#"["engineering"]"#), 2)
+                .await
+                .expect("reserve 2")
+        );
+        assert!(
+            !tracker
+                .try_reserve_request("reserved-user", Some(r#"["engineering"]"#), 2)
+                .await
+                .expect("reserve 3")
+        );
+        let usage = tracker
+            .get_usage("reserved-user")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(usage.request_count, 2);
+        assert_eq!(usage.group_name.as_deref(), Some(r#"["engineering"]"#));
+
+        tracker
+            .release_request("reserved-user")
+            .await
+            .expect("release");
+        assert!(
+            tracker
+                .try_reserve_request("reserved-user", Some(r#"["engineering"]"#), 2)
+                .await
+                .expect("reserve after release")
+        );
     }
 }

@@ -1315,6 +1315,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quota_route_requires_admin_and_returns_resolved_status() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(5000), Some(100))
+            .await
+            .expect("policy");
+        state
+            .usage_tracker
+            .increment("route-target", Some(r#"["engineering"]"#), 4, 900, 0.25)
+            .await
+            .expect("usage");
+
+        let app = router(state.clone());
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/admin/v1/quotas/route-target")
+            .header("x-oac-user-subject", "admin-user")
+            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("JSON body");
+        assert_eq!(body["user_subject"], "route-target");
+        assert_eq!(body["groups"], r#"["engineering"]"#);
+        assert_eq!(body["daily_request_quota"], 100);
+        assert_eq!(body["daily_token_quota"], 5000);
+        assert_eq!(body["request_count"], 4);
+        assert_eq!(body["token_count"], 900);
+        assert_eq!(body["cost_usd"], 0.25);
+
+        let app = router(state);
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/admin/v1/quotas/route-target")
+            .header("x-oac-user-subject", "ordinary-user")
+            .header("x-oac-user-groups", r#"["engineering"]"#)
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn audit_query_applies_limit_and_offset_in_database() {
         use crate::audit::AuditEntry;
 

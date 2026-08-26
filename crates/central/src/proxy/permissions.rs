@@ -40,6 +40,9 @@ pub struct PermissionDecision {
     pub decision: String,
     /// The reason for denial (set when `decision == "denied"`).
     pub reason: Option<String>,
+    /// Whether this request consumed an atomic request-quota reservation.
+    /// The forward handler uses this to avoid counting the request twice.
+    pub request_reserved: bool,
 }
 
 /// The permissions middleware.
@@ -177,40 +180,56 @@ pub async fn permissions_middleware(
     // Check daily quotas (pre-flight). Usage counters accumulate as
     // requests complete, so a single request may overshoot its token quota
     // by up to one request's worth of tokens — the next request is denied.
-    if policy.daily_request_quota.is_some() || policy.daily_token_quota.is_some() {
-        let usage = match state.usage_tracker.get_usage(&identity.subject).await {
-            Ok(usage) => usage,
+    let mut request_reserved = false;
+    if policy.daily_token_quota.is_some() {
+        match state.usage_tracker.get_usage(&identity.subject).await {
+            Ok(Some(usage)) => {
+                if let Some(daily_token_quota) = policy.daily_token_quota {
+                    if usage.token_count >= daily_token_quota {
+                        return deny(
+                            &state,
+                            &identity,
+                            &endpoint,
+                            None,
+                            "token_quota_exceeded",
+                            StatusCode::TOO_MANY_REQUESTS,
+                        )
+                        .await;
+                    }
+                }
+            }
+            Ok(None) => {}
             Err(e) => {
-                tracing::warn!(error = %e, "failed to check usage; allowing");
-                None
+                tracing::warn!(error = %e, "failed to check token usage; allowing");
             }
-        };
-        if let Some(usage) = usage {
-            if let Some(daily_request_quota) = policy.daily_request_quota {
-                if usage.request_count >= daily_request_quota {
-                    return deny(
-                        &state,
-                        &identity,
-                        &endpoint,
-                        None,
-                        "quota_exceeded",
-                        StatusCode::TOO_MANY_REQUESTS,
-                    )
-                    .await;
-                }
+        }
+    }
+    if let Some(daily_request_quota) = policy.daily_request_quota {
+        match state
+            .usage_tracker
+            .try_reserve_request(
+                &identity.subject,
+                identity.groups.as_deref(),
+                daily_request_quota,
+            )
+            .await
+        {
+            Ok(true) => request_reserved = true,
+            Ok(false) => {
+                return deny(
+                    &state,
+                    &identity,
+                    &endpoint,
+                    None,
+                    "quota_exceeded",
+                    StatusCode::TOO_MANY_REQUESTS,
+                )
+                .await;
             }
-            if let Some(daily_token_quota) = policy.daily_token_quota {
-                if usage.token_count >= daily_token_quota {
-                    return deny(
-                        &state,
-                        &identity,
-                        &endpoint,
-                        None,
-                        "token_quota_exceeded",
-                        StatusCode::TOO_MANY_REQUESTS,
-                    )
-                    .await;
-                }
+            Err(e) => {
+                // Preserve the existing fail-open behavior for database
+                // outages, but make the failure visible to operators.
+                tracing::warn!(error = %e, "failed to reserve request quota; allowing");
             }
         }
     }
@@ -220,6 +239,7 @@ pub async fn permissions_middleware(
     request.extensions_mut().insert(PermissionDecision {
         decision: "allowed".into(),
         reason: None,
+        request_reserved,
     });
 
     Ok(next.run(request).await)
@@ -393,6 +413,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_quota_denial_has_precise_error_audit_and_no_side_effects() {
+        use sea_orm::EntityTrait;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(500), None)
+            .await
+            .expect("policy");
+        state
+            .usage_tracker
+            .increment("quota-user-audit", None, 1, 500, 0.125)
+            .await
+            .expect("seed usage");
+
+        let downstream_calls = Arc::new(AtomicUsize::new(0));
+        let calls = downstream_calls.clone();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        "must not run"
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(());
+
+        let response = app
+            .oneshot(chat_request("quota-user-audit", r#"["engineering"]"#))
+            .await
+            .expect("middleware run");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read denial body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("JSON denial body");
+        assert_eq!(body["error"]["type"], "permission_denied");
+        assert_eq!(
+            body["error"]["message"],
+            "access denied: token_quota_exceeded"
+        );
+        assert_eq!(downstream_calls.load(Ordering::SeqCst), 0);
+
+        let usage = state
+            .usage_tracker
+            .get_usage("quota-user-audit")
+            .await
+            .expect("usage")
+            .expect("seed usage remains");
+        assert_eq!(
+            usage.request_count, 1,
+            "denied request must not increment usage"
+        );
+        assert_eq!(usage.token_count, 500);
+
+        let audits = crate::entity::audit_log::Entity::find()
+            .all(state.audit.db())
+            .await
+            .expect("audit rows");
+        let denial = audits.last().expect("denial audit row");
+        assert_eq!(denial.status, 429);
+        assert_eq!(denial.permission_decision.as_deref(), Some("denied"));
+        assert_eq!(
+            denial.denial_reason.as_deref(),
+            Some("token_quota_exceeded")
+        );
+        assert_eq!(denial.user_subject, "quota-user-audit");
+    }
+
+    #[tokio::test]
     async fn token_quota_allows_when_under_quota() {
         let state = test_state().await;
         state
@@ -465,6 +571,135 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS,
             "request-count quota must still be enforced"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_cannot_oversubscribe_request_quota() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, None, Some(1))
+            .await
+            .expect("policy");
+        let usage_tracker = state.usage_tracker.clone();
+        let downstream_calls = Arc::new(AtomicUsize::new(0));
+        let calls = downstream_calls.clone();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        "allowed"
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(());
+
+        // All requests start concurrently. A read-then-forward implementation
+        // would let every request observe request_count=0 and reach the
+        // handler. The atomic reservation must admit exactly one.
+        let requests = (0..16).map(|_| chat_request("concurrent-user", r#"["engineering"]"#));
+        let responses =
+            futures::future::join_all(requests.map(|request| app.clone().oneshot(request))).await;
+        let responses = responses
+            .into_iter()
+            .map(|response| response.expect("middleware run"))
+            .collect::<Vec<_>>();
+
+        let allowed = responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::OK)
+            .count();
+        let denied = responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::TOO_MANY_REQUESTS)
+            .count();
+        assert_eq!(allowed, 1, "exactly one request may reserve quota=1");
+        assert_eq!(denied, 15, "all concurrent excess requests must be denied");
+        assert_eq!(downstream_calls.load(Ordering::SeqCst), 1);
+
+        let usage = usage_tracker
+            .get_usage("concurrent-user")
+            .await
+            .expect("usage")
+            .expect("reservation row");
+        assert_eq!(
+            usage.request_count, 1,
+            "quota reservation must be counted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_request_does_not_consume_request_quota() {
+        let mut state = test_state().await;
+        state.config.dev_mode = false;
+        state.rate_limiter = Some(crate::proxy::rate_limit::RateLimiter::new(
+            1,
+            std::time::Duration::from_secs(3600),
+        ));
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, None, Some(2))
+            .await
+            .expect("policy");
+        let usage_tracker = state.usage_tracker.clone();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { "allowed" }),
+            )
+            // This layer order matches proxy::router: rate limiting runs
+            // before permissions can reserve request quota.
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::proxy::rate_limit::rate_limit_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(());
+
+        let first = app
+            .clone()
+            .oneshot(chat_request("rate-user", r#"["engineering"]"#))
+            .await
+            .expect("first request");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // Same default client IP exhausts the token bucket. This request is
+        // rejected before permissions can reserve the second quota slot.
+        let second = app
+            .oneshot(chat_request("rate-user", r#"["engineering"]"#))
+            .await
+            .expect("second request");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let usage = usage_tracker
+            .get_usage("rate-user")
+            .await
+            .expect("usage")
+            .expect("first reservation");
+        assert_eq!(usage.request_count, 1);
     }
 
     #[tokio::test]

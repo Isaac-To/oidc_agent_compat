@@ -114,6 +114,22 @@ pub async fn proxy_handler(
             resp
         }
         Err(e) => {
+            // A request-quota reservation is made before provider resolution
+            // and forwarding. If forwarding fails before an outcome exists,
+            // release that reservation so transient upstream failures do not
+            // consume the user's daily request allowance permanently.
+            if let (Some(ident), Some(decision)) = (&identity, &permission_decision) {
+                if decision.request_reserved {
+                    if let Err(release_error) =
+                        state.usage_tracker.release_request(&ident.subject).await
+                    {
+                        tracing::error!(
+                            error = %release_error,
+                            "failed to release request quota reservation"
+                        );
+                    }
+                }
+            }
             tracing::error!(error = %e, path = %path, "forward failed");
             let body = serde_json::json!({
                 "error": {
@@ -462,9 +478,9 @@ fn extract_token_usage_from_value(value: &serde_json::Value) -> TokenUsage {
 /// responses when the request asks for it. Without this, streamed requests
 /// would record zero tokens, breaking token quotas and cost reporting.
 ///
-/// Bodies that are not JSON objects, do not set `"stream": true`, or already
-/// set `include_usage` are returned unchanged. Existing `stream_options`
-/// fields from the caller are preserved.
+/// Bodies that are not JSON objects or do not set `"stream": true` are
+/// returned unchanged. Existing object-valued `stream_options` fields from
+/// the caller are preserved; malformed/non-object values are repaired.
 fn inject_stream_usage_option(body: bytes::Bytes) -> bytes::Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
         return body;
@@ -483,22 +499,20 @@ fn inject_stream_usage_option(body: bytes::Bytes) -> bytes::Bytes {
     // include_usage on (it adds one final chunk and does not change token
     // counts). An explicit include_usage=false is overridden — the proxy
     // needs usage reporting for quota enforcement and cost accounting.
-    let options = obj
+    let stream_options = obj
         .entry("stream_options")
         .or_insert_with(|| serde_json::json!({}));
-    let mut modified = false;
-    if let Some(options) = options.as_object_mut() {
-        let include = options
+    if let Some(options) = stream_options.as_object_mut() {
+        if options
             .get("include_usage")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if !include {
-            options.insert("include_usage".into(), serde_json::Value::Bool(true));
-            modified = true;
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return body;
         }
-    }
-    if !modified {
-        return body;
+        options.insert("include_usage".into(), serde_json::Value::Bool(true));
+    } else {
+        *stream_options = serde_json::json!({"include_usage": true});
     }
     match serde_json::to_vec(&value) {
         Ok(encoded) => encoded.into(),
@@ -540,24 +554,27 @@ where
     // the unfold state machine regardless of the inner stream's pinness.
     let inner = Box::pin(stream);
     let mapped = futures::stream::unfold(
-        (inner, usage_for_stream, Some(tx)),
-        |(mut inner, usage, mut tx)| async move {
+        (inner, usage_for_stream, Some(tx), Vec::new()),
+        |(mut inner, usage, mut tx, mut buffer)| async move {
             use futures::StreamExt;
             match inner.next().await {
                 Some(Ok(chunk)) => {
-                    extract_usage_from_sse_chunk(&chunk, &usage);
-                    Some((Ok(chunk), (inner, usage, tx)))
+                    buffer.extend_from_slice(&chunk);
+                    extract_usage_from_sse_buffer(&mut buffer, &usage, false);
+                    Some((Ok(chunk), (inner, usage, tx, buffer)))
                 }
                 Some(Err(e)) => {
                     // Upstream error: signal completion so accounting runs
                     // with whatever usage was extracted so far.
+                    extract_usage_from_sse_buffer(&mut buffer, &usage, true);
                     if let Some(tx) = tx.take() {
                         let _ = tx.send(());
                     }
-                    Some((Err(e), (inner, usage, tx)))
+                    Some((Err(e), (inner, usage, tx, buffer)))
                 }
                 None => {
                     // Stream ended normally.
+                    extract_usage_from_sse_buffer(&mut buffer, &usage, true);
                     if let Some(tx) = tx.take() {
                         let _ = tx.send(());
                     }
@@ -569,28 +586,52 @@ where
     (mapped, usage, rx)
 }
 
-/// Parses an SSE chunk (one or more `data:` lines) and extracts usage if
-/// present. Stores the last usage found (the final chunk typically has it).
-fn extract_usage_from_sse_chunk(bytes: &bytes::Bytes, usage: &SharedUsage) {
-    let text = String::from_utf8_lossy(bytes);
-    for line in text.lines() {
-        let line = line.trim();
-        if !line.starts_with("data:") {
-            continue;
-        }
-        let data = line.trim_start_matches("data:").trim();
-        if data == "[DONE]" {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
-            let extracted = extract_token_usage_from_value(&value);
-            if extracted.total.is_some() {
-                if let Ok(mut guard) = usage.lock() {
-                    *guard = Some(extracted);
-                }
+/// Extracts usage from complete SSE lines in a per-stream buffer.
+///
+/// HTTP body chunks are transport artifacts and may split an SSE line at any
+/// byte boundary. This function retains incomplete trailing lines until the
+/// next chunk arrives. At end-of-stream, `flush` parses one final unterminated
+/// line as well.
+fn extract_usage_from_sse_buffer(buffer: &mut Vec<u8>, usage: &SharedUsage, flush: bool) {
+    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+        let line: Vec<u8> = buffer.drain(..=newline).collect();
+        extract_usage_from_sse_line(&line, usage);
+    }
+    if flush && !buffer.is_empty() {
+        let line = std::mem::take(buffer);
+        extract_usage_from_sse_line(&line, usage);
+    }
+}
+
+/// Parses one complete SSE line and records a usage-bearing JSON object.
+fn extract_usage_from_sse_line(line: &[u8], usage: &SharedUsage) {
+    let Ok(line) = std::str::from_utf8(line) else {
+        return;
+    };
+    let line = line.trim();
+    if !line.starts_with("data:") {
+        return;
+    }
+    let data = line.trim_start_matches("data:").trim();
+    if data == "[DONE]" {
+        return;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+        let extracted = extract_token_usage_from_value(&value);
+        if extracted.total.is_some() {
+            if let Ok(mut guard) = usage.lock() {
+                *guard = Some(extracted);
             }
         }
     }
+}
+
+/// Parses an SSE chunk (one or more `data:` lines) and extracts usage if
+/// present. Stores the last usage found (the final chunk typically has it).
+#[cfg(test)]
+fn extract_usage_from_sse_chunk(bytes: &bytes::Bytes, usage: &SharedUsage) {
+    let mut buffer = bytes.to_vec();
+    extract_usage_from_sse_buffer(&mut buffer, usage, true);
 }
 
 #[cfg(test)]
@@ -722,6 +763,34 @@ mod tests {
     }
 
     #[test]
+    fn inject_stream_usage_option_repairs_non_object_stream_options() {
+        for raw in [
+            r#"{"model":"gpt-4o","stream":true,"stream_options":null}"#,
+            r#"{"model":"gpt-4o","stream":true,"stream_options":"invalid"}"#,
+        ] {
+            let injected = inject_stream_usage_option(bytes::Bytes::from(raw));
+            let value: serde_json::Value = serde_json::from_slice(&injected).unwrap();
+            assert_eq!(
+                value["stream_options"]["include_usage"],
+                serde_json::Value::Bool(true),
+                "invalid stream_options must not disable usage accounting"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_stream_usage_option_preserves_existing_object_fields() {
+        let body = bytes::Bytes::from(
+            r#"{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true,"foo":"bar"}}"#,
+        );
+        let result = inject_stream_usage_option(body.clone());
+        assert_eq!(
+            result, body,
+            "an already compliant body must be byte-stable"
+        );
+    }
+
+    #[test]
     fn inject_stream_usage_option_overrides_explicit_disable() {
         // An explicit include_usage=false is overridden: the central proxy
         // needs usage reporting for token-quota enforcement and cost
@@ -783,5 +852,50 @@ mod tests {
         let guard = usage_handle.lock().unwrap();
         let usage = guard.as_ref().expect("partial usage must be kept");
         assert_eq!(usage.total, Some(5));
+    }
+
+    #[tokio::test]
+    async fn stream_usage_extraction_handles_every_transport_split() {
+        let payload = concat!(
+            ": keep-alive\r\n\r\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":123,\"completion_tokens\":45,\"total_tokens\":168}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n"
+        );
+
+        // An HTTP body chunk is not an SSE frame. Test every split position
+        // in the payload, including inside JSON names, numbers, CRLF, and
+        // UTF-8-adjacent framing bytes. The wrapper must preserve bytes and
+        // still extract the complete usage object.
+        for split in 1..payload.len() {
+            let (left, right) = payload.as_bytes().split_at(split);
+            let chunks = vec![
+                Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(left)),
+                Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(right)),
+            ];
+            let (mapped, usage_handle, done) =
+                wrap_stream_with_usage_extraction(futures::stream::iter(chunks));
+            let output: Vec<bytes::Bytes> = futures::StreamExt::collect::<Vec<_>>(mapped)
+                .await
+                .into_iter()
+                .map(|chunk| chunk.expect("test stream must not fail"))
+                .collect();
+            let output = output
+                .into_iter()
+                .flat_map(|chunk| chunk.to_vec())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                output,
+                payload.as_bytes(),
+                "split at {split} must preserve the exact SSE byte stream"
+            );
+            done.await.expect("completion signal must fire");
+            let guard = usage_handle.lock().unwrap();
+            let usage = guard
+                .as_ref()
+                .expect("usage must be extracted for every split");
+            assert_eq!(usage.prompt, Some(123), "split at {split}");
+            assert_eq!(usage.completion, Some(45), "split at {split}");
+            assert_eq!(usage.total, Some(168), "split at {split}");
+        }
     }
 }
