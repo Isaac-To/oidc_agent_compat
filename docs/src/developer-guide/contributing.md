@@ -81,11 +81,12 @@ cargo doc --workspace --open
 
 ## Known caveats (do not "fix" without asking)
 
-- `cargo audit` flags 2 pre-existing transitive advisories (`rsa 0.9.10`,
-  `rustls-pemfile 2.2.0`) — not our code, no fix available.
-- `cargo deny check` is broken on master: `deny.toml` line 32
-  `allow-build-scripts = true` is incompatible with cargo-deny 0.20.2
-  (expects an array). Fix would be `allow-build-scripts = []`. Do not
-  loosen policy without explicit user approval.
+- CI ignores two documented, unavoidable transitive advisories:
+  `RUSTSEC-2023-0071` (`rsa 0.9.10`, no fixed upgrade available) and
+  `RUSTSEC-2025-0134` (`rustls-pemfile 2.2.0`, unmaintained). All other
+  advisories and warnings remain errors.
+- `cargo deny check` passes with the repository's explicit policy for
+  workspace dependency inheritance, required transitive build scripts, and
+  `CDLA-Permissive-2.0` used by `webpki-roots`.
 - Dockerfile runtime base must be `debian:trixie-slim` (not
   `bookworm-slim`) to match the `rust:1.98-slim` builder's glibc 2.41.
