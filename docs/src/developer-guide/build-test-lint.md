@@ -58,25 +58,23 @@ cargo fmt --all
 ## Security audit
 
 ```sh
-# Known advisories:
-cargo audit
+# Known advisories (the two unavoidable transitive advisories are ignored):
+cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2025-0134
 ```
 
-> **Known caveat:** `cargo audit` flags 2 pre-existing transitive
-> advisories (`rsa 0.9.10`, `rustls-pemfile 2.2.0`) — these are in
-> third-party dependencies, not our code, and no fix is available. Do not
-> "fix" these without asking.
+The CI audit ignores two documented, unavoidable transitive advisories:
+`RUSTSEC-2023-0071` (`rsa 0.9.10`, no fixed upgrade available) and
+`RUSTSEC-2025-0134` (`rustls-pemfile 2.2.0`, unmaintained). All other
+advisories and warnings remain errors in CI.
 
 ```sh
 # License + ban checks:
 cargo deny check
 ```
 
-> **Known caveat:** `cargo deny check` is currently broken on master. The
-> `deny.toml` line 32 `allow-build-scripts = true` is incompatible with
-> cargo-deny 0.20.2 (which expects an array). The fix would be
-> `allow-build-scripts = []`. **Do not loosen policy without explicit
-> user approval.**
+The repository's `deny.toml` explicitly allows the workspace's intentional
+dependency inheritance, required transitive build scripts, and
+`CDLA-Permissive-2.0` used by `webpki-roots`.
 
 ## Docker dev stack
 

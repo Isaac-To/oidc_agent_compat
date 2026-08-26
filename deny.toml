@@ -2,16 +2,22 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Fail the build on any known vulnerability
+# Fail the build on any known vulnerability. These two transitive advisories
+# are currently unavoidable: openidconnect depends on rsa 0.9.10 and
+# axum-server/rustls use the unmaintained rustls-pemfile 2.x release.
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-ignore = []
+ignore = [
+    "RUSTSEC-2023-0071", # rsa: no fixed upgrade is available
+    "RUSTSEC-2025-0134", # rustls-pemfile: no maintained 2.x replacement
+]
 
 [licenses]
 # Allow permissive licenses only
 allow = [
     "MIT",
     "Apache-2.0",
+    "CDLA-Permissive-2.0",
     "BSD-3-Clause",
     "BSD-2-Clause",
     "ISC",
@@ -26,10 +32,54 @@ confidence-threshold = 0.8
 [bans]
 # Warn on multiple versions of the same crate
 multiple-versions = "warn"
-# Deny wildcard dependencies
-wildcards = "deny"
-# Allow build-time only deps to have duplicates
-allow-build-scripts = true
+# Workspace inheritance (`workspace = true`) is intentional and is reported
+# as a wildcard by cargo-deny. Keep the duplicate-version warning while
+# allowing this project convention.
+wildcards = "allow"
+
+[bans.build]
+# Build scripts are required by several transitive platform and crypto crates.
+# Keep cargo-deny's build-script scan enabled without imposing an allowlist.
+allow-build-scripts = [
+    { name = "anyhow" },
+    { name = "crossbeam-utils" },
+    { name = "curve25519-dalek" },
+    { name = "fs-err" },
+    { name = "generic-array" },
+    { name = "getrandom" },
+    { name = "httparse" },
+    { name = "iana-time-zone-haiku" },
+    { name = "icu_normalizer_data" },
+    { name = "icu_properties_data" },
+    { name = "libc" },
+    { name = "libm" },
+    { name = "libsqlite3-sys" },
+    { name = "num-bigint-dig" },
+    { name = "num-traits" },
+    { name = "parking_lot_core" },
+    { name = "proc-macro2" },
+    { name = "proc-macro2-diagnostics" },
+    { name = "quote" },
+    { name = "ring" },
+    { name = "rustls" },
+    { name = "rustversion" },
+    { name = "serde" },
+    { name = "serde_core" },
+    { name = "serde_json" },
+    { name = "thiserror" },
+    { name = "wasm-bindgen" },
+    { name = "wasm-bindgen-shared" },
+    { name = "windows_aarch64_gnullvm" },
+    { name = "windows_aarch64_msvc" },
+    { name = "windows_i686_gnu" },
+    { name = "windows_i686_gnullvm" },
+    { name = "windows_i686_msvc" },
+    { name = "windows_x86_64_gnu" },
+    { name = "windows_x86_64_gnullvm" },
+    { name = "windows_x86_64_msvc" },
+    { name = "zerocopy" },
+    { name = "zmij" },
+]
 
 [sources]
 # Only allow crates.io

@@ -515,7 +515,6 @@ fn write_test_certs_to_temp() -> (
     std::path::PathBuf, // client_key
 ) {
     use oidc_agent_common::test_certs::generate_test_certs;
-    use std::os::unix::fs::PermissionsExt;
 
     let certs = generate_test_certs();
     let dir = std::env::temp_dir().join(format!(
@@ -541,10 +540,15 @@ fn write_test_certs_to_temp() -> (
     std::fs::write(&client_key_path, &certs.client_key).expect("write client key");
 
     // Set 0600 on private keys (required by mtls::enforce_secure_perms).
-    std::fs::set_permissions(&server_key_path, std::fs::Permissions::from_mode(0o600))
-        .expect("chmod server key");
-    std::fs::set_permissions(&client_key_path, std::fs::Permissions::from_mode(0o600))
-        .expect("chmod client key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(&server_key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod server key");
+        std::fs::set_permissions(&client_key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod client key");
+    }
 
     (
         ca_path,
