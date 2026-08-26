@@ -167,7 +167,7 @@ struct AccountingContext {
 /// both outcomes as "record whatever usage was extracted".
 struct DeferredAccounting {
     /// Shared usage handle populated as the stream is consumed.
-    usage: std::sync::Arc<std::sync::Mutex<Option<TokenUsage>>>,
+    usage: SharedUsage,
     /// Fires on stream completion; errors if the stream is dropped.
     done: tokio::sync::oneshot::Receiver<()>,
 }
@@ -497,6 +497,9 @@ fn inject_stream_usage_option(body: bytes::Bytes) -> bytes::Bytes {
     }
 }
 
+/// Shared handle holding the usage extracted from a stream so far.
+type SharedUsage = std::sync::Arc<std::sync::Mutex<Option<TokenUsage>>>;
+
 /// Wraps a byte stream with SSE usage extraction. Returns the pass-through
 /// stream, a shared handle that will contain the extracted usage after the
 /// stream completes, and a oneshot receiver that fires on completion.
@@ -514,7 +517,7 @@ fn wrap_stream_with_usage_extraction<S, E>(
     stream: S,
 ) -> (
     impl futures::Stream<Item = std::result::Result<bytes::Bytes, E>> + Send,
-    std::sync::Arc<std::sync::Mutex<Option<TokenUsage>>>,
+    SharedUsage,
     tokio::sync::oneshot::Receiver<()>,
 )
 where
@@ -559,10 +562,7 @@ where
 
 /// Parses an SSE chunk (one or more `data:` lines) and extracts usage if
 /// present. Stores the last usage found (the final chunk typically has it).
-fn extract_usage_from_sse_chunk(
-    bytes: &bytes::Bytes,
-    usage: &std::sync::Arc<std::sync::Mutex<Option<TokenUsage>>>,
-) {
+fn extract_usage_from_sse_chunk(bytes: &bytes::Bytes, usage: &SharedUsage) {
     let text = String::from_utf8_lossy(bytes);
     for line in text.lines() {
         let line = line.trim();
