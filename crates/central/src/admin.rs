@@ -959,23 +959,33 @@ async fn get_quota(
     State(state): State<AdminState>,
     Path(subject): Path<String>,
 ) -> HandlerResult<axum::Json<QuotaResponse>> {
-    // Get current usage.
+    // Get current usage (including the groups snapshot recorded with it).
     let usage = state
         .usage_tracker
         .get_usage(&subject)
         .await
         .map_err(internal_error)?;
 
-    // Resolve the user's policy. We don't have the user's groups here (the
-    // admin API doesn't receive relay-forwarded groups for the *target*
-    // user), so we return the quotas as None unless we can look them up.
-    // A future enhancement could store the user's groups in the usage_counters
-    // table. For now, return the usage counts and let the admin cross-reference.
+    // Parse the groups snapshot and resolve the effective policy so the
+    // admin sees the same quotas the permissions middleware enforces.
+    // Without a usage row (user has not made a request today) the groups
+    // are unknown, so the quotas are reported as unset.
+    let groups: Vec<String> = usage
+        .as_ref()
+        .and_then(|u| u.group_name.as_deref())
+        .and_then(|g| serde_json::from_str(g).ok())
+        .unwrap_or_default();
+    let policy = state
+        .policy_store
+        .resolve_policy(&groups)
+        .await
+        .map_err(internal_error)?;
+
     Ok(axum::Json(QuotaResponse {
-        user_subject: subject.clone(),
-        groups: None,
-        daily_request_quota: None,
-        daily_token_quota: None,
+        user_subject: subject,
+        groups: usage.as_ref().and_then(|u| u.group_name.clone()),
+        daily_request_quota: policy.daily_request_quota,
+        daily_token_quota: policy.daily_token_quota,
         request_count: usage.as_ref().map(|u| u.request_count).unwrap_or(0),
         token_count: usage.as_ref().map(|u| u.token_count).unwrap_or(0),
         cost_usd: usage.as_ref().map(|u| u.cost_usd).unwrap_or(0.0),
@@ -1105,5 +1115,62 @@ mod tests {
             admin_group: "oac-admins".into(),
         };
         assert!(validate_admin_config(&config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_quota_resolves_policy_from_groups_snapshot() {
+        let state = setup_test_state().await;
+        // Give engineering a token quota and a request quota.
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(5000), Some(100))
+            .await
+            .expect("policy");
+        // Record usage with a groups snapshot (JSON array string).
+        state
+            .usage_tracker
+            .increment("quota-target", Some(r#"["engineering"]"#), 3, 750, 0.02)
+            .await
+            .expect("usage");
+
+        // Call the handler directly (the admin auth middleware is not
+        // under test here).
+        let axum::Json(response) = get_quota(State(state), Path("quota-target".to_string()))
+            .await
+            .expect("handler");
+        assert_eq!(response.user_subject, "quota-target");
+        assert_eq!(
+            response.groups.as_deref(),
+            Some(r#"["engineering"]"#),
+            "the groups snapshot must be reported"
+        );
+        assert_eq!(
+            response.daily_token_quota,
+            Some(5000),
+            "quotas must be resolved from the groups snapshot"
+        );
+        assert_eq!(response.daily_request_quota, Some(100));
+        assert_eq!(response.request_count, 3);
+        assert_eq!(response.token_count, 750);
+    }
+
+    #[tokio::test]
+    async fn get_quota_without_usage_returns_unset_quotas() {
+        let state = setup_test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(5000), None)
+            .await
+            .expect("policy");
+
+        // No usage row for this subject — groups unknown.
+        let axum::Json(response) = get_quota(State(state), Path("no-usage".to_string()))
+            .await
+            .expect("handler");
+        assert_eq!(response.groups, None);
+        assert_eq!(response.daily_token_quota, None);
+        assert_eq!(response.daily_request_quota, None);
+        assert_eq!(response.request_count, 0);
+        assert_eq!(response.token_count, 0);
     }
 }

@@ -24,6 +24,10 @@ pub struct UsageTracker {
 pub struct UsageSnapshot {
     /// The user subject.
     pub user_subject: String,
+    /// The user's groups at the time of the last recorded request (JSON
+    /// array string). Used by the admin quota endpoint to resolve the
+    /// effective policy.
+    pub group_name: Option<String>,
     /// The period date (e.g. `2026-08-25`).
     pub period_date: String,
     /// The period kind (`daily`).
@@ -72,11 +76,14 @@ impl UsageTracker {
 
         // SQLite UPSERT: INSERT ... ON CONFLICT DO UPDATE.
         // The unique index is on (user_subject, period_date, period_kind).
+        // On conflict, the groups snapshot is refreshed (the user's group
+        // membership may have changed since the last request).
         let sql = "INSERT INTO usage_counters \
              (id, user_subject, group_name, period_date, period_kind, \
              request_count, token_count, cost_usd) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
              ON CONFLICT(user_subject, period_date, period_kind) DO UPDATE SET \
+             group_name = $3, \
              request_count = request_count + $6, \
              token_count = token_count + $7, \
              cost_usd = cost_usd + $8";
@@ -111,7 +118,7 @@ impl UsageTracker {
     /// Returns [`Error::Database`] on query failure.
     pub async fn get_usage(&self, user_subject: &str) -> Result<Option<UsageSnapshot>> {
         let period_date = today_date();
-        let sql = "SELECT user_subject, period_date, period_kind, \
+        let sql = "SELECT user_subject, group_name, period_date, period_kind, \
              request_count, token_count, cost_usd \
              FROM usage_counters \
              WHERE user_subject = $1 AND period_date = $2 AND period_kind = $3";
@@ -139,6 +146,7 @@ impl UsageTracker {
             .ok_or_else(|| Error::Database("usage row vanished after empty check".into()))?;
         Ok(Some(UsageSnapshot {
             user_subject: row.try_get("", "user_subject").unwrap_or_default(),
+            group_name: row.try_get("", "group_name").ok(),
             period_date: row.try_get("", "period_date").unwrap_or_default(),
             period_kind: row.try_get("", "period_kind").unwrap_or_default(),
             request_count: row.try_get("", "request_count").unwrap_or(0),
@@ -154,7 +162,7 @@ impl UsageTracker {
     /// Returns [`Error::Database`] on query failure.
     pub async fn get_all_usage(&self) -> Result<Vec<UsageSnapshot>> {
         let period_date = today_date();
-        let sql = "SELECT user_subject, period_date, period_kind, \
+        let sql = "SELECT user_subject, group_name, period_date, period_kind, \
              request_count, token_count, cost_usd \
              FROM usage_counters \
              WHERE period_date = $1 AND period_kind = $2";
@@ -173,6 +181,7 @@ impl UsageTracker {
         for row in rows {
             snapshots.push(UsageSnapshot {
                 user_subject: row.try_get("", "user_subject").unwrap_or_default(),
+                group_name: row.try_get("", "group_name").ok(),
                 period_date: row.try_get("", "period_date").unwrap_or_default(),
                 period_kind: row.try_get("", "period_kind").unwrap_or_default(),
                 request_count: row.try_get("", "request_count").unwrap_or(0),
@@ -263,5 +272,41 @@ mod tests {
 
         let all = tracker.get_all_usage().await.expect("get all");
         assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn group_snapshot_is_stored_and_refreshed() {
+        let tracker = setup_test_db().await;
+        // The group snapshot is stored as a JSON array string (the same
+        // format as the relay-forwarded X-OAC-User-Groups header).
+        tracker
+            .increment("user-g", Some(r#"["engineering"]"#), 1, 10, 0.0)
+            .await
+            .expect("increment 1");
+        let usage = tracker
+            .get_usage("user-g")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(usage.group_name.as_deref(), Some(r#"["engineering"]"#));
+
+        // A later request with changed groups refreshes the snapshot while
+        // the counters accumulate.
+        tracker
+            .increment("user-g", Some(r#"["engineering","oac-admins"]"#), 1, 5, 0.0)
+            .await
+            .expect("increment 2");
+        let usage = tracker
+            .get_usage("user-g")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            usage.group_name.as_deref(),
+            Some(r#"["engineering","oac-admins"]"#),
+            "the groups snapshot must be refreshed on conflict"
+        );
+        assert_eq!(usage.request_count, 2);
+        assert_eq!(usage.token_count, 15);
     }
 }

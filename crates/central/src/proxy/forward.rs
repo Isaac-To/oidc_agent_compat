@@ -255,10 +255,19 @@ async fn record_request_outcome(context: &AccountingContext, usage: TokenUsage, 
     // requests that were allowed by the permissions middleware.
     if let Some(ident) = &context.identity {
         let total_tokens = i64::from(usage.total.unwrap_or(0));
+        // Snapshot the user's groups (JSON array string) into the usage
+        // counters so the admin quota endpoint can resolve the effective
+        // policy without a separate identity lookup.
         if let Err(e) = context
             .state
             .usage_tracker
-            .increment(&ident.subject, None, 1, total_tokens, cost_usd)
+            .increment(
+                &ident.subject,
+                ident.groups.as_deref(),
+                1,
+                total_tokens,
+                cost_usd,
+            )
             .await
         {
             tracing::warn!(error = %e, "failed to increment usage counters");
