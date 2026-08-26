@@ -28,7 +28,8 @@ pub const FORWARDABLE_HEADERS: &[&str] = &[
 
 Only these headers are forwarded upstream. `Authorization` is intentionally
 **not** in this list — it is replaced by upstream auth (local key →
-identity headers at the relay; identity headers → master key at central).
+identity headers at the relay; identity headers → selected provider key at
+central).
 
 ### `MAX_BODY_SIZE`
 

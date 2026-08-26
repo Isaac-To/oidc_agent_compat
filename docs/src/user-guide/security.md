@@ -6,12 +6,13 @@ Agent Compatibility Server. For the full technical threat model, see
 
 ## The master key never touches your laptop
 
-The master backend key (e.g. your OpenAI API key) lives **only** in the
-central proxy's process memory, loaded from a managed secret store. It is:
+Provider API keys (e.g. an OpenAI API key) are encrypted at rest in the
+central database and decrypted **only** in the central proxy's process
+memory. They are:
 
 - Never sent to any laptop.
 - Never logged.
-- Never in a config file.
+- Never in a config file or admin API response.
 - Never in an error response.
 
 The relay holds only a **local API key** — a 256-bit random value that is
@@ -32,6 +33,8 @@ against your enterprise IdP (Okta, Keycloak, etc.):
   `at_hash`.
 - **No token storage** — in v1, tokens are not stored; you re-login when
   they expire.
+- **Local session expiry** — keys created by OIDC login expire after 24 hours
+  by default; configure `session_ttl_hours` for a different lifetime.
 
 ## mTLS between relay and central
 

@@ -11,12 +11,12 @@ duplicating them.
 An enterprise OIDC-to-AI-agent forwarder. Employees run a thin **laptop
 relay** (`oac-relay`) that authenticates them via OIDC and forwards agent
 traffic over mTLS to a company-hosted **central proxy** (`oac-central`),
-which holds the master backend key in a secret store and forwards to an
-OpenAI-compatible backend. The master key never touches any laptop.
+which manages encrypted provider keys and forwards to an OpenAI-compatible
+backend. Provider keys never touch any laptop.
 
 ```
 Agent → 127.0.0.1 relay → mTLS → central proxy → OpenAI-compatible backend
-                                  ↑ master key (secret manager)
+                                  ↑ encrypted provider keys (central DB)
 ```
 
 See `README.md` for the user-facing overview and `docs/threat-model.md` for
@@ -40,7 +40,7 @@ are non-negotiable.
 - Never commit secrets, credentials, tokens, or private keys. The repo is
   public-equivalent; assume anything you push will be read by an attacker.
 - When in doubt about whether a change is safe, **stop and ask** rather
-  than guessing. Security-sensitive areas (mTLS, OIDC, secret store,
+  than guessing. Security-sensitive areas (mTLS, OIDC, provider-key encryption,
   auth, key handling) warrant extra caution.
 - Do not "fix" pre-existing advisories or policy files without explicit
   user approval (see [Known caveats](#known-caveats-do-not-fix-without-asking)).
@@ -190,7 +190,7 @@ Key modules:
 - `crates/central/src/admin.rs` — admin API (`/admin/v1/`) for policy/device/audit management.
 - `crates/central/src/policy.rs` — `PolicyStore` + `resolve_policy` (group→policy merge, most-permissive-wins).
 - `crates/central/src/device_store.rs` — device registration + revocation store.
-- `crates/central/src/secrets.rs` — `SecretStore` trait; `FileSecretStore` for dev. Vault/AWS/GCP/Azure are TODO.
+- `crates/central/src/provider.rs` — runtime provider/key store; provider keys are AES-256-GCM encrypted at rest with the configured MEK.
 - `crates/central/src/audit.rs` — audit logger (enriched with identity, groups, endpoint, request-id, permission decision).
 - `crates/central/src/db.rs`, `migration.rs`, `entity/` — central persistence.
 
@@ -229,9 +229,10 @@ Minimum Rust 1.85; edition 2024.
 - Library code returns `oidc_agent_common::error::Result` (thiserror-based
   `Error` enum). Reserve `anyhow` for binary `main` glue if needed.
 - Secrets are never literals in config: OIDC client secret is referenced by
-  env-var name (`client_secret_env`); master key lives only in the secret
-  store. The master key is held in `Zeroizing` memory, never logged, never
-  sent to a laptop.
+  env-var name (`client_secret_env`); provider API keys are managed through
+  the admin API and encrypted at rest. Provider keys are held in
+  `Zeroizing` memory during forwarding, never logged, never sent to a
+  laptop.
 - Logging is structured JSON via `tracing`/`tracing-subscriber` with a
   secret-redaction layer (`crates/common/src/logging.rs`). Never log raw
   keys/tokens.
@@ -286,13 +287,13 @@ See `docker/README.md` for the full service table and quick start.
 
 ---
 
-## Out of scope (TODOs — don't assume implemented)
+## Out of scope (deferred features — don't assume implemented)
 
-- Vault/AWS/GCP/Azure secret-store backends (only `kind = "file"` works).
-- Groups extraction from userinfo (not a standard OIDC claim).
-- Refresh token handling (v1 re-login on expiry; no token storage).
-- Token-quota enforcement (request-count quotas are enforced pre-flight;
-  token quotas are tracked in the usage counters but not yet blocked).
+- External KMS backends for the provider encryption key.
+- Distributed Redis-backed rate limiting for horizontally scaled central
+  instances (the current limiter is in-memory per IP).
+- Refresh-token handling: v1 intentionally stores no OIDC refresh tokens;
+  local API keys expire according to `session_ttl_hours`, default 24 hours.
 
 ---
 

@@ -65,20 +65,20 @@ crates/relay/tests/
 ```
 crates/central/src/
 ├── lib.rs              # Lib exposed for integration tests
-├── main.rs             # Binary: serve, set-backend-key, admin CLI
+├── main.rs             # Binary: serve and admin CLI
 ├── db.rs               # Central DB setup
 ├── migration.rs        # SeaORM migrations (4 migrations)
 ├── admin.rs            # Admin API (/admin/v1/) router, handlers, auth middleware
 ├── policy.rs           # PolicyStore + resolve_policy (group→policy merge)
 ├── device_store.rs     # Device registration + revocation store
-├── secrets.rs          # SecretStore trait; FileSecretStore
+├── provider.rs         # Runtime providers; AES-256-GCM encrypted keys
 ├── audit.rs            # Audit logger (enriched with identity, groups, endpoint, etc.)
 ├── usage.rs            # UsageTracker (per-user daily token/request quotas)
 ├── pricing.rs          # PriceTable (model cost computation, auto-fetch from backend)
 ├── proxy/
 │   ├── mod.rs          # Router, AppState, serve()
 │   ├── auth.rs         # Validates relay-forwarded identity headers
-│   ├── forward.rs      # Central→backend forwarding (SSE streaming, master key injection)
+│   ├── forward.rs      # Central→backend forwarding (SSE, provider-key injection)
 │   ├── permissions.rs  # Group-based model/endpoint/quota enforcement
 │   └── rate_limit.rs   # Per-IP token bucket rate limiter
 └── entity/

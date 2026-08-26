@@ -74,8 +74,18 @@ pub async fn complete_login(
         .upsert_identity(issuer, subject, email, display_name, groups)
         .await?;
 
-    // 2. Mint a new local key.
-    let minted = key_store.mint_key(&identity.id, "default").await?;
+    // 2. Mint a new local key with the configured session lifetime (None
+    //    = never expires; the v1 default).
+    let expires_at = config
+        .session_ttl_hours
+        .map(|hours| {
+            time::OffsetDateTime::now_utc()
+                + time::Duration::hours(i64::try_from(hours).unwrap_or(i64::MAX))
+        })
+        .map(|exp| time::PrimitiveDateTime::new(exp.date(), exp.time()));
+    let minted = key_store
+        .mint_key(&identity.id, "default", expires_at)
+        .await?;
 
     // 3. Inject into the agent config.
     let base_url = format!("http://{}/v1", config.listen_addr);
@@ -479,6 +489,7 @@ mod tests {
                 client_key_path: "/client.key".into(),
             },
             dev_mode: false,
+            session_ttl_hours: None,
         }
     }
 
@@ -512,6 +523,51 @@ mod tests {
         use crate::entity::api_key;
         let keys = api_key::Entity::find().all(&store.db).await.expect("load");
         assert_eq!(keys.len(), 1, "exactly one key must be minted");
+        assert!(
+            keys[0].expires_at.is_none(),
+            "no TTL configured means the key never expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_login_applies_session_ttl() {
+        let store = setup_test_db().await;
+        let mut config = test_config();
+        config.session_ttl_hours = Some(24);
+
+        let _ = complete_login(
+            &store,
+            &config,
+            "https://idp.example.com",
+            "ttl-user",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("login");
+
+        use crate::entity::api_key;
+        use sea_orm::EntityTrait;
+        let keys = api_key::Entity::find().all(&store.db).await.expect("load");
+        assert_eq!(keys.len(), 1);
+        let expires_at = keys[0]
+            .expires_at
+            .expect("TTL configured means the key must expire");
+        let expected = time::PrimitiveDateTime::new(
+            time::OffsetDateTime::now_utc().date(),
+            time::OffsetDateTime::now_utc().time(),
+        ) + time::Duration::hours(24);
+        // Allow slack for the seconds ticking between mint and assertion.
+        let diff = if expires_at > expected {
+            expires_at - expected
+        } else {
+            expected - expires_at
+        };
+        assert!(
+            diff < time::Duration::minutes(1),
+            "expiry must be ~24h from now, got {expires_at:?}"
+        );
     }
 
     #[tokio::test]

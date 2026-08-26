@@ -15,7 +15,7 @@
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 
 use super::AppState;
 
@@ -52,7 +52,8 @@ pub async fn auth_middleware(
 
     // Verify the key against the store.
     match state.key_store.verify_key(bearer).await {
-        Ok(Some((key, identity))) => {
+        Ok(crate::keystore::KeyVerification::Valid(pair)) => {
+            let (key, identity) = *pair;
             // Attach the identity to the request extensions for downstream use.
             request.extensions_mut().insert(VerifiedIdentity {
                 identity_id: identity.id,
@@ -63,7 +64,25 @@ pub async fn auth_middleware(
             });
             Ok(next.run(request).await)
         }
-        Ok(None) => {
+        Ok(crate::keystore::KeyVerification::Expired) => {
+            // The key matched but the session has expired (and the stored
+            // row was deleted). Tell the user how to recover — agents
+            // surface this body in their error output.
+            tracing::warn!("rejected request with expired session key");
+            let body = serde_json::json!({
+                "error": {
+                    "message": "session expired; run `oac-relay login` to re-authenticate",
+                    "type": "session_expired",
+                }
+            });
+            Ok((
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
+                .into_response())
+        }
+        Ok(crate::keystore::KeyVerification::Invalid) => {
             tracing::warn!("rejected request with invalid API key");
             Err(StatusCode::UNAUTHORIZED)
         }

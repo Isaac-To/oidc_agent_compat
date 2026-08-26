@@ -13,7 +13,9 @@
 //! - No secrets (local API keys, master key) are ever logged.
 //! - The log records who made the request, when, and the outcome.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, EntityTrait, QueryOrder, QuerySelect, Statement, Value,
+};
 use uuid::Uuid;
 
 use oidc_agent_common::error::{Error, Result};
@@ -109,6 +111,27 @@ impl ActivityLogger {
             .map_err(|e| Error::Database(format!("relay activity insert: {e}")))?;
 
         Ok(())
+    }
+
+    /// Lists the most recent relay activity entries, newest first.
+    ///
+    /// The result is bounded to 1,000 entries even if a larger value is
+    /// supplied by a caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] if the query fails.
+    pub async fn list_activity(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<crate::entity::relay_activity_log::Model>> {
+        crate::entity::relay_activity_log::Entity::find()
+            .order_by_desc(crate::entity::relay_activity_log::Column::CreatedAt)
+            .order_by_desc(crate::entity::relay_activity_log::Column::Id)
+            .limit(u64::from(limit.min(1000)))
+            .all(&self.db)
+            .await
+            .map_err(|e| Error::Database(format!("list relay activity: {e}")))
     }
 }
 
@@ -206,5 +229,42 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].identity_id, "id'; DROP TABLE--");
         assert_eq!(entries[0].endpoint, "/v1/chat'; --");
+    }
+
+    #[tokio::test]
+    async fn list_activity_honors_limit() {
+        let logger = setup_test_db().await;
+        // Insert explicit timestamps so this test proves ORDER BY semantics,
+        // rather than relying on wall-clock timing (the schema stores second
+        // precision). The log is append-only, but direct inserts are valid
+        // test setup and exercise the same query used by the CLI.
+        for (id, created_at) in [
+            ("activity-old", "2026-01-01 00:00:01"),
+            ("activity-new", "2026-01-01 00:00:03"),
+            ("activity-middle", "2026-01-01 00:00:02"),
+        ] {
+            logger
+                .db
+                .execute(Statement::from_sql_and_values(
+                    logger.db.get_database_backend(),
+                    "INSERT INTO relay_activity_log \
+                     (id, identity_id, key_id, method, endpoint, model, central_status, \
+                      latency_ms, request_id, created_at) \
+                     VALUES ($1, $2, $3, 'GET', '/v1/models', NULL, 200, 0, NULL, $4)",
+                    vec![
+                        id.into(),
+                        format!("identity-{id}").into(),
+                        format!("key-{id}").into(),
+                        created_at.into(),
+                    ],
+                ))
+                .await
+                .expect("insert test activity");
+        }
+
+        let entries = logger.list_activity(2).await.expect("list");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "activity-new");
+        assert_eq!(entries[1].id, "activity-middle");
     }
 }

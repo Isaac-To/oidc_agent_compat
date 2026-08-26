@@ -123,7 +123,7 @@ pub fn router(state: AdminState) -> Router {
 /// - No static token is used; the admin's OIDC identity is the auth.
 async fn admin_auth_middleware(
     State(state): State<AdminState>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> std::result::Result<axum::response::Response, StatusCode> {
     let headers = request.headers();
@@ -158,7 +158,41 @@ async fn admin_auth_middleware(
     }
 
     tracing::info!(user_subject = %subject, "admin API request authorized");
+
+    // Attach the verified admin identity so handlers can attribute admin
+    // audit entries to the actual caller instead of a generic label.
+    let admin_subject = subject.to_string();
+    request.extensions_mut().insert(AdminIdentity {
+        subject: admin_subject,
+    });
+
     Ok(next.run(request).await)
+}
+
+/// The authenticated admin identity, attached by [`admin_auth_middleware`].
+///
+/// Extracted by mutating handlers via [`axum::extract::FromRequestParts`] so
+/// admin audit entries record who performed each action.
+#[derive(Debug, Clone)]
+pub struct AdminIdentity {
+    /// The admin's user subject (from the relay-forwarded, mTLS-protected
+    /// identity headers).
+    pub subject: String,
+}
+
+impl axum::extract::FromRequestParts<AdminState> for AdminIdentity {
+    type Rejection = StatusCode;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &AdminState,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<AdminIdentity>()
+            .cloned()
+            .ok_or(StatusCode::UNAUTHORIZED)
+    }
 }
 
 // --- Provider handlers ---
@@ -250,6 +284,7 @@ async fn list_providers(
 
 async fn create_provider(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     axum::Json(body): axum::Json<CreateProviderRequest>,
 ) -> HandlerResult<axum::Json<ProviderResponse>> {
     let input = crate::provider::ProviderInput {
@@ -267,7 +302,7 @@ async fn create_provider(
         .map_err(internal_error)?;
     record_admin_audit(
         state.audit.db(),
-        "admin",
+        &admin.subject,
         "upsert_provider",
         &input.id,
         None,
@@ -291,6 +326,7 @@ async fn get_provider(
 
 async fn update_provider(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path(id): Path<String>,
     axum::Json(body): axum::Json<UpdateProviderRequest>,
 ) -> HandlerResult<axum::Json<ProviderResponse>> {
@@ -316,12 +352,20 @@ async fn update_provider(
         .upsert_provider(&input)
         .await
         .map_err(internal_error)?;
-    record_admin_audit(state.audit.db(), "admin", "upsert_provider", &id, None).await;
+    record_admin_audit(
+        state.audit.db(),
+        &admin.subject,
+        "upsert_provider",
+        &id,
+        None,
+    )
+    .await;
     Ok(axum::Json(ProviderResponse::from(provider)))
 }
 
 async fn delete_provider(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path(id): Path<String>,
 ) -> HandlerResult<StatusCode> {
     let deleted = state
@@ -332,12 +376,20 @@ async fn delete_provider(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, format!("provider '{id}' not found")));
     }
-    record_admin_audit(state.audit.db(), "admin", "delete_provider", &id, None).await;
+    record_admin_audit(
+        state.audit.db(),
+        &admin.subject,
+        "delete_provider",
+        &id,
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn set_default_provider(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path(id): Path<String>,
 ) -> HandlerResult<StatusCode> {
     state
@@ -345,7 +397,14 @@ async fn set_default_provider(
         .set_default_provider(&id)
         .await
         .map_err(internal_error)?;
-    record_admin_audit(state.audit.db(), "admin", "set_default_provider", &id, None).await;
+    record_admin_audit(
+        state.audit.db(),
+        &admin.subject,
+        "set_default_provider",
+        &id,
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -473,6 +532,7 @@ async fn get_key(
 
 async fn add_key(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path(id): Path<String>,
     axum::Json(body): axum::Json<AddProviderKeyRequest>,
 ) -> HandlerResult<axum::Json<ProviderKeyResponse>> {
@@ -496,12 +556,20 @@ async fn add_key(
         )
         .await
         .map_err(internal_error)?;
-    record_admin_audit(state.audit.db(), "admin", "add_provider_key", &id, None).await;
+    record_admin_audit(
+        state.audit.db(),
+        &admin.subject,
+        "add_provider_key",
+        &id,
+        None,
+    )
+    .await;
     Ok(axum::Json(ProviderKeyResponse::from(key)))
 }
 
 async fn update_key(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path((provider_id, key_id)): Path<(String, String)>,
     axum::Json(body): axum::Json<UpdateProviderKeyRequest>,
 ) -> HandlerResult<axum::Json<ProviderKeyResponse>> {
@@ -530,7 +598,7 @@ async fn update_key(
         .map_err(internal_error)?;
     record_admin_audit(
         state.audit.db(),
-        "admin",
+        &admin.subject,
         "update_provider_key",
         &key_id,
         None,
@@ -541,6 +609,7 @@ async fn update_key(
 
 async fn delete_key(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path((provider_id, key_id)): Path<(String, String)>,
 ) -> HandlerResult<StatusCode> {
     if state
@@ -568,7 +637,7 @@ async fn delete_key(
     }
     record_admin_audit(
         state.audit.db(),
-        "admin",
+        &admin.subject,
         "delete_provider_key",
         &key_id,
         None,
@@ -665,6 +734,7 @@ pub struct UpsertPolicyRequest {
 
 async fn upsert_policy(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path(name): Path<String>,
     axum::Json(body): axum::Json<UpsertPolicyRequest>,
 ) -> HandlerResult<axum::Json<GroupPolicyResponse>> {
@@ -689,15 +759,12 @@ async fn upsert_policy(
         .await
         .map_err(internal_error)?;
 
-    // Record admin audit entry. The admin subject comes from the request
-    // headers (set by the relay from the verified OIDC identity).
-    let admin_subject = "admin"; // The actual subject is in the headers; we
-    // record a generic label here. A future
-    // enhancement could extract it from the
-    // request extensions.
+    // Record admin audit entry, attributed to the verified admin identity
+    // (set by the relay from the OIDC login; attached to the request
+    // extensions by the admin auth middleware).
     record_admin_audit(
         state.audit.db(),
-        admin_subject,
+        &admin.subject,
         "upsert_policy",
         &name,
         Some(&serde_json::to_string(&body).unwrap_or_default()),
@@ -709,6 +776,7 @@ async fn upsert_policy(
 
 async fn delete_policy(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path(name): Path<String>,
 ) -> HandlerResult<StatusCode> {
     let deleted = state
@@ -719,7 +787,14 @@ async fn delete_policy(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, format!("policy '{name}' not found")));
     }
-    record_admin_audit(state.audit.db(), "admin", "delete_policy", &name, None).await;
+    record_admin_audit(
+        state.audit.db(),
+        &admin.subject,
+        "delete_policy",
+        &name,
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -764,6 +839,7 @@ async fn list_devices(
 
 async fn revoke_device(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path(fingerprint): Path<String>,
 ) -> HandlerResult<StatusCode> {
     let revoked = state
@@ -779,7 +855,7 @@ async fn revoke_device(
     }
     record_admin_audit(
         state.audit.db(),
-        "admin",
+        &admin.subject,
         "revoke_device",
         &fingerprint,
         None,
@@ -790,6 +866,7 @@ async fn revoke_device(
 
 async fn reinstate_device(
     State(state): State<AdminState>,
+    admin: AdminIdentity,
     Path(fingerprint): Path<String>,
 ) -> HandlerResult<StatusCode> {
     let reinstated = state
@@ -805,7 +882,7 @@ async fn reinstate_device(
     }
     record_admin_audit(
         state.audit.db(),
-        "admin",
+        &admin.subject,
         "reinstate_device",
         &fingerprint,
         None,
@@ -823,25 +900,31 @@ pub struct AuditQuery {
     pub subject: Option<String>,
     /// Maximum number of entries to return (default 100, max 1000).
     pub limit: Option<u32>,
+    /// Number of newest entries to skip (default 0).
+    pub offset: Option<u32>,
 }
 
 async fn query_audit(
     State(state): State<AdminState>,
     Query(params): Query<AuditQuery>,
 ) -> HandlerResult<axum::Json<serde_json::Value>> {
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    let limit = params.limit.unwrap_or(100).min(1000) as usize;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+    let limit = params.limit.unwrap_or(100).min(1000) as u64;
+    let offset = u64::from(params.offset.unwrap_or(0));
     let mut query = crate::entity::audit_log::Entity::find();
     if let Some(subject) = params.subject {
         query = query.filter(crate::entity::audit_log::Column::UserSubject.eq(subject));
     }
     let entries = query
+        .order_by_desc(crate::entity::audit_log::Column::CreatedAt)
+        .order_by_desc(crate::entity::audit_log::Column::Id)
+        .limit(limit)
+        .offset(offset)
         .all(state.audit.db())
         .await
         .map_err(|e| internal_error(Error::Database(format!("query audit: {e}"))))?;
-    let limited: Vec<_> = entries.into_iter().take(limit).collect();
     // Serialize manually since the entity model doesn't derive Serialize.
-    let serialized: Vec<serde_json::Value> = limited
+    let serialized: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
             serde_json::json!({
@@ -959,23 +1042,33 @@ async fn get_quota(
     State(state): State<AdminState>,
     Path(subject): Path<String>,
 ) -> HandlerResult<axum::Json<QuotaResponse>> {
-    // Get current usage.
+    // Get current usage (including the groups snapshot recorded with it).
     let usage = state
         .usage_tracker
         .get_usage(&subject)
         .await
         .map_err(internal_error)?;
 
-    // Resolve the user's policy. We don't have the user's groups here (the
-    // admin API doesn't receive relay-forwarded groups for the *target*
-    // user), so we return the quotas as None unless we can look them up.
-    // A future enhancement could store the user's groups in the usage_counters
-    // table. For now, return the usage counts and let the admin cross-reference.
+    // Parse the groups snapshot and resolve the effective policy so the
+    // admin sees the same quotas the permissions middleware enforces.
+    // Without a usage row (user has not made a request today) the groups
+    // are unknown, so the quotas are reported as unset.
+    let groups: Vec<String> = usage
+        .as_ref()
+        .and_then(|u| u.group_name.as_deref())
+        .and_then(|g| serde_json::from_str(g).ok())
+        .unwrap_or_default();
+    let policy = state
+        .policy_store
+        .resolve_policy(&groups)
+        .await
+        .map_err(internal_error)?;
+
     Ok(axum::Json(QuotaResponse {
-        user_subject: subject.clone(),
-        groups: None,
-        daily_request_quota: None,
-        daily_token_quota: None,
+        user_subject: subject,
+        groups: usage.as_ref().and_then(|u| u.group_name.clone()),
+        daily_request_quota: policy.daily_request_quota,
+        daily_token_quota: policy.daily_token_quota,
         request_count: usage.as_ref().map(|u| u.request_count).unwrap_or(0),
         token_count: usage.as_ref().map(|u| u.token_count).unwrap_or(0),
         cost_usd: usage.as_ref().map(|u| u.cost_usd).unwrap_or(0.0),
@@ -1091,6 +1184,63 @@ mod tests {
         assert_eq!(entries[0].target, "target");
     }
 
+    #[tokio::test]
+    async fn admin_audit_records_caller_identity_via_middleware() {
+        use sea_orm::EntityTrait;
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        let app = router(state.clone());
+
+        // Upsert a policy as alice (member of the admin group).
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::PUT)
+            .uri("/admin/v1/group-policies/engineering")
+            .header("content-type", "application/json")
+            .header("x-oac-user-subject", "alice")
+            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .body(axum::body::Body::from(
+                r#"{"allowed_models": ["gpt-4o"]}"#.to_string(),
+            ))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        // The admin audit entry must be attributed to alice, not "admin".
+        let entries = crate::entity::admin_audit_log::Entity::find()
+            .all(state.audit.db())
+            .await
+            .expect("load");
+        assert_eq!(entries.len(), 1, "one audit entry expected");
+        assert_eq!(
+            entries[0].admin_subject, "alice",
+            "audit entries must record the verified admin subject"
+        );
+        assert_eq!(entries[0].action, "upsert_policy");
+    }
+
+    #[tokio::test]
+    async fn admin_middleware_rejects_non_admin_group() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        let app = router(state);
+
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/admin/v1/group-policies")
+            .header("x-oac-user-subject", "mallory")
+            .header("x-oac-user-groups", r#"["engineering"]"#)
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "non-admin group must be rejected"
+        );
+    }
+
     #[test]
     fn validate_admin_config_rejects_empty_group() {
         let config = AdminConfig {
@@ -1105,5 +1255,172 @@ mod tests {
             admin_group: "oac-admins".into(),
         };
         assert!(validate_admin_config(&config).is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_quota_resolves_policy_from_groups_snapshot() {
+        let state = setup_test_state().await;
+        // Give engineering a token quota and a request quota.
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(5000), Some(100))
+            .await
+            .expect("policy");
+        // Record usage with a groups snapshot (JSON array string).
+        state
+            .usage_tracker
+            .increment("quota-target", Some(r#"["engineering"]"#), 3, 750, 0.02)
+            .await
+            .expect("usage");
+
+        // Call the handler directly (the admin auth middleware is not
+        // under test here).
+        let axum::Json(response) = get_quota(State(state), Path("quota-target".to_string()))
+            .await
+            .expect("handler");
+        assert_eq!(response.user_subject, "quota-target");
+        assert_eq!(
+            response.groups.as_deref(),
+            Some(r#"["engineering"]"#),
+            "the groups snapshot must be reported"
+        );
+        assert_eq!(
+            response.daily_token_quota,
+            Some(5000),
+            "quotas must be resolved from the groups snapshot"
+        );
+        assert_eq!(response.daily_request_quota, Some(100));
+        assert_eq!(response.request_count, 3);
+        assert_eq!(response.token_count, 750);
+    }
+
+    #[tokio::test]
+    async fn get_quota_without_usage_returns_unset_quotas() {
+        let state = setup_test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(5000), None)
+            .await
+            .expect("policy");
+
+        // No usage row for this subject — groups unknown.
+        let axum::Json(response) = get_quota(State(state), Path("no-usage".to_string()))
+            .await
+            .expect("handler");
+        assert_eq!(response.groups, None);
+        assert_eq!(response.daily_token_quota, None);
+        assert_eq!(response.daily_request_quota, None);
+        assert_eq!(response.request_count, 0);
+        assert_eq!(response.token_count, 0);
+    }
+
+    #[tokio::test]
+    async fn quota_route_requires_admin_and_returns_resolved_status() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(5000), Some(100))
+            .await
+            .expect("policy");
+        state
+            .usage_tracker
+            .increment("route-target", Some(r#"["engineering"]"#), 4, 900, 0.25)
+            .await
+            .expect("usage");
+
+        let app = router(state.clone());
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/admin/v1/quotas/route-target")
+            .header("x-oac-user-subject", "admin-user")
+            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read body");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("JSON body");
+        assert_eq!(body["user_subject"], "route-target");
+        assert_eq!(body["groups"], r#"["engineering"]"#);
+        assert_eq!(body["daily_request_quota"], 100);
+        assert_eq!(body["daily_token_quota"], 5000);
+        assert_eq!(body["request_count"], 4);
+        assert_eq!(body["token_count"], 900);
+        assert_eq!(body["cost_usd"], 0.25);
+
+        let app = router(state);
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/admin/v1/quotas/route-target")
+            .header("x-oac-user-subject", "ordinary-user")
+            .header("x-oac-user-groups", r#"["engineering"]"#)
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn audit_query_applies_limit_and_offset_in_database() {
+        use crate::audit::AuditEntry;
+
+        let state = setup_test_state().await;
+        for subject in ["audit-a", "audit-b", "audit-c"] {
+            state
+                .audit
+                .record(&AuditEntry {
+                    device_id: "device".into(),
+                    user_subject: subject.into(),
+                    model: None,
+                    backend: "provider".into(),
+                    status: 200,
+                    latency_ms: 1,
+                    stream: false,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    total_tokens: None,
+                    identity_id: None,
+                    email: None,
+                    groups: None,
+                    endpoint: Some("/v1/models".into()),
+                    request_id: None,
+                    permission_decision: Some("allowed".into()),
+                    denial_reason: None,
+                    cost_usd: Some(0.0),
+                })
+                .await
+                .expect("record audit entry");
+        }
+
+        let axum::Json(page) = query_audit(
+            State(state.clone()),
+            Query(AuditQuery {
+                subject: None,
+                limit: Some(2),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .expect("first page");
+        let first_page = page.as_array().expect("array");
+        assert_eq!(first_page.len(), 2);
+
+        let axum::Json(next_page) = query_audit(
+            State(state),
+            Query(AuditQuery {
+                subject: None,
+                limit: Some(2),
+                offset: Some(2),
+            }),
+        )
+        .await
+        .expect("second page");
+        let next_page = next_page.as_array().expect("array");
+        assert_eq!(next_page.len(), 1);
+        assert_ne!(first_page[0]["id"], next_page[0]["id"]);
     }
 }

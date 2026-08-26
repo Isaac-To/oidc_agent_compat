@@ -75,6 +75,9 @@ oac-relay list-keys --config config.toml
 
 Output columns: `id`, `label`, `created_at`, `last_used_at` (or `"never"`).
 
+OIDC-login keys expire after `session_ttl_hours` (24 hours by default). An
+expired key is rejected with a `session_expired` response; run `login` again.
+
 #### `revoke-key`
 
 Revoke a single key by ID.
@@ -82,6 +85,18 @@ Revoke a single key by ID.
 ```sh
 oac-relay revoke-key <KEY_ID> --config config.toml
 ```
+
+#### `activity`
+
+Show recent relay request activity from the append-only local activity log.
+
+```sh
+oac-relay activity --limit 20 --config config.toml
+```
+
+Entries are displayed newest first. `--limit` defaults to `20` and is capped
+at `1000`. The output contains request metadata only; API keys and provider
+key material are never printed.
 
 ---
 
@@ -165,7 +180,7 @@ oac-central admin --key <KEY> [--url <URL>] <SUBCOMMAND>
 | `device-list` | — | List all registered devices |
 | `device-revoke <fingerprint>` | `fingerprint` (positional) | Revoke a device |
 | `device-reinstate <fingerprint>` | `fingerprint` (positional) | Reinstate a revoked device |
-| `audit-query` | `--subject <STRING>`, `--limit <U32>` (default 100) | Query the audit log |
+| `audit-query` | `--subject <STRING>`, `--limit <U32>` (default 100), `--offset <U32>` (default 0) | Query the newest-first audit log page |
 | `usage-query` | `--subject <STRING>` (optional) | Query usage counters |
 | `quota-get <subject>` | `subject` (positional) | Get quota status for a user |
 

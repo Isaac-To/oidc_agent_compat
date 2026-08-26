@@ -24,21 +24,23 @@ production deployment walkthrough, or try the bundled dev stack via
 
 ```
 Agent → [127.0.0.1 relay] → mTLS → [central proxy] → [OpenAI-compatible backend]
-                                   ↑ master key (secret manager)
+                                   ↑ encrypted provider keys (central DB)
 ```
 
-- **Central proxy** (company-hosted) — holds the master backend key in a
-  secret store, authenticates employees via OIDC, forwards approved
-  requests to the AI backend with SSE streaming.
+- **Central proxy** (company-hosted) — manages encrypted provider keys,
+  authenticates employees via OIDC, enforces policy and quotas, and forwards
+  approved requests to the AI backend with SSE streaming.
 - **Laptop relay** (thin, per-employee) — listens on `127.0.0.1`,
   authenticates the employee via OIDC, relays agent traffic to the central
   proxy over mTLS. Holds **no master key**.
 
 ## Status
 
-🚧 **Under development.** This documentation covers only implemented
-features. Items not yet built (Vault/AWS/GCP/Azure secret stores, refresh
-token handling) are intentionally omitted to avoid misleading readers.
+🚧 **Under development.** This documentation covers the implemented
+features. OIDC refresh tokens are intentionally not stored; local relay
+sessions expire after 24 hours by default and require re-login. External KMS
+backends for the provider encryption key and distributed Redis rate limiting
+remain deployment-specific future work.
 
 ## API type reference
 

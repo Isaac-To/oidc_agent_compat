@@ -17,7 +17,7 @@ use oac_relay::keystore::KeyStore;
 use oac_relay::proxy;
 
 /// Sets up a test relay with a mock central proxy.
-async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String) {
+async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String, KeyStore) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -40,7 +40,10 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String) {
         .upsert_identity("https://idp.example.com", "user123", None, None, None)
         .await
         .expect("identity");
-    let minted = key_store.mint_key(&ident.id, "test").await.expect("mint");
+    let minted = key_store
+        .mint_key(&ident.id, "test", None)
+        .await
+        .expect("mint");
     let key = minted.plaintext.to_string();
 
     // Set up a mock central proxy.
@@ -81,6 +84,7 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String) {
             client_key_path: "/client.key".into(),
         },
         dev_mode: true,
+        session_ttl_hours: None,
     };
 
     let client = proxy::forward::build_client(&config).expect("client");
@@ -100,12 +104,12 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String) {
         let _ = axum::serve(relay_listener, app).await;
     });
 
-    (relay_addr, reqwest::Client::new(), key)
+    (relay_addr, reqwest::Client::new(), key, key_store)
 }
 
 #[tokio::test]
 async fn healthz_returns_ok() {
-    let (addr, client, _) = setup_test_relay().await;
+    let (addr, client, _, _) = setup_test_relay().await;
     let url = format!("http://127.0.0.1:{}/healthz", addr.port());
     let resp = client.get(&url).send().await.expect("request");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
@@ -113,7 +117,7 @@ async fn healthz_returns_ok() {
 
 #[tokio::test]
 async fn rejects_request_without_authorization() {
-    let (addr, client, _) = setup_test_relay().await;
+    let (addr, client, _, _) = setup_test_relay().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client.get(&url).send().await.expect("request");
     assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
@@ -121,7 +125,7 @@ async fn rejects_request_without_authorization() {
 
 #[tokio::test]
 async fn rejects_request_with_invalid_key() {
-    let (addr, client, _) = setup_test_relay().await;
+    let (addr, client, _, _) = setup_test_relay().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client
         .get(&url)
@@ -133,8 +137,63 @@ async fn rejects_request_with_invalid_key() {
 }
 
 #[tokio::test]
+async fn expired_session_returns_relogin_error_and_removes_key() {
+    let (addr, client, _, key_store) = setup_test_relay().await;
+    let identity = key_store
+        .upsert_identity("https://idp.example.com", "expired-user", None, None, None)
+        .await
+        .expect("identity");
+    let expires_at = oidc_agent_common::time_util::now_utc() - time::Duration::minutes(1);
+    let minted = key_store
+        .mint_key(&identity.id, "expired", Some(expires_at))
+        .await
+        .expect("expired key");
+    let expired_key = minted.plaintext.to_string();
+
+    let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
+    let response = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {expired_key}"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body: serde_json::Value = response.json().await.expect("JSON error body");
+    assert_eq!(body["error"]["type"], "session_expired");
+    assert_eq!(
+        body["error"]["message"],
+        "session expired; run `oac-relay login` to re-authenticate"
+    );
+
+    // The middleware's first verification must delete the stale row, so a
+    // replay is indistinguishable from an unknown credential.
+    let replay = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {expired_key}"))
+        .send()
+        .await
+        .expect("replay request");
+    assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let remaining = key_store
+        .verify_key(&expired_key)
+        .await
+        .expect("replay verification");
+    assert!(matches!(
+        remaining,
+        oac_relay::keystore::KeyVerification::Invalid
+    ));
+}
+
+#[tokio::test]
 async fn rejects_non_loopback_host() {
-    let (addr, client, _) = setup_test_relay().await;
+    let (addr, client, _, _) = setup_test_relay().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client
         .get(&url)
@@ -147,7 +206,7 @@ async fn rejects_non_loopback_host() {
 
 #[tokio::test]
 async fn forwards_get_request_with_valid_key() {
-    let (addr, client, key) = setup_test_relay().await;
+    let (addr, client, key, _) = setup_test_relay().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client
         .get(&url)
@@ -162,7 +221,7 @@ async fn forwards_get_request_with_valid_key() {
 
 #[tokio::test]
 async fn forwards_post_request_with_valid_key() {
-    let (addr, client, key) = setup_test_relay().await;
+    let (addr, client, key, _) = setup_test_relay().await;
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
     let body = serde_json::json!({
         "model": "gpt-4",

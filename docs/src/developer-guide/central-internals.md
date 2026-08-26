@@ -9,8 +9,8 @@ documents the internal architecture. For full type signatures, run
 Entry point: `oac-central [OPTIONS] [COMMAND]`.
 
 - `serve` (default) — starts the proxy.
-- `set-backend-key` — prompts for and stores the master key.
-- `admin` — admin CLI (sends requests through the relay).
+- `admin` — manages runtime providers, provider keys, policies, devices, and
+   audit data through the relay.
 
 See [CLI Reference](../user-guide/cli-reference.md) for the user-facing
 command docs.
@@ -22,7 +22,7 @@ command docs.
 ```rust
 pub struct AppState {
     pub config: CentralConfig,
-    pub master_key: Arc<Zeroizing<String>>,
+   pub provider_store: ProviderStore,
     pub client: reqwest::Client,
     pub audit: AuditLogger,
     pub rate_limiter: Option<RateLimiter>,
@@ -36,11 +36,12 @@ pub struct AppState {
 ### `serve()`
 
 - Opens the database (runs migrations).
-- Loads the master key from the secret store into `Zeroizing` memory.
+- Loads the provider encryption key and opens the `ProviderStore`; provider
+   API keys are decrypted into `Zeroizing` memory only for upstream requests.
 - Builds the `reqwest::Client` via `forward::build_client()`.
 - Creates `PolicyStore`, `DeviceStore`, `UsageTracker`, `PriceTable`.
-- If `[pricing]` is configured, auto-fetches prices from the backend
-  (best-effort) and spawns a periodic refresh task.
+- If `[pricing]` is configured with a non-zero interval, refreshes model
+   prices from each enabled provider (best-effort).
 - Binds:
   - **Dev mode**: plain HTTP via `axum::serve` + `TcpListener`.
   - **Production**: mTLS via `axum_server::bind_rustls` with
@@ -140,17 +141,19 @@ Denials also write an `AuditEntry` with
    - Reads body (max `MAX_BODY_SIZE`).
    - Extracts model.
    - Sanitizes path.
-   - Builds upstream URL: `{backend.base_url}{sanitized_path}`.
+   - Builds upstream URL: `{provider.base_url}{sanitized_path}`.
    - Builds forward headers (strips hop-by-hop).
-   - **Replaces** `Authorization` with `Bearer {master_key}`.
+   - **Replaces** `Authorization` with the selected provider key.
    - Sends request.
 3. If non-streaming: buffers response, extracts token usage from `usage`
    JSON field.
 4. If SSE: passes through as raw byte stream, wraps with
    `wrap_stream_with_usage_extraction` to intercept `data:` lines and
    extract `usage` from the final chunk.
-5. Computes cost via `PriceTable::compute_cost`.
-6. Records `AuditEntry` (best-effort).
+5. Computes cost via `PriceTable::compute_cost`; enabled providers are
+   refreshed periodically when configured.
+6. Records `AuditEntry` (best-effort) and increments daily usage. For SSE,
+   audit and usage accounting are deferred until the stream completes.
 7. Increments usage counters (best-effort, allowed requests only).
 8. On error: `502 Bad Gateway`.
 
@@ -196,24 +199,18 @@ pub struct DeviceStore { db: DatabaseConnection }
 Enforcement: checked in `permissions_middleware` using `identity_id`
 (or `subject` as fallback) as the device ID.
 
-## Secret store (`secrets.rs`)
+## Provider store (`provider.rs`)
 
-```rust
-#[async_trait]
-pub trait SecretStore: Send + Sync {
-    async fn load_master_key(&self) -> Result<Zeroizing<String>>;
-    async fn store_master_key(&self, key: &str) -> Result<()>;
-}
-```
+`ProviderStore` manages providers and their API keys at runtime through the
+admin API. Provider metadata and AES-256-GCM ciphertexts are stored in the
+central database; plaintext keys are decrypted into `Zeroizing<String>` only
+when selecting an upstream request key. The 32-byte encryption key is loaded
+from `OAC_PROVIDER_ENCRYPTION_KEY` or `/run/secrets/provider-encryption-key`.
 
-`FileSecretStore`:
-
-- `load_master_key()` — enforces `0600` on Unix, reads into
-  `Zeroizing<String>`, trims whitespace, rejects empty.
-- `store_master_key(key)` — writes to file, sets `0600` on Unix.
-
-`from_config(config)` — returns `Box<FileSecretStore>` for `File` kind;
-errors for Vault/Aws/Gcp/Azure ("not yet implemented").
+Each provider can have multiple priority-ordered keys with optional group
+access rules. A failed upstream `401` or `429` causes the proxy to try the
+next authorized key. Manual prices remain overrides while enabled providers'
+`/v1/models` catalogs can be refreshed periodically.
 
 ## Audit logger (`audit.rs`)
 

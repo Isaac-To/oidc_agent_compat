@@ -44,7 +44,7 @@ proxy (in-process, `dev_mode=true`). Mints a key for identity `user123`.
 
 ## Central integration tests (`crates/central/tests/proxy_integration.rs`)
 
-10 tests across three modes:
+11 tests across three modes:
 
 ### Dev mode tests
 
@@ -57,6 +57,7 @@ proxy (in-process, `dev_mode=true`). Mints a key for identity `user123`.
 | `forwards_get_request_to_backend` | GET `/v1/models` | 200, `data` array |
 | `forwards_post_request_with_master_key` | POST `/v1/chat/completions` | 200, `choices`, `usage.total_tokens == 15` |
 | `master_key_not_in_response_body` | POST, check body | must NOT contain `sk-test-master-key-12345` |
+| `streaming_response_records_token_usage_after_stream_completes` | SSE POST, consume stream | usage is recorded and `include_usage` reaches backend |
 
 ### Production mode tests
 

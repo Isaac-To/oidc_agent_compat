@@ -9,7 +9,7 @@ callback — neither works reliably from inside a container).
 
 ```
 Agent → 127.0.0.1 relay (native binary, laptop) → mTLS → central (container) → OpenAI-compatible backend
-                                                       ↑ master key (secret)
+                                                       ↑ encrypted provider keys (central DB)
 ```
 
 | Component | Where it runs | How it's deployed |
@@ -173,13 +173,18 @@ oac-relay --config ~/.oac/relay.toml serve
 The agent points at `http://127.0.0.1:8787` with the minted API key. The
 relay forwards over mTLS to the central proxy.
 
-## Secret store backends
+## Provider-key encryption
 
-Only `kind = "file"` is implemented. For production with a managed secret
-store (Vault, AWS Secrets Manager, GCP Secret Manager, Azure Key Vault),
-the `SecretStore` trait is extensible but those backends are not yet built.
-See [Developer Guide: Conventions](../developer-guide/conventions.md) for
-the trait design.
+Providers and their API keys are managed at runtime through the admin API.
+Provider API keys are encrypted at rest in the central database with
+AES-256-GCM. Supply the 64-hex-character encryption key through the Docker
+secret `provider-encryption-key` (mounted at
+`/run/secrets/provider-encryption-key`) or through
+`OAC_PROVIDER_ENCRYPTION_KEY`. Back up this encryption key securely: losing it
+makes stored provider keys unrecoverable.
+
+The relay never receives provider-key material. See [Configuration](configuration.md)
+and [Admin API](admin-api.md) for provider and key management.
 
 ## Production security checklist
 

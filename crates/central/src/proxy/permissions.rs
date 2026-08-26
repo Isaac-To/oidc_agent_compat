@@ -6,12 +6,14 @@
 //! 1. Extracts the `VerifiedRelayIdentity` from request extensions.
 //! 2. Parses the user's groups (JSON array string).
 //! 3. Resolves the effective policy via [`PolicyStore::resolve_policy`].
-//! 4. Extracts the requested model from the request body.
-//! 5. Checks the model against the policy's allowlist.
-//! 6. Checks the endpoint against the policy's allowlist.
-//! 7. On denial, writes an audit entry with `permission_decision="denied"`
-//!    and returns `403 Forbidden`.
-//! 8. On allow, inserts a `PermissionDecision` into extensions for the
+//! 4. Checks device revocation and auto-registers the device.
+//! 5. Checks the endpoint against the policy's allowlist.
+//! 6. Checks the model against the policy's allowlist.
+//! 7. Checks the daily request and token quotas against the accumulated
+//!    usage counters (pre-flight; a single request may overshoot).
+//! 8. On denial, writes an audit entry with `permission_decision="denied"`
+//!    and returns `403 Forbidden` (or `429 Too Many Requests` for quotas).
+//! 9. On allow, inserts a `PermissionDecision` into extensions for the
 //!    forward handler to log.
 //!
 //! # Dev mode
@@ -38,6 +40,9 @@ pub struct PermissionDecision {
     pub decision: String,
     /// The reason for denial (set when `decision == "denied"`).
     pub reason: Option<String>,
+    /// Whether this request consumed an atomic request-quota reservation.
+    /// The forward handler uses this to avoid counting the request twice.
+    pub request_reserved: bool,
 }
 
 /// The permissions middleware.
@@ -89,30 +94,42 @@ pub async fn permissions_middleware(
         }
     };
 
-    // Check device revocation. In production (mTLS), the device is identified
-    // by its client cert fingerprint. In dev mode, we use the identity_id as a
-    // proxy device identifier. If the device is revoked, deny with 403.
-    if let Some(device_id) = identity
+    // Check device revocation and auto-register the device. The device is
+    // identified by the relay-side identity (identity_id, falling back to
+    // the subject). In production (mTLS) the transport layer has already
+    // authenticated the relay's client certificate; the identity header
+    // (set by the relay, unspoofable over mTLS) identifies the user/device.
+    // Auto-registration keeps `devices` populated so admins can revoke;
+    // `last_seen_at` is refreshed on every request.
+    let device_id = identity
         .identity_id
-        .as_deref()
-        .or(Some(identity.subject.as_str()))
-    {
-        match state.device_store.is_revoked(device_id).await {
-            Ok(Some(true)) => {
-                return deny(
-                    &state,
-                    &identity,
-                    &endpoint,
-                    None,
-                    "device_revoked",
-                    StatusCode::FORBIDDEN,
-                )
-                .await;
+        .clone()
+        .unwrap_or_else(|| identity.subject.clone());
+    match state.device_store.is_revoked(&device_id).await {
+        Ok(Some(true)) => {
+            return deny(
+                &state,
+                &identity,
+                &endpoint,
+                None,
+                "device_revoked",
+                StatusCode::FORBIDDEN,
+            )
+            .await;
+        }
+        Ok(Some(false)) | Ok(None) => {
+            // Not revoked (or not yet registered) — register/refresh.
+            if let Err(e) = state
+                .device_store
+                .upsert_device(&device_id, &identity.subject, identity.email.as_deref())
+                .await
+            {
+                // Best-effort: a failure to register must not block traffic.
+                tracing::warn!(error = %e, "failed to upsert device registration");
             }
-            Ok(Some(false)) | Ok(None) => {} // not revoked or not registered
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to check device revocation; allowing");
-            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to check device revocation; allowing");
         }
     }
 
@@ -160,26 +177,59 @@ pub async fn permissions_middleware(
         request = Request::from_parts(parts, Body::from(body_bytes));
     }
 
-    // Check request-count quota (pre-flight). Token quotas are enforced
-    // post-hoc since streaming usage is only known after completion.
-    if let Some(daily_request_quota) = policy.daily_request_quota {
+    // Check daily quotas (pre-flight). Usage counters accumulate as
+    // requests complete, so a single request may overshoot its token quota
+    // by up to one request's worth of tokens — the next request is denied.
+    let mut request_reserved = false;
+    if policy.daily_token_quota.is_some() {
         match state.usage_tracker.get_usage(&identity.subject).await {
             Ok(Some(usage)) => {
-                if usage.request_count >= daily_request_quota {
-                    return deny(
-                        &state,
-                        &identity,
-                        &endpoint,
-                        None,
-                        "quota_exceeded",
-                        StatusCode::TOO_MANY_REQUESTS,
-                    )
-                    .await;
+                if let Some(daily_token_quota) = policy.daily_token_quota {
+                    if usage.token_count >= daily_token_quota {
+                        return deny(
+                            &state,
+                            &identity,
+                            &endpoint,
+                            None,
+                            "token_quota_exceeded",
+                            StatusCode::TOO_MANY_REQUESTS,
+                        )
+                        .await;
+                    }
                 }
             }
-            Ok(None) => {} // no usage yet
+            Ok(None) => {}
             Err(e) => {
-                tracing::warn!(error = %e, "failed to check usage; allowing");
+                tracing::warn!(error = %e, "failed to check token usage; allowing");
+            }
+        }
+    }
+    if let Some(daily_request_quota) = policy.daily_request_quota {
+        match state
+            .usage_tracker
+            .try_reserve_request(
+                &identity.subject,
+                identity.groups.as_deref(),
+                daily_request_quota,
+            )
+            .await
+        {
+            Ok(true) => request_reserved = true,
+            Ok(false) => {
+                return deny(
+                    &state,
+                    &identity,
+                    &endpoint,
+                    None,
+                    "quota_exceeded",
+                    StatusCode::TOO_MANY_REQUESTS,
+                )
+                .await;
+            }
+            Err(e) => {
+                // Preserve the existing fail-open behavior for database
+                // outages, but make the failure visible to operators.
+                tracing::warn!(error = %e, "failed to reserve request quota; allowing");
             }
         }
     }
@@ -189,6 +239,7 @@ pub async fn permissions_middleware(
     request.extensions_mut().insert(PermissionDecision {
         decision: "allowed".into(),
         reason: None,
+        request_reserved,
     });
 
     Ok(next.run(request).await)
@@ -255,4 +306,444 @@ async fn deny(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::ProviderStore;
+    use crate::usage::UsageTracker;
+    use axum::Router;
+    use oidc_agent_common::identity;
+    use tower::ServiceExt;
+    use zeroize::Zeroizing;
+
+    async fn test_state() -> AppState {
+        let url = oidc_agent_common::persistence::temp_sqlite_url("perms");
+        let db = crate::db::setup(&url).await.expect("db setup");
+        let audit = crate::audit::AuditLogger::new(db.clone());
+        AppState {
+            config: oidc_agent_common::config::CentralConfig {
+                listen_addr: "127.0.0.1:0".parse().expect("addr"),
+                database_url: "sqlite://test.db".into(),
+                oidc: oidc_agent_common::config::OidcConfig {
+                    issuer: "https://idp.example.com".into(),
+                    client_id: "test".into(),
+                    client_secret_env: "TEST".into(),
+                    redirect_uri: "http://127.0.0.1:0/callback".into(),
+                    scopes: vec!["openid".into()],
+                },
+                mtls: oidc_agent_common::config::MtlsServerConfig {
+                    ca_cert_path: "/ca.pem".into(),
+                    server_cert_path: "/server.pem".into(),
+                    server_key_path: "/server.key".into(),
+                },
+                admin: None,
+                pricing: None,
+                dev_mode: true,
+                rate_limit_requests: 60,
+                rate_limit_window_secs: 60,
+            },
+            provider_store: ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32])),
+            client: reqwest::Client::new(),
+            audit,
+            rate_limiter: None,
+            policy_store: crate::policy::PolicyStore::new(db.clone()),
+            device_store: crate::device_store::DeviceStore::new(db.clone()),
+            usage_tracker: UsageTracker::new(db),
+            price_table: crate::pricing::PriceTable::empty(),
+        }
+    }
+
+    fn test_router(state: AppState) -> Router {
+        Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { "ok" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(())
+    }
+
+    fn chat_request(subject: &str, groups: &str) -> Request<Body> {
+        Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(identity::HEADER_USER_SUBJECT, subject)
+            .header(identity::HEADER_IDENTITY_ID, format!("{subject}-identity"))
+            .header(identity::HEADER_USER_GROUPS, groups)
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .expect("build request")
+    }
+
+    #[tokio::test]
+    async fn token_quota_denies_when_accumulated_usage_exceeds() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(500), None)
+            .await
+            .expect("policy");
+        // User already consumed 500 tokens today.
+        state
+            .usage_tracker
+            .increment("quota-user", None, 1, 500, 0.0)
+            .await
+            .expect("seed usage");
+
+        let response = test_router(state)
+            .oneshot(chat_request("quota-user", r#"["engineering"]"#))
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "accumulated tokens at the quota must deny with 429"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_quota_denial_has_precise_error_audit_and_no_side_effects() {
+        use sea_orm::EntityTrait;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(500), None)
+            .await
+            .expect("policy");
+        state
+            .usage_tracker
+            .increment("quota-user-audit", None, 1, 500, 0.125)
+            .await
+            .expect("seed usage");
+
+        let downstream_calls = Arc::new(AtomicUsize::new(0));
+        let calls = downstream_calls.clone();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        "must not run"
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(());
+
+        let response = app
+            .oneshot(chat_request("quota-user-audit", r#"["engineering"]"#))
+            .await
+            .expect("middleware run");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("read denial body");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body_bytes).expect("JSON denial body");
+        assert_eq!(body["error"]["type"], "permission_denied");
+        assert_eq!(
+            body["error"]["message"],
+            "access denied: token_quota_exceeded"
+        );
+        assert_eq!(downstream_calls.load(Ordering::SeqCst), 0);
+
+        let usage = state
+            .usage_tracker
+            .get_usage("quota-user-audit")
+            .await
+            .expect("usage")
+            .expect("seed usage remains");
+        assert_eq!(
+            usage.request_count, 1,
+            "denied request must not increment usage"
+        );
+        assert_eq!(usage.token_count, 500);
+
+        let audits = crate::entity::audit_log::Entity::find()
+            .all(state.audit.db())
+            .await
+            .expect("audit rows");
+        let denial = audits.last().expect("denial audit row");
+        assert_eq!(denial.status, 429);
+        assert_eq!(denial.permission_decision.as_deref(), Some("denied"));
+        assert_eq!(
+            denial.denial_reason.as_deref(),
+            Some("token_quota_exceeded")
+        );
+        assert_eq!(denial.user_subject, "quota-user-audit");
+    }
+
+    #[tokio::test]
+    async fn token_quota_allows_when_under_quota() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, Some(1000), None)
+            .await
+            .expect("policy");
+        state
+            .usage_tracker
+            .increment("quota-user-2", None, 1, 499, 0.0)
+            .await
+            .expect("seed usage");
+
+        let response = test_router(state)
+            .oneshot(chat_request("quota-user-2", r#"["engineering"]"#))
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "tokens under the quota must be allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_quota_unset_allows_any_usage() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, None, None)
+            .await
+            .expect("policy");
+        state
+            .usage_tracker
+            .increment("quota-user-3", None, 5, 1_000_000, 0.0)
+            .await
+            .expect("seed usage");
+
+        let response = test_router(state)
+            .oneshot(chat_request("quota-user-3", r#"["engineering"]"#))
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "no token quota configured means unlimited"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_quota_still_denies_when_exceeded() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, None, Some(1))
+            .await
+            .expect("policy");
+        state
+            .usage_tracker
+            .increment("quota-user-4", None, 1, 0, 0.0)
+            .await
+            .expect("seed usage");
+
+        let response = test_router(state)
+            .oneshot(chat_request("quota-user-4", r#"["engineering"]"#))
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "request-count quota must still be enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_cannot_oversubscribe_request_quota() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, None, Some(1))
+            .await
+            .expect("policy");
+        let usage_tracker = state.usage_tracker.clone();
+        let downstream_calls = Arc::new(AtomicUsize::new(0));
+        let calls = downstream_calls.clone();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        "allowed"
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(());
+
+        // All requests start concurrently. A read-then-forward implementation
+        // would let every request observe request_count=0 and reach the
+        // handler. The atomic reservation must admit exactly one.
+        let requests = (0..16).map(|_| chat_request("concurrent-user", r#"["engineering"]"#));
+        let responses =
+            futures::future::join_all(requests.map(|request| app.clone().oneshot(request))).await;
+        let responses = responses
+            .into_iter()
+            .map(|response| response.expect("middleware run"))
+            .collect::<Vec<_>>();
+
+        let allowed = responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::OK)
+            .count();
+        let denied = responses
+            .iter()
+            .filter(|response| response.status() == StatusCode::TOO_MANY_REQUESTS)
+            .count();
+        assert_eq!(allowed, 1, "exactly one request may reserve quota=1");
+        assert_eq!(denied, 15, "all concurrent excess requests must be denied");
+        assert_eq!(downstream_calls.load(Ordering::SeqCst), 1);
+
+        let usage = usage_tracker
+            .get_usage("concurrent-user")
+            .await
+            .expect("usage")
+            .expect("reservation row");
+        assert_eq!(
+            usage.request_count, 1,
+            "quota reservation must be counted once"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limited_request_does_not_consume_request_quota() {
+        let mut state = test_state().await;
+        state.config.dev_mode = false;
+        state.rate_limiter = Some(crate::proxy::rate_limit::RateLimiter::new(
+            1,
+            std::time::Duration::from_secs(3600),
+        ));
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, None, Some(2))
+            .await
+            .expect("policy");
+        let usage_tracker = state.usage_tracker.clone();
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { "allowed" }),
+            )
+            // This layer order matches proxy::router: rate limiting runs
+            // before permissions can reserve request quota.
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::proxy::rate_limit::rate_limit_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(());
+
+        let first = app
+            .clone()
+            .oneshot(chat_request("rate-user", r#"["engineering"]"#))
+            .await
+            .expect("first request");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // Same default client IP exhausts the token bucket. This request is
+        // rejected before permissions can reserve the second quota slot.
+        let second = app
+            .oneshot(chat_request("rate-user", r#"["engineering"]"#))
+            .await
+            .expect("second request");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let usage = usage_tracker
+            .get_usage("rate-user")
+            .await
+            .expect("usage")
+            .expect("first reservation");
+        assert_eq!(usage.request_count, 1);
+    }
+
+    #[tokio::test]
+    async fn device_auto_registers_on_first_request() {
+        let state = test_state().await;
+        let device_store = state.device_store.clone();
+
+        let response = test_router(state)
+            .oneshot(chat_request("device-user", r#"[]"#))
+            .await
+            .expect("middleware run");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let devices = device_store.list_devices().await.expect("list devices");
+        let device = devices
+            .iter()
+            .find(|d| d.cert_fingerprint == "device-user-identity")
+            .expect("device must be auto-registered keyed by identity_id");
+        assert_eq!(device.user_subject, "device-user");
+        assert!(!device.revoked);
+    }
+
+    #[tokio::test]
+    async fn revoked_device_is_denied() {
+        let state = test_state().await;
+        state
+            .device_store
+            .upsert_device("device-user-identity", "device-user", None)
+            .await
+            .expect("register");
+        state
+            .device_store
+            .revoke("device-user-identity")
+            .await
+            .expect("revoke");
+
+        let response = test_router(state)
+            .oneshot(chat_request("device-user", r#"[]"#))
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "a revoked device must be denied"
+        );
+    }
 }

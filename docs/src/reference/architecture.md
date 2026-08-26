@@ -8,7 +8,7 @@ Agent (Codex, Goose, etc.)
   ▼
 [127.0.0.1 relay]  ── mTLS (TLS 1.3) ──►  [central proxy]  ──►  [OpenAI-compatible backend]
   │                                        │
-  │ OIDC (browser, auth-code + PKCE)       │ master key (secret manager)
+  │ OIDC (browser, auth-code + PKCE)       │ encrypted provider keys
   ▼                                        │
 [Enterprise IdP]                           ▼
                                   [Audit log (append-only)]
@@ -20,9 +20,9 @@ Agent (Codex, Goose, etc.)
 |---|---|---|
 | Agent | Employee laptop | Sends OpenAI-compatible API requests to `127.0.0.1:8787/v1` |
 | Relay (`oac-relay`) | Employee laptop | Authenticates employee via OIDC, mints local key, forwards over mTLS |
-| Central proxy (`oac-central`) | Company-hosted server | Holds master key, enforces policies, forwards to backend |
+| Central proxy (`oac-central`) | Company-hosted server | Manages encrypted provider keys, enforces policies and quotas, forwards to backend |
 | IdP | Company infrastructure | Authenticates employees via OIDC auth-code + PKCE |
-| Backend | External | OpenAI-compatible API called with the master key |
+| Backend | External | OpenAI-compatible API called with a selected provider key |
 
 ## Trust boundaries
 
@@ -35,7 +35,7 @@ Agent (Codex, Goose, etc.)
 
 | Asset | Location | Sensitivity |
 |---|---|---|
-| Master backend key | Central secret manager → `Zeroizing` memory | **CRITICAL** — never on laptop |
+| Provider API keys | Central DB ciphertext → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop |
 | Local API keys (plaintext) | Agent config file (`0600`) | Medium — loopback-only, revocable |
 | Local API key hashes | Relay SQLite (`0600`) | Low — SHA-256 hashes |
 | OIDC ID tokens | In transit only (not stored in v1) | Medium — short-lived |

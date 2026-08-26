@@ -8,7 +8,7 @@ to get a working end-to-end setup.
 
 ```
 Goose (Docker) → relay (Docker, :8787) → central (Docker, :8443) → mock-backend (Docker, :8090)
-                                       ↑ master key (file, dev only)
+                                       ↑ encrypted provider key (dev secret)
                     ↑ OIDC (browser)
               Keycloak (Docker, :8080)
 ```
@@ -19,7 +19,7 @@ Goose (Docker) → relay (Docker, :8787) → central (Docker, :8443) → mock-ba
 |---|---|---|---|
 | Keycloak | `keycloak` | `localhost:8080` | OIDC IdP with pre-configured realm `oac-dev` |
 | Mock backend | `mock-backend` | `localhost:8090` | OpenAI-compatible Flask server |
-| Central proxy | `central` | `localhost:8443` | Holds the master key, forwards to mock-backend |
+| Central proxy | `central` | `localhost:8443` | Resolves the encrypted mock provider key, forwards to mock-backend |
 | Relay | `relay` | `127.0.0.1:8787` | Forwards to central; Goose connects here |
 | Goose | `goose` | — | AI agent (headless CLI, connects to relay) |
 

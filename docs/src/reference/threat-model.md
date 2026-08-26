@@ -15,7 +15,7 @@ Agent (Codex, etc.)
   ▼
 [127.0.0.1 relay]  ── mTLS (TLS 1.3) ──►  [central proxy]  ──►  [OpenAI-compatible backend]
   │                                        │
-  │ OIDC (browser, auth-code + PKCE)       │ master key (secret manager)
+  │ OIDC (browser, auth-code + PKCE)       │ encrypted provider keys
   ▼                                        │
 [Enterprise IdP]                           ▼
                                   [Audit log (append-only)]
@@ -32,7 +32,7 @@ Agent (Codex, etc.)
 
 | Asset | Location | Sensitivity |
 |---|---|---|
-| Master backend key | Central secret manager → `Zeroizing` memory | **CRITICAL** — never on laptop |
+| Provider API keys | Central DB ciphertext → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop |
 | Local API keys (plaintext) | Agent config file (`0600`) | Medium — loopback-only, revocable |
 | Local API key hashes | Relay SQLite (`0600`) | Low — SHA-256 hashes |
 | OIDC ID tokens | In transit only (not stored in v1) | Medium — short-lived |
@@ -105,11 +105,12 @@ Agent (Codex, etc.)
 | Attacker exploits `unsafe` code | `#![forbid(unsafe_code)]` across all crates | ✅ Implemented |
 | Authenticated user calls disallowed model | Permissions middleware enforces group-based model allowlists (403) | ✅ Implemented |
 | Authenticated user calls disallowed endpoint | Permissions middleware enforces group-based endpoint restrictions (403) | ✅ Implemented |
-| Authenticated user exceeds quota | Per-user daily request-count quota enforced pre-flight (429 `quota_exceeded`); token quotas tracked but not yet enforced | ⚠️ Partial (request quota enforced; token quota tracked only) |
+| Authenticated user exceeds quota | Per-user daily request and token quotas enforced pre-flight against accumulated daily usage (429) | ✅ Implemented (a request may overshoot by its own completed usage) |
 | Attacker spoofs group membership | Groups extracted from IdP-signed ID token / TLS-protected userinfo; forwarded over mTLS | ✅ Implemented |
 | Admin API accessed without authorization | Admin auth middleware checks IdP group membership (via relay-forwarded `x-oac-user-groups`); 403 if not in admin group | ✅ Implemented |
 | Admin API mutations go unlogged | All mutations recorded in append-only `admin_audit_log` | ✅ Implemented |
-| Revoked device continues to access | Device revocation checked in `permissions_middleware` (uses `identity_id` or `subject` as device ID) | ✅ Implemented |
+| Revoked device continues to access | Devices auto-register on first verified request; revocation checked in `permissions_middleware` (uses `identity_id` or `subject` as device ID) | ✅ Implemented |
+| Expired local session continues to access | OIDC-login API keys expire after `session_ttl_hours` (24 hours by default); expired rows are deleted | ✅ Implemented |
 
 ## Security standards compliance
 

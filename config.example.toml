@@ -40,6 +40,9 @@
 # # When true, allows requests without relay-forwarded identity headers
 # # (for dev/testing only). Defaults to false.
 # dev_mode = false
+# # Production per-client-IP token bucket. Defaults to 60 requests per 60s.
+# rate_limit_requests = 60
+# rate_limit_window_secs = 60
 #
 # [oidc]
 # issuer = "https://idp.example.com"

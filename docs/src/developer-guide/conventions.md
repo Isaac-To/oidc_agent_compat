@@ -44,7 +44,7 @@ pub enum Error {
     Reqwest(reqwest::Error),
     Crypto(String),
     Tls(String),
-    SecretStore(String),
+    // Provider-key encryption failures are represented as Crypto errors.
     Auth(String),
     Forbidden(String),
     Io(std::io::Error),
@@ -59,15 +59,15 @@ never use `anyhow`.
 ## Secrets
 
 - **Never literal in config**: the OIDC client secret is referenced by
-  env-var name (`client_secret_env`); the master key lives only in the
-  secret store.
-- **`Zeroizing` memory**: the master key is held in
+  env-var name (`client_secret_env`); provider API keys are managed through
+  the admin API and encrypted in the central database.
+- **`Zeroizing` memory**: provider keys are held in
   `zeroize::Zeroizing<String>`, which zeros memory on drop.
 - **Never logged**: the logging layer (`crates/common/src/logging.rs`)
   redacts sensitive fields (`authorization`, `api_key`, `client_secret`,
   `token`, `master_key`, etc.) to `[REDACTED]`.
-- **Never sent to a laptop**: the master key is only in the central
-  proxy's memory; the relay never sees it.
+- **Never sent to a laptop**: provider keys are only decrypted in central
+  proxy memory; the relay never sees them.
 
 ## Logging
 
@@ -90,7 +90,8 @@ On Unix, security-sensitive files must have `0600` permissions:
 - Agent config file (`~/.codex/config.json` or `~/.oac/agent-env.sh`) —
   enforced by `agent_config::inject`.
 - mTLS private key files — enforced by `mtls::enforce_secure_perms`.
-- Master key file (for `FileSecretStore`) — enforced at load time.
+- Provider encryption key source — `OAC_PROVIDER_ENCRYPTION_KEY` or the
+  Docker secret at `/run/secrets/provider-encryption-key`.
 
 ## HTTP forwarding
 
