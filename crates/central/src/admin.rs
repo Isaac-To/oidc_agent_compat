@@ -900,25 +900,31 @@ pub struct AuditQuery {
     pub subject: Option<String>,
     /// Maximum number of entries to return (default 100, max 1000).
     pub limit: Option<u32>,
+    /// Number of newest entries to skip (default 0).
+    pub offset: Option<u32>,
 }
 
 async fn query_audit(
     State(state): State<AdminState>,
     Query(params): Query<AuditQuery>,
 ) -> HandlerResult<axum::Json<serde_json::Value>> {
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    let limit = params.limit.unwrap_or(100).min(1000) as usize;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+    let limit = params.limit.unwrap_or(100).min(1000) as u64;
+    let offset = u64::from(params.offset.unwrap_or(0));
     let mut query = crate::entity::audit_log::Entity::find();
     if let Some(subject) = params.subject {
         query = query.filter(crate::entity::audit_log::Column::UserSubject.eq(subject));
     }
     let entries = query
+        .order_by_desc(crate::entity::audit_log::Column::CreatedAt)
+        .order_by_desc(crate::entity::audit_log::Column::Id)
+        .limit(limit)
+        .offset(offset)
         .all(state.audit.db())
         .await
         .map_err(|e| internal_error(Error::Database(format!("query audit: {e}"))))?;
-    let limited: Vec<_> = entries.into_iter().take(limit).collect();
     // Serialize manually since the entity model doesn't derive Serialize.
-    let serialized: Vec<serde_json::Value> = limited
+    let serialized: Vec<serde_json::Value> = entries
         .iter()
         .map(|e| {
             serde_json::json!({
@@ -1306,5 +1312,65 @@ mod tests {
         assert_eq!(response.daily_request_quota, None);
         assert_eq!(response.request_count, 0);
         assert_eq!(response.token_count, 0);
+    }
+
+    #[tokio::test]
+    async fn audit_query_applies_limit_and_offset_in_database() {
+        use crate::audit::AuditEntry;
+
+        let state = setup_test_state().await;
+        for subject in ["audit-a", "audit-b", "audit-c"] {
+            state
+                .audit
+                .record(&AuditEntry {
+                    device_id: "device".into(),
+                    user_subject: subject.into(),
+                    model: None,
+                    backend: "provider".into(),
+                    status: 200,
+                    latency_ms: 1,
+                    stream: false,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    total_tokens: None,
+                    identity_id: None,
+                    email: None,
+                    groups: None,
+                    endpoint: Some("/v1/models".into()),
+                    request_id: None,
+                    permission_decision: Some("allowed".into()),
+                    denial_reason: None,
+                    cost_usd: Some(0.0),
+                })
+                .await
+                .expect("record audit entry");
+        }
+
+        let axum::Json(page) = query_audit(
+            State(state.clone()),
+            Query(AuditQuery {
+                subject: None,
+                limit: Some(2),
+                offset: Some(0),
+            }),
+        )
+        .await
+        .expect("first page");
+        let first_page = page.as_array().expect("array");
+        assert_eq!(first_page.len(), 2);
+
+        let axum::Json(next_page) = query_audit(
+            State(state),
+            Query(AuditQuery {
+                subject: None,
+                limit: Some(2),
+                offset: Some(2),
+            }),
+        )
+        .await
+        .expect("second page");
+        let next_page = next_page.as_array().expect("array");
+        assert_eq!(next_page.len(), 1);
+        assert_ne!(first_page[0]["id"], next_page[0]["id"]);
     }
 }

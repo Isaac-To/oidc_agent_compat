@@ -80,6 +80,8 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
         admin: None,
         pricing: None,
         dev_mode: true,
+        rate_limit_requests: 60,
+        rate_limit_window_secs: 60,
     };
 
     let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
@@ -262,6 +264,8 @@ async fn streaming_response_records_token_usage_after_stream_completes() {
             admin: None,
             pricing: None,
             dev_mode: true,
+            rate_limit_requests: 60,
+            rate_limit_window_secs: 60,
         },
         provider_store,
         client: proxy::forward::build_client().expect("client"),
@@ -395,6 +399,8 @@ async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
         admin: None,
         pricing: None,
         dev_mode: false,
+        rate_limit_requests: 60,
+        rate_limit_window_secs: 60,
     };
 
     let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
@@ -620,6 +626,8 @@ async fn setup_mtls_central() -> SocketAddr {
         admin: None,
         pricing: None,
         dev_mode: false,
+        rate_limit_requests: 60,
+        rate_limit_window_secs: 60,
     };
 
     let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
@@ -882,6 +890,8 @@ async fn setup_multi_provider_central(
         admin: None,
         pricing: None,
         dev_mode: true,
+        rate_limit_requests: 60,
+        rate_limit_window_secs: 60,
     };
     let client = proxy::forward::build_client().expect("client");
     let state = proxy::AppState {
@@ -1114,6 +1124,8 @@ async fn key_falls_back_on_upstream_401() {
         admin: None,
         pricing: None,
         dev_mode: true,
+        rate_limit_requests: 60,
+        rate_limit_window_secs: 60,
     };
     let client = proxy::forward::build_client().expect("client");
     let state = proxy::AppState {
@@ -1195,6 +1207,8 @@ async fn no_provider_configured_returns_error_without_key_leak() {
         admin: None,
         pricing: None,
         dev_mode: true,
+        rate_limit_requests: 60,
+        rate_limit_window_secs: 60,
     };
     let client = proxy::forward::build_client().expect("client");
     let state = proxy::AppState {

@@ -321,6 +321,8 @@ mod tests {
                 admin: None,
                 pricing: None,
                 dev_mode: true,
+                rate_limit_requests: 60,
+                rate_limit_window_secs: 60,
             },
             provider_store: ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32])),
             client: reqwest::Client::new(),

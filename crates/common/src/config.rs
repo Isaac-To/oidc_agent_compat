@@ -89,6 +89,13 @@ pub struct CentralConfig {
     /// safety.
     #[serde(default)]
     pub dev_mode: bool,
+    /// Maximum requests per rate-limit window per client IP in production.
+    /// Defaults to 60.
+    #[serde(default = "default_rate_limit_requests")]
+    pub rate_limit_requests: u32,
+    /// Rate-limit window in seconds. Defaults to 60.
+    #[serde(default = "default_rate_limit_window_secs")]
+    pub rate_limit_window_secs: u64,
 }
 
 /// Admin API configuration.
@@ -126,6 +133,16 @@ pub struct PricingConfig {
 /// Default auto-fetch interval (1 hour).
 fn default_fetch_interval() -> u64 {
     3600
+}
+
+/// Default production requests per rate-limit window.
+fn default_rate_limit_requests() -> u32 {
+    60
+}
+
+/// Default production rate-limit window in seconds.
+fn default_rate_limit_window_secs() -> u64 {
+    60
 }
 
 /// A single model's pricing.
@@ -266,6 +283,16 @@ impl CentralConfig {
     /// Returns [`Error::Config`] if OIDC fields are invalid.
     pub fn validate(&self) -> Result<()> {
         validate_oidc(&self.oidc)?;
+        if self.rate_limit_requests == 0 {
+            return Err(Error::Config(
+                "rate_limit_requests must be greater than zero".into(),
+            ));
+        }
+        if self.rate_limit_window_secs == 0 {
+            return Err(Error::Config(
+                "rate_limit_window_secs must be greater than zero".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -373,6 +400,25 @@ server_key_path = "/server.key"
     fn central_config_parses_valid_toml() {
         let cfg = CentralConfig::from_toml(valid_central_toml()).expect("valid config");
         assert_eq!(cfg.database_url, "postgres://central");
+        assert_eq!(cfg.rate_limit_requests, 60);
+        assert_eq!(cfg.rate_limit_window_secs, 60);
+    }
+
+    #[test]
+    fn central_rejects_zero_rate_limit_settings() {
+        let toml = valid_central_toml().replace(
+            "database_url = \"postgres://central\"",
+            "database_url = \"postgres://central\"\nrate_limit_requests = 0",
+        );
+        let err = CentralConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("rate_limit_requests"), "{err}");
+
+        let toml = valid_central_toml().replace(
+            "database_url = \"postgres://central\"",
+            "database_url = \"postgres://central\"\nrate_limit_window_secs = 0",
+        );
+        let err = CentralConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("rate_limit_window_secs"), "{err}");
     }
 
     #[test]

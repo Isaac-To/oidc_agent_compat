@@ -103,6 +103,8 @@ async fn setup_full_system() -> (
         admin: None,
         pricing: None,
         dev_mode: true,
+        rate_limit_requests: 60,
+        rate_limit_window_secs: 60,
     };
 
     let provider_store =

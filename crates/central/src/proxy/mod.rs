@@ -143,8 +143,8 @@ pub async fn serve(
         None
     } else {
         Some(rate_limit::RateLimiter::new(
-            rate_limit::DEFAULT_RATE_LIMIT,
-            rate_limit::DEFAULT_WINDOW,
+            config.rate_limit_requests,
+            std::time::Duration::from_secs(config.rate_limit_window_secs),
         ))
     };
     let policy_store = PolicyStore::new(audit.db().clone());
