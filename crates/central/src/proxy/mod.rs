@@ -157,14 +157,27 @@ pub async fn serve(
         .map(PriceTable::from_config)
         .unwrap_or_else(PriceTable::empty);
 
-    // Provider-specific price refresh is not performed at startup because
-    // providers are runtime-managed. Manual pricing entries remain valid.
-    let fetch_interval = config
+    // Periodically auto-fetch model prices from each enabled provider's
+    // /v1/models endpoint (e.g. OpenRouter's pricing catalog). Manual
+    // pricing entries act as overrides and are never overwritten. An
+    // interval of 0 disables auto-fetch; each cycle re-lists providers so
+    // runtime-managed changes are picked up within one interval.
+    let fetch_interval_secs = config
         .pricing
         .as_ref()
         .map(|p| p.fetch_interval_secs)
-        .unwrap_or(3600);
-    let _ = fetch_interval;
+        .unwrap_or(0);
+    if fetch_interval_secs > 0 {
+        price_table.spawn_provider_price_refresh(
+            provider_store.clone(),
+            client.clone(),
+            std::time::Duration::from_secs(fetch_interval_secs),
+        );
+        tracing::debug!(
+            interval_secs = fetch_interval_secs,
+            "periodic provider price refresh enabled"
+        );
+    }
 
     let state = AppState {
         config: config.clone(),

@@ -138,6 +138,11 @@ impl PriceTable {
     /// them into the table. Fetched prices do **not** overwrite existing
     /// override entries — only models without a manual override are updated.
     ///
+    /// `bearer` is an optional provider API key; some backends only expose
+    /// `/v1/models` to authenticated callers, while others (e.g.
+    /// OpenRouter's public catalog) serve it unauthenticated. When a key is
+    /// supplied it is sent as a bearer token and never logged.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Http`] on network or parse failure.
@@ -145,10 +150,14 @@ impl PriceTable {
         &self,
         client: &reqwest::Client,
         base_url: &str,
+        bearer: Option<&str>,
     ) -> Result<usize> {
         let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-        let resp = client
-            .get(&url)
+        let mut request = client.get(&url);
+        if let Some(key) = bearer {
+            request = request.bearer_auth(key);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| Error::Http(format!("fetch pricing: {e}")))?;
@@ -196,26 +205,69 @@ impl PriceTable {
     /// Starts a background task that periodically refreshes fetched prices
     /// from the backend. Returns immediately; the task runs until the
     /// process exits.
-    pub fn spawn_refresh_task(
+    ///
+    /// Providers are runtime-managed rows, so each cycle re-lists the
+    /// enabled providers — newly added or reconfigured providers are picked
+    /// up automatically within one interval. For each provider, one
+    /// authorized key is resolved (best-effort, unrestricted keys first) and
+    /// used as the bearer token; providers whose keys are all group-
+    /// restricted are fetched unauthenticated, and backends that require
+    /// auth simply fail the fetch (logged at debug).
+    pub fn spawn_provider_price_refresh(
         &self,
+        provider_store: crate::provider::ProviderStore,
         client: reqwest::Client,
-        base_url: String,
         interval: std::time::Duration,
     ) {
         let table = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(interval).await;
-                match table.fetch_from_backend(&client, &base_url).await {
-                    Ok(count) => {
-                        if count > 0 {
-                            tracing::info!("refreshed {count} model prices from backend");
+                match provider_store.list_providers().await {
+                    Ok(providers) => {
+                        for provider in providers {
+                            if !provider.enabled {
+                                continue;
+                            }
+                            // Resolve one usable key (best-effort). Empty
+                            // groups match only unrestricted keys; that is
+                            // acceptable for price fetching since public
+                            // catalogs work unauthenticated too. The
+                            // decrypted key stays inside its Zeroizing
+                            // wrapper and is only borrowed for the request.
+                            let resolved = provider_store
+                                .resolve_key(&provider.id, &[], &std::collections::HashSet::new())
+                                .await
+                                .ok()
+                                .flatten();
+                            let bearer = resolved.as_ref().map(|k| k.secret.as_str());
+                            match table
+                                .fetch_from_backend(&client, &provider.base_url, bearer)
+                                .await
+                            {
+                                Ok(count) => {
+                                    if count > 0 {
+                                        tracing::info!(
+                                            provider = %provider.id,
+                                            count,
+                                            "refreshed model prices from provider"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!(
+                                        provider = %provider.id,
+                                        error = %e,
+                                        "failed to refresh model prices from provider"
+                                    );
+                                }
+                            }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to refresh model prices");
+                        tracing::warn!(error = %e, "failed to list providers for price refresh");
                     }
                 }
+                tokio::time::sleep(interval).await;
             }
         });
     }
@@ -466,5 +518,75 @@ mod tests {
             table.price_source("fetched-model").await,
             Some(PriceSource::Fetched)
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_from_backend_merges_prices_and_sends_bearer() {
+        use std::sync::{Arc, Mutex};
+
+        let auth_headers: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured = auth_headers.clone();
+
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let captured = captured.clone();
+                async move {
+                    if let Some(auth) = headers.get("authorization") {
+                        captured
+                            .lock()
+                            .expect("lock")
+                            .push(auth.to_str().unwrap_or_default().to_string());
+                    }
+                    axum::Json(serde_json::json!({
+                        "data": [
+                            {
+                                "id": "provider-model",
+                                "pricing": {"prompt": "0.000002", "completion": "0.000006"}
+                            }
+                        ]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let table = PriceTable::empty();
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{addr}");
+
+        // Unauthenticated fetch also works (public catalog).
+        let count = table
+            .fetch_from_backend(&client, &base_url, None)
+            .await
+            .expect("fetch");
+        assert_eq!(count, 1, "one priced model must be merged");
+
+        // Authenticated fetch sends the bearer token.
+        let count = table
+            .fetch_from_backend(&client, &base_url, Some("sk-provider-key"))
+            .await
+            .expect("fetch");
+        assert_eq!(count, 1, "re-fetching the same model still counts");
+        let headers = auth_headers.lock().expect("lock");
+        assert_eq!(
+            headers.last().map(String::as_str),
+            Some("Bearer sk-provider-key"),
+            "the resolved provider key must be sent as a bearer token"
+        );
+
+        // The fetched price must be usable for cost computation:
+        // per-token 0.000002 → per-1k 0.002; 1000 input + 1000 output
+        // = 0.002 + 0.006 = 0.008.
+        let cost = table
+            .compute_cost("provider-model", Some(1000), Some(1000))
+            .await;
+        assert!((cost - 0.008).abs() < 0.0001);
     }
 }
