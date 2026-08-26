@@ -177,6 +177,173 @@ async fn master_key_not_in_response_body() {
     );
 }
 
+// ─── Streaming usage accounting tests ──────────────────────────────────────
+
+#[tokio::test]
+async fn streaming_response_records_token_usage_after_stream_completes() {
+    use std::sync::{Arc, Mutex};
+
+    // Capture the request bodies received by the mock backend so the test
+    // can assert the include_usage injection reached the upstream.
+    let received: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    let mock_backend = Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |body: String| {
+            let captured = captured.clone();
+            async move {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) {
+                    captured.lock().expect("lock").push(value);
+                }
+                ([("content-type", "text/event-stream")], sse_body)
+            }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_backend).await;
+    });
+
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-central-stream-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let url = format!("sqlite://{}?mode=rwc", tmp.display());
+    let db = oac_central::db::setup(&url).await.expect("db setup");
+    let audit = AuditLogger::new(db);
+    let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&ProviderInput {
+            id: "mock".into(),
+            name: "mock".into(),
+            base_url: format!("http://{mock_addr}"),
+            enabled: true,
+            is_default: true,
+            models: Some(vec!["gpt-4".into()]),
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key("mock", "test-key", "sk-test-master-key-12345", 0, &[])
+        .await
+        .expect("provider key");
+
+    let usage_tracker = oac_central::usage::UsageTracker::new(audit.db().clone());
+    let state = proxy::AppState {
+        config: oidc_agent_common::config::CentralConfig {
+            listen_addr: "127.0.0.1:0".parse().expect("addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: oidc_agent_common::config::OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "test".into(),
+                client_secret_env: "TEST".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            mtls: oidc_agent_common::config::MtlsServerConfig {
+                ca_cert_path: "/ca.pem".into(),
+                server_cert_path: "/server.pem".into(),
+                server_key_path: "/server.key".into(),
+            },
+            admin: None,
+            pricing: None,
+            dev_mode: true,
+        },
+        provider_store,
+        client: proxy::forward::build_client().expect("client"),
+        audit: audit.clone(),
+        rate_limiter: None,
+        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
+        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
+        usage_tracker: usage_tracker.clone(),
+        price_table: oac_central::pricing::PriceTable::empty(),
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind central");
+    let addr = listener.local_addr().expect("central addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    // Send a streaming request with a relay identity header (dev mode still
+    // attaches the identity when the header is present — required for the
+    // usage counters to be incremented).
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "stream": true,
+        "messages": [{"role": "user", "content": "hello"}],
+    });
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("X-OAC-User-Subject", "stream-user-1")
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        "text/event-stream"
+    );
+    // Consume the entire stream (the deferred accounting task runs after
+    // the stream completes).
+    let resp_text = resp.text().await.expect("stream body");
+    assert!(resp_text.contains("[DONE]"));
+    assert!(resp_text.contains("\"total_tokens\":15"));
+
+    // The upstream must have received the include_usage injection.
+    {
+        let bodies = received.lock().expect("lock");
+        let upstream_body = bodies
+            .first()
+            .expect("mock backend must have received the request");
+        assert_eq!(
+            upstream_body["stream_options"]["include_usage"],
+            serde_json::Value::Bool(true),
+            "central must inject stream_options.include_usage for streaming requests"
+        );
+    }
+
+    // The usage counters must reflect the streamed usage (deferred task).
+    let mut usage = None;
+    for _ in 0..50 {
+        usage = usage_tracker
+            .get_usage("stream-user-1")
+            .await
+            .expect("usage");
+        if usage.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let usage = usage.expect("usage must be recorded after the stream completes");
+    assert_eq!(usage.request_count, 1);
+    assert_eq!(
+        usage.token_count, 15,
+        "streamed token usage must be recorded"
+    );
+}
+
 // ─── Auth middleware tests (non-dev-mode) ──────────────────────────────────
 
 /// Sets up a central proxy in **production mode** (`dev_mode = false`) so the
