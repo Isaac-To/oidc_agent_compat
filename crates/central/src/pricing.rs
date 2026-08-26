@@ -574,12 +574,14 @@ mod tests {
             .await
             .expect("fetch");
         assert_eq!(count, 1, "re-fetching the same model still counts");
-        let headers = auth_headers.lock().expect("lock");
-        assert_eq!(
-            headers.last().map(String::as_str),
-            Some("Bearer sk-provider-key"),
-            "the resolved provider key must be sent as a bearer token"
-        );
+        {
+            let headers = auth_headers.lock().expect("lock");
+            assert_eq!(
+                headers.last().map(String::as_str),
+                Some("Bearer sk-provider-key"),
+                "the resolved provider key must be sent as a bearer token"
+            );
+        }
 
         // The fetched price must be usable for cost computation:
         // per-token 0.000002 → per-1k 0.002; 1000 input + 1000 output
