@@ -261,7 +261,21 @@ fn shell_escape(s: &str) -> String {
 
 /// Returns the user's home directory.
 fn home_dir() -> Result<Option<PathBuf>> {
-    Ok(std::env::var_os("HOME").map(PathBuf::from))
+    #[cfg(windows)]
+    {
+        Ok(std::env::var_os("USERPROFILE")
+            .or_else(|| {
+                let drive = std::env::var_os("HOMEDRIVE")?;
+                let path = std::env::var_os("HOMEPATH")?;
+                Some(PathBuf::from(drive).join(path))
+            })
+            .map(PathBuf::from))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(std::env::var_os("HOME").map(PathBuf::from))
+    }
 }
 
 #[cfg(test)]
