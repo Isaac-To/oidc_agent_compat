@@ -15,11 +15,12 @@ TOML config schemas + validation for both components.
 - `RelayConfig` — relay config; `from_toml()` + `validate()`. Rejects
   non-loopback `listen_addr` unless `dev_mode`.
 - `CentralConfig` — central config; `from_toml()` + `validate()`.
-- Sub-configs: `OidcConfig`, `CentralConnectionConfig`, `BackendConfig`,
-  `MtlsServerConfig`, `SecretStoreConfig`, `AdminConfig`,
-  `PricingConfig`, `ModelPriceConfig`.
-- `SecretStoreKind` enum: `File`, `Vault`, `Aws`, `Gcp`, `Azure` (only
-  `File` implemented).
+- Sub-configs: `OidcConfig`, `CentralConnectionConfig`, `MtlsServerConfig`,
+  `AdminConfig`, `PricingConfig`, and `ModelPriceConfig`.
+- `RelayConfig` includes the validated `session_ttl_hours` setting; the
+  default is 24 hours and `null` explicitly disables expiry.
+- `CentralConfig` includes validated per-IP rate-limit settings and optional
+  pricing configuration.
 
 ### `error`
 

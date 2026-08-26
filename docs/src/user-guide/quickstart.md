@@ -60,7 +60,8 @@ $EDITOR docker/prod/configs/central.toml
 ```
 
 The production compose file mounts this config directly into the
-container. Set at minimum the `issuer` and `backend.base_url`:
+container. Set the `issuer` and TLS paths. Providers and their keys are
+configured through the admin API after startup:
 
 ```toml
 listen_addr = "0.0.0.0:8443"
@@ -74,18 +75,10 @@ client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid", "email", "profile"]
 
-[backend]
-name = "openai"
-base_url = "https://api.openai.com"   # ← your backend
-
 [mtls]
 ca_cert_path = "/certs/ca.crt"
 server_cert_path = "/certs/server.crt"
 server_key_path = "/certs/server.key"
-
-[secret_store]
-kind = "file"
-path = "/run/secrets/master-key"
 
 [admin]
 admin_group = "oac-admins"   # ← your admin group (optional)
@@ -99,15 +92,17 @@ Set the OIDC client secret via an `.env` file:
 echo "OAC_OIDC_CLIENT_SECRET=your-oidc-client-secret" > docker/prod/.env
 ```
 
-Store the master backend key as a Docker secret (preferred) or a mounted
-file. With Docker Swarm:
+Generate a 64-hex-character provider encryption key and store it as a Docker
+secret (preferred). With Docker Swarm:
 
 ```sh
-echo -n 'sk-your-master-key' | docker secret create oac_master_key -
+openssl rand -hex 32 | docker secret create oac_provider_encryption_key -
 ```
 
 Without Swarm, edit `docker/prod/docker-compose.yml` `secrets:` section to
-use a `file:` source instead of `external: true`.
+use a `file:` source instead of `external: true`. After central starts, add
+providers and provider keys through the admin API; provider keys are
+encrypted at rest and are never sent to relays.
 
 ## Step 4: Deploy the central proxy
 
@@ -209,9 +204,9 @@ curl -X POST http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-The request flows: agent → relay (loopback) → mTLS → central proxy (master
-key injection + policy enforcement) → backend. The master key never touches
-the laptop.
+The request flows: agent → relay (loopback) → mTLS → central proxy
+(provider-key resolution + policy enforcement) → backend. Provider keys
+never touch the laptop.
 
 ## Next steps
 

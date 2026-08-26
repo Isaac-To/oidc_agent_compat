@@ -145,6 +145,9 @@ enum AdminSubcommand {
         /// Maximum number of entries.
         #[arg(long, default_value = "100")]
         limit: u32,
+        /// Number of newest entries to skip.
+        #[arg(long, default_value = "0")]
+        offset: u32,
     },
     /// Query usage (per-user request/token/cost totals).
     UsageQuery {
@@ -387,8 +390,12 @@ async fn admin(cli: AdminCli) -> Result<()> {
             .await?;
             println!("device '{fingerprint}' reinstated");
         }
-        AdminSubcommand::AuditQuery { subject, limit } => {
-            let mut path = format!("/admin/v1/audit?limit={limit}");
+        AdminSubcommand::AuditQuery {
+            subject,
+            limit,
+            offset,
+        } => {
+            let mut path = format!("/admin/v1/audit?limit={limit}&offset={offset}");
             if let Some(s) = subject {
                 path.push_str(&format!("&subject={s}"));
             }

@@ -165,6 +165,11 @@ Query the audit log.
 |---|---|---|---|
 | `subject` | `Option<String>` | — | — |
 | `limit` | `Option<u32>` | `100` | `1000` (clamped) |
+| `offset` | `Option<u32>` | `0` | — |
+
+Results are ordered newest first. `offset` skips that many newest entries;
+pagination is applied in the database rather than loading the entire audit
+table.
 
 **Response:** `200` — JSON array of audit entries with fields: `id`,
 `user_subject`, `identity_id`, `email`, `groups`, `model`, `backend`,
@@ -195,9 +200,10 @@ Get quota status for a user.
 
 **Response:** `200` — [`QuotaResponse`](#quotaresponse).
 
-> **Note:** `groups`, `daily_request_quota`, and `daily_token_quota` are
-> always `null` in the response because the admin API doesn't receive the
-> target user's groups. Only current usage counts are populated.
+The response includes the groups snapshot from the user's most recent usage
+record and resolves `daily_request_quota` and `daily_token_quota` using the
+same most-permissive-wins policy merge used for enforcement. If the user has
+not made a request today, the groups are unknown and both quotas are `null`.
 
 ---
 

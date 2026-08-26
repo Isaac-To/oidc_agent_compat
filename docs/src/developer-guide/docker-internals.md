@@ -49,8 +49,9 @@ Multi-stage build, central proxy only:
 - `EXPOSE 8443`
 - Entrypoint: `oac-central --config /config/central.toml serve`
 
-> The master key is **never** baked into the image. It is mounted via
-> Docker secret at `/run/secrets/master-key`.
+> Provider API keys are **never** baked into the image. They are encrypted in
+> the central database; the provider encryption key is mounted via Docker
+> secret at `/run/secrets/provider-encryption-key`.
 
 ## Dev compose (`docker/dev/docker-compose.yml`)
 
@@ -67,7 +68,7 @@ Multi-stage build, central proxy only:
 
 ### `central-init` (one-shot)
 
-Writes the mock master key:
+Writes the mock provider encryption key:
 
 ```sh
 echo -n "sk-mock-backend-master-key" > /secrets/master-key && chmod 600 /secrets/master-key

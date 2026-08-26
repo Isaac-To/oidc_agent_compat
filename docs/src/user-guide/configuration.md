@@ -23,6 +23,7 @@ All configs are parsed and validated by
 | `oidc` | table | yes | — | See [OIDC](#oidc) below |
 | `central` | table | yes | — | See [Central connection](#central-connection) below |
 | `dev_mode` | `bool` | no | `false` | When `true`: allows non-loopback bind, HTTP central URL, auto-mints dev key |
+| `session_ttl_hours` | `u64` or `null` | no | `24` | Lifetime of OIDC-login API keys; after expiry, run `oac-relay login` again. `null` explicitly disables expiry. |
 
 ### OIDC
 
@@ -52,6 +53,7 @@ All configs are parsed and validated by
 listen_addr = "127.0.0.1:8787"
 database_url = "sqlite:///data/relay.db"
 dev_mode = false
+session_ttl_hours = 24
 
 [oidc]
 issuer = "https://idp.example.com"
@@ -82,6 +84,8 @@ client_key_path = "/etc/oac/client.key"
 | `admin` | table | no | `None` (admin API disabled) | See [Admin](#admin) below |
 | `pricing` | table | no | `None` (no cost tracking) | See [Pricing](#pricing) below |
 | `dev_mode` | `bool` | no | `false` | When `true`: plain HTTP, permissive auth |
+| `rate_limit_requests` | `u32` | no | `60` | Maximum requests per client IP per rate-limit window; must be greater than zero |
+| `rate_limit_window_secs` | `u64` | no | `60` | Token-bucket window in seconds; must be greater than zero |
 
 ### OIDC
 
@@ -154,6 +158,8 @@ Manual config overrides take precedence over auto-fetched prices.
 listen_addr = "0.0.0.0:8443"
 database_url = "sqlite:///data/central.db"
 dev_mode = false
+rate_limit_requests = 60
+rate_limit_window_secs = 60
 
 [oidc]
 issuer = "https://idp.example.com"

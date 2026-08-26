@@ -12,7 +12,7 @@ Agent (Codex, Goose, etc.)
   ▼
 [127.0.0.1 relay]  ── mTLS (TLS 1.3) ──►  [central proxy]  ──►  [OpenAI-compatible backend]
   │                                        │
-  │ OIDC (browser, auth-code + PKCE)       │ master key (secret manager)
+  │ OIDC (browser, auth-code + PKCE)       │ encrypted provider keys
   ▼                                        ▼
 [Enterprise IdP]                           [Audit log (append-only)]
 ```
@@ -36,9 +36,8 @@ Agent (Codex, Goose, etc.)
    `x-oac-*` identity headers, and forwards over mTLS to the central
    proxy.
 3. The **central proxy** validates the relay-forwarded identity headers,
-   resolves the user's group policy, checks device revocation, checks
-   model/endpoint permissions, injects the master key as
-   `Authorization: Bearer <master-key>`, and forwards to the backend.
+   resolves the user's group policy, checks device revocation and quotas,
+   resolves an encrypted provider key, and forwards to the backend.
 4. The **backend** responds (optionally with SSE streaming). The central
    proxy extracts token usage, computes cost, records an audit entry,
    increments usage counters, and streams the response back.
@@ -57,8 +56,8 @@ For a detailed walkthrough with the header table, see
 
 ## Key design principles
 
-- **Master key isolation** — the master key never leaves the central
-  proxy's `Zeroizing` memory. The relay never sees it.
+- **Provider-key isolation** — provider keys are encrypted at rest and
+  decrypted only in central proxy process memory; the relay never sees them.
 - **Defense in depth** — mTLS, OIDC, local key hashing, DNS rebinding
   defense, hop-by-hop header stripping, path sanitization, append-only
   audit logs.

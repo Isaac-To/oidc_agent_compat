@@ -53,13 +53,14 @@ The dev key `oac_test_key_alice` is only auto-minted when
 
 ## Central proxy
 
-### `oac-central serve` — master key not loaded
+### `oac-central serve` — provider encryption key not loaded
 
-If you see an error about the secret store:
+If central cannot start because the provider encryption key is missing:
 
-- For `kind = "file"`: ensure the file exists, is readable, and has
-  exactly `0600` permissions on Unix.
-- Run `oac-central set-backend-key --config config.toml` to store the key.
+- Ensure `OAC_PROVIDER_ENCRYPTION_KEY` contains exactly 64 hexadecimal
+  characters, or that `/run/secrets/provider-encryption-key` is mounted.
+- Restore the original key from secure backup; generating a replacement
+  makes existing encrypted provider keys unrecoverable.
 
 ### mTLS handshake failure
 

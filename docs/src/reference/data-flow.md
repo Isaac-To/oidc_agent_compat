@@ -10,7 +10,7 @@ Agent ──HTTP──► Relay ──mTLS──► Central ──HTTPS──►
                   │                  │
                   │                  ├─ Auth (identity headers)
                   │                  ├─ Permissions (policy, device, quota)
-                  │                  ├─ Master key injection
+                  │                  ├─ Provider-key injection
                   │                  ├─ Audit log
                   │                  └─ Usage tracking
                   │
@@ -123,9 +123,9 @@ User-Agent: codex/1.0
    - Reads body (max 10 MB).
    - Extracts model.
    - Sanitizes path.
-   - Builds upstream URL: `{backend.base_url}{sanitized_path}`.
+  - Builds upstream URL: `{provider.base_url}{sanitized_path}`.
    - Builds forward headers (strips hop-by-hop + identity headers).
-   - **Replaces** `Authorization` with `Bearer {master_key}` (from
+   - **Replaces** `Authorization` with the selected provider key (held in
      `Zeroizing<String>` memory).
    - Sends to backend.
 
@@ -134,7 +134,7 @@ User-Agent: codex/1.0
 ```http
 POST /v1/chat/completions HTTP/1.1
 Host: api.openai.com
-Authorization: Bearer sk-<master-key>
+Authorization: Bearer sk-<provider-key>
 Content-Type: application/json
 Accept: */*
 User-Agent: codex/1.0
@@ -142,7 +142,8 @@ User-Agent: codex/1.0
 {"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}
 ```
 
-> Note: Identity headers are gone. `Authorization` is now the master key.
+> Note: Identity headers are gone. `Authorization` is now the selected
+> provider key; provider keys are never returned to the relay.
 
 ## Step 4: Response (Backend → Central → Relay → Agent)
 
@@ -168,11 +169,12 @@ The relay:
 
 When `Content-Type: text/event-stream`:
 
-- **Central**: streams via `bytes_stream()` → `Body::from_stream`, but
-  wraps with `wrap_stream_with_usage_extraction` to intercept `data:`
-  lines and extract `usage` from the final chunk (before
-  `data: [DONE]`). This allows recording token usage and cost without
-  modifying the stream content.
+- **Central**: sets `stream_options.include_usage=true`, then streams via
+  `bytes_stream()` → `Body::from_stream` while wrapping with
+  `wrap_stream_with_usage_extraction` to intercept `data:` lines and
+  extract `usage` from the final chunk (before `data: [DONE]`). Audit and
+  usage accounting are deferred until the stream completes; the forwarded
+  SSE bytes are not modified.
 - **Relay**: streams via `bytes_stream()` → `Body::from_stream` (raw
   byte passthrough).
 
@@ -180,7 +182,7 @@ When `Content-Type: text/event-stream`:
 
 | Header | Agent→Relay | Relay→Central | Central→Backend |
 |---|---|---|---|
-| `Authorization` | `Bearer oac_...` (local key) | **stripped** | `Bearer sk-...` (master key) |
+| `Authorization` | `Bearer oac_...` (local key) | **stripped** | `Bearer sk-...` (selected provider key) |
 | `Host` | `127.0.0.1:8787` | `central:8443` | `api.openai.com` |
 | `x-oac-user-subject` | — | **added** (from VerifiedIdentity) | **stripped** |
 | `x-oac-user-email` | — | **added** | **stripped** |

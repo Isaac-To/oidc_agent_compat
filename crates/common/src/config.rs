@@ -54,15 +54,16 @@ pub struct RelayConfig {
     /// dev environments). Defaults to false for production safety.
     #[serde(default)]
     pub dev_mode: bool,
-    /// Local API key session lifetime in hours. Keys minted by
-    /// [`crate::keys::LocalKey`] after OIDC login expire after this long
-    /// and the user must re-run `oac-relay login`. `None` (the default)
-    /// means keys never expire. The dev-mode seeded key is exempt.
+    /// Local API key session lifetime in hours. Keys minted after OIDC login
+    /// expire after this long and the user must re-run `oac-relay login`.
+    /// Defaults to 24 hours. `None` means keys never expire and is intended
+    /// only for explicit compatibility configurations. The dev-mode seeded
+    /// key is exempt.
     ///
     /// This implements the documented v1 security posture: no OIDC tokens
     /// are stored; the local key is the only credential kept on the laptop,
     /// and this bounds how long it remains valid.
-    #[serde(default)]
+    #[serde(default = "default_session_ttl_hours")]
     pub session_ttl_hours: Option<u64>,
 }
 
@@ -143,6 +144,11 @@ fn default_rate_limit_requests() -> u32 {
 /// Default production rate-limit window in seconds.
 fn default_rate_limit_window_secs() -> u64 {
     60
+}
+
+/// Default local OIDC session lifetime (24 hours).
+fn default_session_ttl_hours() -> Option<u64> {
+    Some(24)
 }
 
 /// A single model's pricing.
@@ -442,10 +448,7 @@ server_key_path = "/server.key"
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         );
         assert!(cfg.dev_mode);
-        assert!(
-            cfg.session_ttl_hours.is_none(),
-            "session_ttl_hours must default to None (no expiry)"
-        );
+        assert_eq!(cfg.session_ttl_hours, Some(24));
     }
 
     #[test]
