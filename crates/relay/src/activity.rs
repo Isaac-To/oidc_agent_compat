@@ -13,7 +13,9 @@
 //! - No secrets (local API keys, master key) are ever logged.
 //! - The log records who made the request, when, and the outcome.
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use sea_orm::{
+    ConnectionTrait, DatabaseConnection, EntityTrait, QueryOrder, QuerySelect, Statement, Value,
+};
 use uuid::Uuid;
 
 use oidc_agent_common::error::{Error, Result};
@@ -109,6 +111,27 @@ impl ActivityLogger {
             .map_err(|e| Error::Database(format!("relay activity insert: {e}")))?;
 
         Ok(())
+    }
+
+    /// Lists the most recent relay activity entries, newest first.
+    ///
+    /// The result is bounded to 1,000 entries even if a larger value is
+    /// supplied by a caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] if the query fails.
+    pub async fn list_activity(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<crate::entity::relay_activity_log::Model>> {
+        crate::entity::relay_activity_log::Entity::find()
+            .order_by_desc(crate::entity::relay_activity_log::Column::CreatedAt)
+            .order_by_desc(crate::entity::relay_activity_log::Column::Id)
+            .limit(u64::from(limit.min(1000)))
+            .all(&self.db)
+            .await
+            .map_err(|e| Error::Database(format!("list relay activity: {e}")))
     }
 }
 
@@ -206,5 +229,29 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].identity_id, "id'; DROP TABLE--");
         assert_eq!(entries[0].endpoint, "/v1/chat'; --");
+    }
+
+    #[tokio::test]
+    async fn list_activity_honors_limit() {
+        let logger = setup_test_db().await;
+        for index in 0..3 {
+            logger
+                .record(&RelayActivityEntry {
+                    identity_id: format!("identity-{index}"),
+                    key_id: format!("key-{index}"),
+                    method: "GET".into(),
+                    endpoint: "/v1/models".into(),
+                    model: None,
+                    central_status: Some(200),
+                    latency_ms: i64::from(index),
+                    request_id: None,
+                })
+                .await
+                .expect("record");
+        }
+
+        let entries = logger.list_activity(2).await.expect("list");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].created_at >= entries[1].created_at);
     }
 }

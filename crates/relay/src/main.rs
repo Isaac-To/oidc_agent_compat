@@ -50,6 +50,12 @@ enum Command {
         /// The key ID to revoke.
         key_id: String,
     },
+    /// Show recent relay request activity.
+    Activity {
+        /// Maximum number of entries to display (default 20, max 1000).
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
 }
 
 fn main() -> Result<()> {
@@ -75,6 +81,7 @@ fn main() -> Result<()> {
             Command::PrintKey => print_key_cmd().await,
             Command::ListKeys => list_keys_cmd(config).await,
             Command::RevokeKey { key_id } => revoke_key_cmd(config, &key_id).await,
+            Command::Activity { limit } => activity_cmd(config, limit).await,
         }
     })
 }
@@ -234,6 +241,39 @@ async fn revoke_key_cmd(config: RelayConfig, key_id: &str) -> Result<()> {
         println!("oac-relay: revoked key {key_id}");
     } else {
         println!("oac-relay: key {key_id} not found");
+    }
+    Ok(())
+}
+
+/// Prints recent relay-side request activity.
+async fn activity_cmd(config: RelayConfig, limit: u32) -> Result<()> {
+    let db = oac_relay::db::setup(&config.database_url).await?;
+    let logger = oac_relay::activity::ActivityLogger::new(db);
+    let entries = logger.list_activity(limit).await?;
+
+    if entries.is_empty() {
+        println!("oac-relay: no activity found");
+        return Ok(());
+    }
+
+    let suffix = if entries.len() == 1 { "y" } else { "ies" };
+    println!("oac-relay: {} recent entr{}:", entries.len(), suffix);
+    for entry in entries {
+        println!(
+            "  {} {} status={} latency_ms={} identity={} key={} model={} request_id={} created={}",
+            entry.method,
+            entry.endpoint,
+            entry
+                .central_status
+                .map(|status| status.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            entry.latency_ms,
+            entry.identity_id,
+            entry.key_id,
+            entry.model.unwrap_or_else(|| "-".into()),
+            entry.request_id.unwrap_or_else(|| "-".into()),
+            entry.created_at,
+        );
     }
     Ok(())
 }
