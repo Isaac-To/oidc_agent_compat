@@ -78,9 +78,7 @@ client_key_path = "/etc/oac/client.key"
 | `listen_addr` | `SocketAddr` | yes | — | e.g. `0.0.0.0:8443` |
 | `database_url` | `String` | yes | — | SQLite or Postgres URL |
 | `oidc` | table | yes | — | See [OIDC](#oidc-1) below |
-| `backend` | table | yes | — | See [Backend](#backend) below |
 | `mtls` | table | yes | — | See [mTLS server](#mtls-server) below |
-| `secret_store` | table | yes | — | See [Secret store](#secret-store) below |
 | `admin` | table | no | `None` (admin API disabled) | See [Admin](#admin) below |
 | `pricing` | table | no | `None` (no cost tracking) | See [Pricing](#pricing) below |
 | `dev_mode` | `bool` | no | `false` | When `true`: plain HTTP, permissive auth |
@@ -97,12 +95,25 @@ Same shape as the relay's OIDC config:
 | `redirect_uri` | `String` | yes | Must start with `http://127.0.0.1` |
 | `scopes` | `Vec<String>` | yes | e.g. `["openid"]` |
 
-### Backend
+### Providers and API keys
 
-| Field | Type | Required | Validation |
-|---|---|---|---|
-| `name` | `String` | yes | Non-empty (human-readable, e.g. `"openai"`) |
-| `base_url` | `String` | yes | Non-empty (e.g. `https://api.openai.com`) |
+Providers are deliberately not configuration fields. They are runtime data
+managed through the admin API, allowing administrators to add, remove,
+enable, disable, and route between multiple OpenAI-compatible backends without
+restarting central. Each provider has a base URL, an optional exact model
+allowlist, and an optional default flag.
+
+Provider API keys are encrypted at rest in the central database using
+AES-256-GCM. Central loads the encryption key from `OAC_PROVIDER_ENCRYPTION_KEY`
+or `/run/secrets/provider-encryption-key`; the value must be 64 hexadecimal
+characters (32 bytes). The encryption key is required at startup and must be
+backed up securely: losing it makes stored provider keys unrecoverable.
+
+Each provider can have multiple keys. Keys are selected by ascending priority,
+then creation time. A key can be restricted to IdP groups; an empty access
+list means unrestricted. On upstream `401` or `429`, central tries the next
+authorized key. Key plaintext is accepted only when a key is created and is
+never returned by the API or written to audit logs.
 
 ### mTLS server
 
@@ -111,21 +122,6 @@ Same shape as the relay's OIDC config:
 | `ca_cert_path` | `PathBuf` | Company CA cert (PEM) — validates relay client certs |
 | `server_cert_path` | `PathBuf` | Server cert (PEM) |
 | `server_key_path` | `PathBuf` | Server private key (PEM, must be `0600`) |
-
-### Secret store
-
-| Field | Type | Values |
-|---|---|---|
-| `kind` | `String` (serde `"kind"`) | `"file"` \| `"vault"` \| `"aws"` \| `"gcp"` \| `"azure"` |
-| `path` | `String` | File path, Vault path, AWS ARN, etc. |
-
-> Only `kind = "file"` is implemented. `vault` / `aws` / `gcp` / `azure`
-> return an error ("not yet implemented").
-
-For `kind = "file"`, the file must:
-- Exist and be readable.
-- Have exactly `0600` permissions on Unix (enforced at load time).
-- Contain the master key (whitespace trimmed).
 
 ### Admin
 
@@ -166,18 +162,10 @@ client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid"]
 
-[backend]
-name = "openai"
-base_url = "https://api.openai.com"
-
 [mtls]
 ca_cert_path = "/etc/oac/ca.crt"
 server_cert_path = "/etc/oac/server.crt"
 server_key_path = "/etc/oac/server.key"
-
-[secret_store]
-kind = "file"
-path = "/run/secrets/master-key"
 
 [admin]
 admin_group = "oac-admins"
@@ -198,6 +186,7 @@ output_per_1k_usd = 0.01
 | Variable | Used by | Description |
 |---|---|---|
 | `OAC_OIDC_CLIENT_SECRET` | Both | OIDC client secret (referenced by `client_secret_env` in config) |
+| `OAC_PROVIDER_ENCRYPTION_KEY` | Central | 64-hex-character key used to encrypt provider API keys at rest |
 | `OAC_RELAY_CONFIG` | Relay | Path to config file (alternative to `--config`) |
 | `OAC_CENTRAL_CONFIG` | Central | Path to config file (alternative to `--config`) |
 | `OAC_API_KEY` | Central admin CLI | Local API key from `oac-relay login` |

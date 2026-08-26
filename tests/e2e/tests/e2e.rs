@@ -95,29 +95,43 @@ async fn setup_full_system() -> (
             redirect_uri: "http://127.0.0.1:0/callback".into(),
             scopes: vec!["openid".into()],
         },
-        backend: oidc_agent_common::config::BackendConfig {
-            name: "mock-backend".into(),
-            base_url: format!("http://{}", backend_addr),
-        },
         mtls: oidc_agent_common::config::MtlsServerConfig {
             ca_cert_path: "/ca.pem".into(),
             server_cert_path: "/server.pem".into(),
             server_key_path: "/server.key".into(),
-        },
-        secret_store: oidc_agent_common::config::SecretStoreConfig {
-            kind: oidc_agent_common::config::SecretStoreKind::Vault,
-            path: "test".into(),
         },
         admin: None,
         pricing: None,
         dev_mode: true,
     };
 
-    let master_key = Zeroizing::new("sk-e2e-master-key-secret".into());
+    let provider_store =
+        oac_central::provider::ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&oac_central::provider::ProviderInput {
+            id: "mock-backend".into(),
+            name: "mock-backend".into(),
+            base_url: format!("http://{backend_addr}"),
+            enabled: true,
+            is_default: true,
+            models: Some(vec!["gpt-4".into()]),
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key(
+            "mock-backend",
+            "test-key",
+            "sk-e2e-master-key-secret",
+            0,
+            &[],
+        )
+        .await
+        .expect("provider key");
     let central_client = central_proxy::forward::build_client().expect("central client");
     let central_state = central_proxy::AppState {
         config: central_config.clone(),
-        master_key: std::sync::Arc::new(master_key),
+        provider_store,
         client: central_client,
         audit: audit.clone(),
         rate_limiter: None,

@@ -51,15 +51,20 @@ cmd_up() {
     wait_for "http://localhost:8443/healthz" 30 "Central proxy"
     wait_for "http://127.0.0.1:8787/healthz" 30 "Relay"
 
-    info "Loading master key into the central proxy..."
-    docker compose -f "$COMPOSE_FILE" exec -T central \
-        sh -c 'echo -n "sk-mock-backend-master-key" > /secrets/master-key && chmod 600 /secrets/master-key'
-    ok "Master key loaded"
-
-    # Restart central so it picks up the master key
-    docker compose -f "$COMPOSE_FILE" restart central
-    sleep 3
-    wait_for "http://localhost:8443/healthz" 30 "Central proxy (after restart)"
+    info "Registering the mock provider and test key..."
+    curl -sfS -X POST http://localhost:8443/admin/v1/providers \
+        -H 'Content-Type: application/json' \
+        -H 'X-OAC-User-Subject: dev-admin' \
+        -H 'X-OAC-User-Groups: ["oac-admins"]' \
+        -d '{"id":"mock-backend","name":"mock-backend","base_url":"http://mock-backend:8080","enabled":true,"is_default":true,"models":["mock-gpt-4"]}' \
+        >/dev/null
+    curl -sfS -X POST http://localhost:8443/admin/v1/providers/mock-backend/keys \
+        -H 'Content-Type: application/json' \
+        -H 'X-OAC-User-Subject: dev-admin' \
+        -H 'X-OAC-User-Groups: ["oac-admins"]' \
+        -d '{"key":"sk-mock-backend-master-key","label":"dev-mock-key","priority":0}' \
+        >/dev/null
+    ok "Mock provider and test key registered"
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════════════"

@@ -8,8 +8,9 @@
 //!
 //! - The relay rejects `0.0.0.0` as a listen address (must be loopback).
 //! - Secrets are never stored as literals in config; the OIDC client secret
-//!   is referenced by environment-variable name (`client_secret_env`), and
-//!   the backend master key lives in the secret manager (not in config).
+//!   is referenced by environment-variable name (`client_secret_env`).
+//!   Provider API keys are managed through the central admin API and are
+//!   encrypted at rest with `OAC_PROVIDER_ENCRYPTION_KEY`.
 //!
 //! # Example (relay)
 //!
@@ -64,12 +65,8 @@ pub struct CentralConfig {
     pub database_url: String,
     /// OIDC relying-party settings (for token validation).
     pub oidc: OidcConfig,
-    /// The backend to forward requests to.
-    pub backend: BackendConfig,
     /// mTLS server settings.
     pub mtls: MtlsServerConfig,
-    /// Secret-manager settings for the master key.
-    pub secret_store: SecretStoreConfig,
     /// Admin API settings. Optional; if absent, the admin API is disabled.
     #[serde(default)]
     pub admin: Option<AdminConfig>,
@@ -160,15 +157,6 @@ pub struct CentralConnectionConfig {
     pub client_key_path: PathBuf,
 }
 
-/// Backend configuration for the central proxy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackendConfig {
-    /// A human-readable name for the backend.
-    pub name: String,
-    /// The base URL of the OpenAI-compatible backend.
-    pub base_url: String,
-}
-
 /// mTLS server configuration for the central proxy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MtlsServerConfig {
@@ -178,33 +166,6 @@ pub struct MtlsServerConfig {
     pub server_cert_path: PathBuf,
     /// Path to the server private key (PEM).
     pub server_key_path: PathBuf,
-}
-
-/// Secret-manager configuration for the master backend key.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SecretStoreConfig {
-    /// The secret-store backend kind.
-    #[serde(rename = "kind")]
-    pub kind: SecretStoreKind,
-    /// The path or address of the secret (e.g. Vault path, AWS secret ARN).
-    pub path: String,
-}
-
-/// Supported secret-store backends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SecretStoreKind {
-    /// A file on disk (dev/testing only — the key is stored in a file with
-    /// `0600` permissions). Not for production.
-    File,
-    /// HashiCorp Vault.
-    Vault,
-    /// AWS Secrets Manager.
-    Aws,
-    /// Google Cloud Secret Manager.
-    Gcp,
-    /// Azure Key Vault.
-    Azure,
 }
 
 impl RelayConfig {
@@ -283,16 +244,9 @@ impl CentralConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Config`] if OIDC fields are invalid or the backend
-    /// base URL is empty.
+    /// Returns [`Error::Config`] if OIDC fields are invalid.
     pub fn validate(&self) -> Result<()> {
         validate_oidc(&self.oidc)?;
-        if self.backend.base_url.is_empty() {
-            return Err(Error::Config("backend.base_url must not be empty".into()));
-        }
-        if self.backend.name.is_empty() {
-            return Err(Error::Config("backend.name must not be empty".into()));
-        }
         Ok(())
     }
 }
@@ -381,16 +335,10 @@ client_id = "central"
 client_secret_env = "SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid"]
-[backend]
-name = "openai"
-base_url = "https://api.openai.com"
 [mtls]
 ca_cert_path = "/ca.pem"
 server_cert_path = "/server.pem"
 server_key_path = "/server.key"
-[secret_store]
-kind = "vault"
-path = "secret/data/oac/master-key"
 "#
     }
 
@@ -405,8 +353,7 @@ path = "secret/data/oac/master-key"
     #[test]
     fn central_config_parses_valid_toml() {
         let cfg = CentralConfig::from_toml(valid_central_toml()).expect("valid config");
-        assert_eq!(cfg.backend.name, "openai");
-        assert_eq!(cfg.secret_store.kind, SecretStoreKind::Vault);
+        assert_eq!(cfg.database_url, "postgres://central");
     }
 
     #[test]
@@ -468,29 +415,6 @@ path = "secret/data/oac/master-key"
         let toml = valid_relay_toml().replace("client_id = \"relay\"", "client_id = \"\"");
         let err = RelayConfig::from_toml(&toml).unwrap_err();
         assert!(err.to_string().contains("client_id"), "{err}");
-    }
-
-    #[test]
-    fn central_rejects_empty_backend_name() {
-        let toml = valid_central_toml().replace("name = \"openai\"", "name = \"\"");
-        let err = CentralConfig::from_toml(&toml).unwrap_err();
-        assert!(err.to_string().contains("backend.name"), "{err}");
-    }
-
-    #[test]
-    fn central_rejects_empty_backend_url() {
-        let toml = valid_central_toml()
-            .replace("base_url = \"https://api.openai.com\"", "base_url = \"\"");
-        let err = CentralConfig::from_toml(&toml).unwrap_err();
-        assert!(err.to_string().contains("backend.base_url"), "{err}");
-    }
-
-    #[test]
-    fn secret_store_kind_serializes_lowercase() {
-        let toml = valid_central_toml();
-        let cfg = CentralConfig::from_toml(toml).unwrap();
-        let reserialized = toml::to_string(&cfg.secret_store).unwrap();
-        assert!(reserialized.contains("kind = \"vault\""), "{reserialized}");
     }
 
     #[test]

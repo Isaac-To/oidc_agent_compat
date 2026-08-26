@@ -36,6 +36,7 @@ use oidc_agent_common::error::{Error, Result};
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
 use crate::policy::PolicyStore;
+use crate::provider::{ProviderKeyInfo, ProviderKeyUpdate, ProviderStore};
 use crate::usage::UsageTracker;
 
 /// The shared application state for the admin API.
@@ -43,6 +44,8 @@ use crate::usage::UsageTracker;
 pub struct AdminState {
     /// The policy store.
     pub policy_store: PolicyStore,
+    /// The runtime provider and encrypted key store.
+    pub provider_store: ProviderStore,
     /// The device store.
     pub device_store: DeviceStore,
     /// The audit logger (for querying the audit log).
@@ -74,6 +77,28 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/v1/audit", get(query_audit))
         .route("/admin/v1/usage", get(query_usage))
         .route("/admin/v1/quotas/{subject}", get(get_quota))
+        .route(
+            "/admin/v1/providers",
+            get(list_providers).post(create_provider),
+        )
+        .route(
+            "/admin/v1/providers/{id}",
+            get(get_provider)
+                .put(update_provider)
+                .delete(delete_provider),
+        )
+        .route(
+            "/admin/v1/providers/{id}/default",
+            post(set_default_provider),
+        )
+        .route(
+            "/admin/v1/providers/{id}/keys",
+            get(list_keys).post(add_key),
+        )
+        .route(
+            "/admin/v1/providers/{id}/keys/{key_id}",
+            get(get_key).put(update_key).delete(delete_key),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,
@@ -134,6 +159,422 @@ async fn admin_auth_middleware(
 
     tracing::info!(user_subject = %subject, "admin API request authorized");
     Ok(next.run(request).await)
+}
+
+// --- Provider handlers ---
+
+/// Public provider metadata returned by the admin API.
+#[derive(Debug, Serialize)]
+pub struct ProviderResponse {
+    /// Stable provider identifier.
+    pub id: String,
+    /// Human-readable provider name.
+    pub name: String,
+    /// OpenAI-compatible backend base URL.
+    pub base_url: String,
+    /// Whether the provider is enabled.
+    pub enabled: bool,
+    /// Whether this is the default fallback provider.
+    pub is_default: bool,
+    /// Exact model names served by this provider; `None` means all models.
+    pub models: Option<Vec<String>>,
+}
+
+impl From<crate::entity::provider::Model> for ProviderResponse {
+    fn from(provider: crate::entity::provider::Model) -> Self {
+        Self {
+            id: provider.id,
+            name: provider.name,
+            base_url: provider.base_url,
+            enabled: provider.enabled,
+            is_default: provider.is_default,
+            models: provider
+                .models
+                .as_deref()
+                .and_then(|models| serde_json::from_str(models).ok()),
+        }
+    }
+}
+
+/// Request body for creating a provider.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CreateProviderRequest {
+    /// Stable provider identifier.
+    pub id: String,
+    /// Human-readable provider name.
+    pub name: String,
+    /// OpenAI-compatible backend base URL.
+    pub base_url: String,
+    /// Whether the provider accepts traffic.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Whether this is the default fallback provider.
+    #[serde(default)]
+    pub is_default: bool,
+    /// Exact model names served by this provider; `None` means all models.
+    pub models: Option<Vec<String>>,
+}
+
+/// Request body for updating a provider.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UpdateProviderRequest {
+    /// Human-readable provider name.
+    pub name: String,
+    /// OpenAI-compatible backend base URL.
+    pub base_url: String,
+    /// Whether the provider accepts traffic.
+    pub enabled: bool,
+    /// Whether this is the default fallback provider.
+    pub is_default: bool,
+    /// Exact model names served by this provider; `None` means all models.
+    pub models: Option<Vec<String>>,
+}
+
+/// Returns `true` for serde defaults on enabled fields.
+fn default_true() -> bool {
+    true
+}
+
+async fn list_providers(
+    State(state): State<AdminState>,
+) -> HandlerResult<axum::Json<Vec<ProviderResponse>>> {
+    let providers = state
+        .provider_store
+        .list_providers()
+        .await
+        .map_err(internal_error)?;
+    Ok(axum::Json(
+        providers.into_iter().map(ProviderResponse::from).collect(),
+    ))
+}
+
+async fn create_provider(
+    State(state): State<AdminState>,
+    axum::Json(body): axum::Json<CreateProviderRequest>,
+) -> HandlerResult<axum::Json<ProviderResponse>> {
+    let input = crate::provider::ProviderInput {
+        id: body.id.clone(),
+        name: body.name,
+        base_url: body.base_url,
+        enabled: body.enabled,
+        is_default: body.is_default,
+        models: body.models,
+    };
+    let provider = state
+        .provider_store
+        .upsert_provider(&input)
+        .await
+        .map_err(internal_error)?;
+    record_admin_audit(
+        state.audit.db(),
+        "admin",
+        "upsert_provider",
+        &input.id,
+        None,
+    )
+    .await;
+    Ok(axum::Json(ProviderResponse::from(provider)))
+}
+
+async fn get_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> HandlerResult<axum::Json<ProviderResponse>> {
+    let provider = state
+        .provider_store
+        .get_provider(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("provider '{id}' not found")))?;
+    Ok(axum::Json(ProviderResponse::from(provider)))
+}
+
+async fn update_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    axum::Json(body): axum::Json<UpdateProviderRequest>,
+) -> HandlerResult<axum::Json<ProviderResponse>> {
+    if state
+        .provider_store
+        .get_provider(&id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("provider '{id}' not found")));
+    }
+    let input = crate::provider::ProviderInput {
+        id: id.clone(),
+        name: body.name,
+        base_url: body.base_url,
+        enabled: body.enabled,
+        is_default: body.is_default,
+        models: body.models,
+    };
+    let provider = state
+        .provider_store
+        .upsert_provider(&input)
+        .await
+        .map_err(internal_error)?;
+    record_admin_audit(state.audit.db(), "admin", "upsert_provider", &id, None).await;
+    Ok(axum::Json(ProviderResponse::from(provider)))
+}
+
+async fn delete_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> HandlerResult<StatusCode> {
+    let deleted = state
+        .provider_store
+        .delete_provider(&id)
+        .await
+        .map_err(internal_error)?;
+    if !deleted {
+        return Err((StatusCode::NOT_FOUND, format!("provider '{id}' not found")));
+    }
+    record_admin_audit(state.audit.db(), "admin", "delete_provider", &id, None).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_default_provider(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> HandlerResult<StatusCode> {
+    state
+        .provider_store
+        .set_default_provider(&id)
+        .await
+        .map_err(internal_error)?;
+    record_admin_audit(state.audit.db(), "admin", "set_default_provider", &id, None).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Public provider-key metadata returned by the admin API. It intentionally
+/// contains no plaintext or encrypted key material.
+#[derive(Debug, Serialize)]
+pub struct ProviderKeyResponse {
+    /// Key identifier.
+    pub id: String,
+    /// Provider identifier.
+    pub provider_id: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Selection priority; lower values are preferred.
+    pub priority: i32,
+    /// SHA-256 digest of the key.
+    pub key_digest: String,
+    /// Whether the key is enabled.
+    pub enabled: bool,
+    /// Groups allowed to use the key. Empty means unrestricted.
+    pub allowed_groups: Vec<String>,
+}
+
+impl From<ProviderKeyInfo> for ProviderKeyResponse {
+    fn from(key: ProviderKeyInfo) -> Self {
+        Self {
+            id: key.id,
+            provider_id: key.provider_id,
+            label: key.label,
+            priority: key.priority,
+            key_digest: key.key_digest,
+            enabled: key.enabled,
+            allowed_groups: key.allowed_groups,
+        }
+    }
+}
+
+/// Request body for adding a provider key. The `key` field is accepted only
+/// on this request and is never returned or written to audit payloads.
+#[derive(Debug, Deserialize)]
+pub struct AddProviderKeyRequest {
+    /// Plaintext provider API key.
+    pub key: String,
+    /// Human-readable key label.
+    pub label: String,
+    /// Selection priority; lower values are preferred.
+    #[serde(default)]
+    pub priority: i32,
+    /// Groups allowed to use the key. Empty means unrestricted.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+}
+
+/// Request body for updating provider-key metadata and access rules.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UpdateProviderKeyRequest {
+    /// Human-readable key label.
+    pub label: String,
+    /// Selection priority; lower values are preferred.
+    pub priority: i32,
+    /// Whether the key is enabled.
+    pub enabled: bool,
+    /// Groups allowed to use the key. Empty means unrestricted.
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
+}
+
+async fn list_keys(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> HandlerResult<axum::Json<Vec<ProviderKeyResponse>>> {
+    if state
+        .provider_store
+        .get_provider(&id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("provider '{id}' not found")));
+    }
+    let keys = state
+        .provider_store
+        .list_keys(&id)
+        .await
+        .map_err(internal_error)?;
+    Ok(axum::Json(
+        keys.into_iter().map(ProviderKeyResponse::from).collect(),
+    ))
+}
+
+async fn get_key(
+    State(state): State<AdminState>,
+    Path((id, key_id)): Path<(String, String)>,
+) -> HandlerResult<axum::Json<ProviderKeyResponse>> {
+    let key = state
+        .provider_store
+        .get_key(&id, &key_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("provider key '{key_id}' not found"),
+            )
+        })?;
+    let groups = state
+        .provider_store
+        .key_access_groups(&key.id)
+        .await
+        .map_err(internal_error)?;
+    Ok(axum::Json(ProviderKeyResponse::from(
+        crate::provider::ProviderKeyInfo {
+            id: key.id,
+            provider_id: key.provider_id,
+            label: key.label,
+            priority: key.priority,
+            key_digest: key.key_digest,
+            enabled: key.enabled,
+            allowed_groups: groups,
+            created_at: key.created_at,
+            updated_at: key.updated_at,
+        },
+    )))
+}
+
+async fn add_key(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    axum::Json(body): axum::Json<AddProviderKeyRequest>,
+) -> HandlerResult<axum::Json<ProviderKeyResponse>> {
+    if state
+        .provider_store
+        .get_provider(&id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("provider '{id}' not found")));
+    }
+    let key = state
+        .provider_store
+        .add_key(
+            &id,
+            &body.label,
+            &body.key,
+            body.priority,
+            &body.allowed_groups,
+        )
+        .await
+        .map_err(internal_error)?;
+    record_admin_audit(state.audit.db(), "admin", "add_provider_key", &id, None).await;
+    Ok(axum::Json(ProviderKeyResponse::from(key)))
+}
+
+async fn update_key(
+    State(state): State<AdminState>,
+    Path((provider_id, key_id)): Path<(String, String)>,
+    axum::Json(body): axum::Json<UpdateProviderKeyRequest>,
+) -> HandlerResult<axum::Json<ProviderKeyResponse>> {
+    let update = ProviderKeyUpdate {
+        label: body.label,
+        priority: body.priority,
+        enabled: body.enabled,
+        allowed_groups: body.allowed_groups,
+    };
+    if state
+        .provider_store
+        .get_key(&provider_id, &key_id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("provider key '{key_id}' not found"),
+        ));
+    }
+    let key = state
+        .provider_store
+        .update_key(&provider_id, &key_id, &update)
+        .await
+        .map_err(internal_error)?;
+    record_admin_audit(
+        state.audit.db(),
+        "admin",
+        "update_provider_key",
+        &key_id,
+        None,
+    )
+    .await;
+    Ok(axum::Json(ProviderKeyResponse::from(key)))
+}
+
+async fn delete_key(
+    State(state): State<AdminState>,
+    Path((provider_id, key_id)): Path<(String, String)>,
+) -> HandlerResult<StatusCode> {
+    if state
+        .provider_store
+        .get_provider(&provider_id)
+        .await
+        .map_err(internal_error)?
+        .is_none()
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("provider '{provider_id}' not found"),
+        ));
+    }
+    let deleted = state
+        .provider_store
+        .delete_key(&provider_id, &key_id)
+        .await
+        .map_err(internal_error)?;
+    if !deleted {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("provider key '{key_id}' not found"),
+        ));
+    }
+    record_admin_audit(
+        state.audit.db(),
+        "admin",
+        "delete_provider_key",
+        &key_id,
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // --- Group policy handlers ---
@@ -255,7 +696,7 @@ async fn upsert_policy(
     // enhancement could extract it from the
     // request extensions.
     record_admin_audit(
-        &state.audit.db(),
+        state.audit.db(),
         admin_subject,
         "upsert_policy",
         &name,
@@ -278,7 +719,7 @@ async fn delete_policy(
     if !deleted {
         return Err((StatusCode::NOT_FOUND, format!("policy '{name}' not found")));
     }
-    record_admin_audit(&state.audit.db(), "admin", "delete_policy", &name, None).await;
+    record_admin_audit(state.audit.db(), "admin", "delete_policy", &name, None).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -337,7 +778,7 @@ async fn revoke_device(
         ));
     }
     record_admin_audit(
-        &state.audit.db(),
+        state.audit.db(),
         "admin",
         "revoke_device",
         &fingerprint,
@@ -363,7 +804,7 @@ async fn reinstate_device(
         ));
     }
     record_admin_audit(
-        &state.audit.db(),
+        state.audit.db(),
         "admin",
         "reinstate_device",
         &fingerprint,
@@ -601,12 +1042,14 @@ pub fn validate_admin_config(config: &AdminConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroize::Zeroizing;
 
     async fn setup_test_state() -> AdminState {
         let url = oidc_agent_common::persistence::temp_sqlite_url("admin");
         let db = crate::db::setup(&url).await.expect("db setup");
         AdminState {
             policy_store: PolicyStore::new(db.clone()),
+            provider_store: ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32])),
             device_store: DeviceStore::new(db.clone()),
             audit: AuditLogger::new(db.clone()),
             usage_tracker: UsageTracker::new(db),

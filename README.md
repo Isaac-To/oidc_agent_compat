@@ -52,12 +52,12 @@ Production setup in 7 steps (central proxy in Docker + relay on laptop):
 cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/
 
 # 2. Configure the central proxy:
-#    Edit docker/prod/configs/central.toml — set issuer, backend.base_url
+#    Edit docker/prod/configs/central.toml — set issuer and TLS settings
 #    for your environment.
 
 # 3. Provide secrets:
 echo "OAC_OIDC_CLIENT_SECRET=your-secret" > docker/prod/.env
-echo -n 'sk-your-master-key' | docker secret create oac_master_key -
+openssl rand -hex 32 | docker secret create oac_provider_encryption_key -
 
 # 4. Deploy the central proxy:
 cd docker/prod && docker compose up -d --build

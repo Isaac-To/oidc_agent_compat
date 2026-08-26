@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use oac_central::audit::AuditLogger;
+use oac_central::provider::{ProviderInput, ProviderStore};
 use oac_central::proxy;
 use zeroize::Zeroizing;
 
@@ -71,29 +72,36 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
             redirect_uri: "http://127.0.0.1:0/callback".into(),
             scopes: vec!["openid".into()],
         },
-        backend: oidc_agent_common::config::BackendConfig {
-            name: "mock".into(),
-            base_url: format!("http://{}", mock_addr),
-        },
         mtls: oidc_agent_common::config::MtlsServerConfig {
             ca_cert_path: "/ca.pem".into(),
             server_cert_path: "/server.pem".into(),
             server_key_path: "/server.key".into(),
-        },
-        secret_store: oidc_agent_common::config::SecretStoreConfig {
-            kind: oidc_agent_common::config::SecretStoreKind::Vault,
-            path: "test".into(),
         },
         admin: None,
         pricing: None,
         dev_mode: true,
     };
 
-    let master_key = Zeroizing::new("sk-test-master-key-12345".into());
+    let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&ProviderInput {
+            id: "mock".into(),
+            name: "mock".into(),
+            base_url: format!("http://{mock_addr}"),
+            enabled: true,
+            is_default: true,
+            models: Some(vec!["gpt-4".into()]),
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key("mock", "test-key", "sk-test-master-key-12345", 0, &[])
+        .await
+        .expect("provider key");
     let client = proxy::forward::build_client().expect("client");
     let state = proxy::AppState {
         config: config.clone(),
-        master_key: std::sync::Arc::new(master_key),
+        provider_store,
         client,
         audit: audit.clone(),
         rate_limiter: None,
@@ -212,29 +220,36 @@ async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
             redirect_uri: "http://127.0.0.1:0/callback".into(),
             scopes: vec!["openid".into()],
         },
-        backend: oidc_agent_common::config::BackendConfig {
-            name: "mock".into(),
-            base_url: format!("http://{}", mock_addr),
-        },
         mtls: oidc_agent_common::config::MtlsServerConfig {
             ca_cert_path: "/ca.pem".into(),
             server_cert_path: "/server.pem".into(),
             server_key_path: "/server.key".into(),
-        },
-        secret_store: oidc_agent_common::config::SecretStoreConfig {
-            kind: oidc_agent_common::config::SecretStoreKind::Vault,
-            path: "test".into(),
         },
         admin: None,
         pricing: None,
         dev_mode: false,
     };
 
-    let master_key = Zeroizing::new("sk-test-master-key-12345".into());
+    let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&ProviderInput {
+            id: "mock".into(),
+            name: "mock".into(),
+            base_url: format!("http://{mock_addr}"),
+            enabled: true,
+            is_default: true,
+            models: Some(vec!["gpt-4".into()]),
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key("mock", "test-key", "sk-test-master-key-12345", 0, &[])
+        .await
+        .expect("provider key");
     let client = proxy::forward::build_client().expect("client");
     let state = proxy::AppState {
         config: config.clone(),
-        master_key: std::sync::Arc::new(master_key),
+        provider_store,
         client,
         audit: audit.clone(),
         rate_limiter: None,
@@ -430,29 +445,36 @@ async fn setup_mtls_central() -> SocketAddr {
             redirect_uri: "http://127.0.0.1:0/callback".into(),
             scopes: vec!["openid".into()],
         },
-        backend: oidc_agent_common::config::BackendConfig {
-            name: "mock".into(),
-            base_url: format!("http://{}", mock_addr),
-        },
         mtls: oidc_agent_common::config::MtlsServerConfig {
             ca_cert_path: ca_path.clone(),
             server_cert_path: server_cert_path.clone(),
             server_key_path: server_key_path.clone(),
-        },
-        secret_store: oidc_agent_common::config::SecretStoreConfig {
-            kind: oidc_agent_common::config::SecretStoreKind::Vault,
-            path: "test".into(),
         },
         admin: None,
         pricing: None,
         dev_mode: false,
     };
 
-    let master_key = Zeroizing::new("sk-mtls-test-master-key".into());
+    let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&ProviderInput {
+            id: "mock".into(),
+            name: "mock".into(),
+            base_url: format!("http://{mock_addr}"),
+            enabled: true,
+            is_default: true,
+            models: Some(vec!["gpt-4".into()]),
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key("mock", "test-key", "sk-mtls-test-master-key", 0, &[])
+        .await
+        .expect("provider key");
     let client = proxy::forward::build_client().expect("central client");
     let state = proxy::AppState {
         config: config.clone(),
-        master_key: std::sync::Arc::new(master_key),
+        provider_store,
         client,
         audit: audit.clone(),
         rate_limiter: None,
@@ -551,5 +573,503 @@ async fn mtls_rejects_connection_without_client_cert() {
     assert!(
         result.is_err(),
         "connection without client cert must fail the TLS handshake"
+    );
+}
+
+// ─── Provider routing & key selection integration tests ───────────────────
+
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// A recording mock backend: captures Authorization headers and returns a
+/// marker in the body. If `accept_key` is set, requests whose Authorization
+/// header doesn't match get a 401 (to exercise key fallback).
+async fn spawn_recording_backend(
+    marker: &'static str,
+    accept_key: Option<&'static str>,
+) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = seen.clone();
+    let accept = accept_key.map(String::from);
+
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap,
+                  _body: axum::body::Bytes| {
+                let seen = seen_clone.clone();
+                let accept = accept.clone();
+                let marker = marker;
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    seen.lock().await.push(auth.clone());
+                    if let Some(good) = &accept {
+                        if &auth != good {
+                            return (
+                                axum::http::StatusCode::UNAUTHORIZED,
+                                [("content-type", "application/json")],
+                                r#"{"error": {"message": "bad key"}}"#.to_string(),
+                            );
+                        }
+                    }
+                    (
+                        axum::http::StatusCode::OK,
+                        [("content-type", "application/json")],
+                        format!(
+                            r#"{{"choices": [{{"message": {{"content": "{marker}"}}}}], "usage": {{"total_tokens": 1}}}}"#
+                        ),
+                    )
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind recording backend");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, seen)
+}
+
+/// A configured provider for the multi-provider test helper.
+struct TestProvider {
+    id: &'static str,
+    models: Option<Vec<&'static str>>,
+    is_default: bool,
+    keys: Vec<(&'static str, i32, Vec<&'static str>)>, // (secret, priority, groups)
+}
+
+/// Spins up central (dev mode) with recording backends per provider and
+/// returns the central address plus the captured-auth handles per provider.
+async fn setup_multi_provider_central(
+    providers: Vec<TestProvider>,
+) -> (SocketAddr, Vec<Arc<Mutex<Vec<String>>>>) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    let mut seen_handles = Vec::new();
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-central-routing-{}-{counter}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let url = format!("sqlite://{}?mode=rwc", tmp.display());
+    let db = oac_central::db::setup(&url).await.expect("db setup");
+    let audit = AuditLogger::new(db);
+
+    let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
+    for provider in providers {
+        // Each provider gets its own backend so routing is observable by
+        // which marker comes back.
+        let (backend_addr, seen) =
+            spawn_recording_backend(Box::leak(provider.id.to_string().into_boxed_str()), None)
+                .await;
+        seen_handles.push(seen);
+        provider_store
+            .upsert_provider(&ProviderInput {
+                id: provider.id.into(),
+                name: provider.id.into(),
+                base_url: format!("http://{backend_addr}"),
+                enabled: true,
+                is_default: provider.is_default,
+                models: provider
+                    .models
+                    .map(|models| models.into_iter().map(String::from).collect()),
+            })
+            .await
+            .expect("provider");
+        for (secret, priority, groups) in provider.keys {
+            let groups: Vec<String> = groups.into_iter().map(String::from).collect();
+            provider_store
+                .add_key(provider.id, "test-key", secret, priority, &groups)
+                .await
+                .expect("provider key");
+        }
+    }
+
+    let config = oidc_agent_common::config::CentralConfig {
+        listen_addr: "127.0.0.1:0".parse().expect("addr"),
+        database_url: "sqlite://test.db".into(),
+        oidc: oidc_agent_common::config::OidcConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "test".into(),
+            client_secret_env: "TEST".into(),
+            redirect_uri: "http://127.0.0.1:0/callback".into(),
+            scopes: vec!["openid".into()],
+        },
+        mtls: oidc_agent_common::config::MtlsServerConfig {
+            ca_cert_path: "/ca.pem".into(),
+            server_cert_path: "/server.pem".into(),
+            server_key_path: "/server.key".into(),
+        },
+        admin: None,
+        pricing: None,
+        dev_mode: true,
+    };
+    let client = proxy::forward::build_client().expect("client");
+    let state = proxy::AppState {
+        config,
+        provider_store,
+        client,
+        audit: audit.clone(),
+        rate_limiter: None,
+        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
+        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
+        usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
+        price_table: oac_central::pricing::PriceTable::empty(),
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind central");
+    let addr = listener.local_addr().expect("central addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, seen_handles)
+}
+
+/// POSTs a chat completion and returns (status, body).
+async fn post_completion(
+    client: &reqwest::Client,
+    addr: &SocketAddr,
+    model: &str,
+    groups: &[&str],
+) -> (reqwest::StatusCode, String) {
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let groups_json = serde_json::json!(groups).to_string();
+    let req = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("X-OAC-User-Subject", "routing-test-user")
+        .header("X-OAC-User-Groups", groups_json)
+        .json(&serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+        }));
+    let resp = req.send().await.expect("request");
+    let status = resp.status();
+    (status, resp.text().await.expect("body"))
+}
+
+#[tokio::test]
+async fn routes_request_to_provider_matching_model() {
+    let (addr, _seen) = setup_multi_provider_central(vec![
+        TestProvider {
+            id: "provider-alpha",
+            models: Some(vec!["model-a"]),
+            is_default: false,
+            keys: vec![("sk-alpha", 0, vec![])],
+        },
+        TestProvider {
+            id: "provider-beta",
+            models: Some(vec!["model-b"]),
+            is_default: false,
+            keys: vec![("sk-beta", 0, vec![])],
+        },
+    ])
+    .await;
+
+    let client = reqwest::Client::new();
+    let (status, body) = post_completion(&client, &addr, "model-b", &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("provider-beta"),
+        "model-b must be served by provider-beta, got: {body}"
+    );
+    assert!(
+        !body.contains("provider-alpha"),
+        "model-b must not hit provider-alpha, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_model_falls_back_to_default_provider() {
+    let (addr, _seen) = setup_multi_provider_central(vec![
+        TestProvider {
+            id: "provider-alpha",
+            models: Some(vec!["model-a"]),
+            is_default: false,
+            keys: vec![("sk-alpha", 0, vec![])],
+        },
+        TestProvider {
+            id: "provider-default",
+            models: None,
+            is_default: true,
+            keys: vec![("sk-default", 0, vec![])],
+        },
+    ])
+    .await;
+
+    let client = reqwest::Client::new();
+    let (status, body) = post_completion(&client, &addr, "totally-unknown", &[]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert!(
+        body.contains("provider-default"),
+        "unknown model must fall back to the default provider, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn group_restricted_key_serves_only_matching_groups() {
+    let (addr, seen) = setup_multi_provider_central(vec![TestProvider {
+        id: "restricted",
+        models: None,
+        is_default: true,
+        keys: vec![("sk-eng-only", 0, vec!["engineering"])],
+    }])
+    .await;
+
+    let client = reqwest::Client::new();
+
+    // Matching group → key is used.
+    let (status, body) = post_completion(&client, &addr, "any-model", &["engineering"]).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {body}");
+    assert_eq!(
+        seen[0].lock().await.len(),
+        1,
+        "authorized group must reach the backend exactly once"
+    );
+
+    // Non-matching group → no authorized key → upstream failure surfaced.
+    let (status, body) = post_completion(&client, &addr, "any-model", &["sales"]).await;
+    assert_ne!(status, reqwest::StatusCode::OK);
+    assert!(
+        !body.contains("sk-eng-only"),
+        "key material must never appear in error responses: {body}"
+    );
+    assert_eq!(
+        seen[0].lock().await.len(),
+        1,
+        "unauthorized group must not reach the backend"
+    );
+}
+
+#[tokio::test]
+async fn missing_identity_groups_cannot_use_restricted_keys() {
+    // No X-OAC-User-Groups header at all in dev mode → empty group set →
+    // restricted keys are unavailable.
+    let (addr, seen) = setup_multi_provider_central(vec![TestProvider {
+        id: "restricted",
+        models: None,
+        is_default: true,
+        keys: vec![("sk-eng-only", 0, vec!["engineering"])],
+    }])
+    .await;
+
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("X-OAC-User-Subject", "groupless-user")
+        .json(&serde_json::json!({
+            "model": "any-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_ne!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        seen[0].lock().await.len(),
+        0,
+        "no groups + restricted key must not reach the backend"
+    );
+}
+
+#[tokio::test]
+async fn key_falls_back_on_upstream_401() {
+    // One provider whose backend rejects the primary key and accepts the
+    // secondary. Central must retry with the next authorized key.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    let (backend_addr, seen) = spawn_recording_backend("fallback-ok", Some("sk-good")).await;
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-central-fallback-{}-{counter}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let url = format!("sqlite://{}?mode=rwc", tmp.display());
+    let db = oac_central::db::setup(&url).await.expect("db setup");
+    let audit = AuditLogger::new(db);
+    let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&ProviderInput {
+            id: "fallback".into(),
+            name: "fallback".into(),
+            base_url: format!("http://{backend_addr}"),
+            enabled: true,
+            is_default: true,
+            models: None,
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key("fallback", "bad", "sk-bad", 0, &[])
+        .await
+        .expect("bad key");
+    provider_store
+        .add_key("fallback", "good", "sk-good", 1, &[])
+        .await
+        .expect("good key");
+
+    let config = oidc_agent_common::config::CentralConfig {
+        listen_addr: "127.0.0.1:0".parse().expect("addr"),
+        database_url: "sqlite://test.db".into(),
+        oidc: oidc_agent_common::config::OidcConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "test".into(),
+            client_secret_env: "TEST".into(),
+            redirect_uri: "http://127.0.0.1:0/callback".into(),
+            scopes: vec!["openid".into()],
+        },
+        mtls: oidc_agent_common::config::MtlsServerConfig {
+            ca_cert_path: "/ca.pem".into(),
+            server_cert_path: "/server.pem".into(),
+            server_key_path: "/server.key".into(),
+        },
+        admin: None,
+        pricing: None,
+        dev_mode: true,
+    };
+    let client = proxy::forward::build_client().expect("client");
+    let state = proxy::AppState {
+        config,
+        provider_store,
+        client,
+        audit: audit.clone(),
+        rate_limiter: None,
+        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
+        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
+        usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
+        price_table: oac_central::pricing::PriceTable::empty(),
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind central");
+    let addr = listener.local_addr().expect("central addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let http = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let resp = http
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("X-OAC-User-Subject", "fallback-user")
+        .json(&serde_json::json!({
+            "model": "any-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = resp.text().await.expect("body");
+    assert!(body.contains("fallback-ok"), "body: {body}");
+
+    // Both keys were tried, in priority order.
+    let seen = seen.lock().await;
+    assert_eq!(&*seen, &["sk-bad".to_string(), "sk-good".to_string()]);
+}
+
+#[tokio::test]
+async fn no_provider_configured_returns_error_without_key_leak() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-central-noprovider-{}-{counter}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let url = format!("sqlite://{}?mode=rwc", tmp.display());
+    let db = oac_central::db::setup(&url).await.expect("db setup");
+    let audit = AuditLogger::new(db);
+    let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
+
+    let config = oidc_agent_common::config::CentralConfig {
+        listen_addr: "127.0.0.1:0".parse().expect("addr"),
+        database_url: "sqlite://test.db".into(),
+        oidc: oidc_agent_common::config::OidcConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "test".into(),
+            client_secret_env: "TEST".into(),
+            redirect_uri: "http://127.0.0.1:0/callback".into(),
+            scopes: vec!["openid".into()],
+        },
+        mtls: oidc_agent_common::config::MtlsServerConfig {
+            ca_cert_path: "/ca.pem".into(),
+            server_cert_path: "/server.pem".into(),
+            server_key_path: "/server.key".into(),
+        },
+        admin: None,
+        pricing: None,
+        dev_mode: true,
+    };
+    let client = proxy::forward::build_client().expect("client");
+    let state = proxy::AppState {
+        config,
+        provider_store,
+        client,
+        audit: audit.clone(),
+        rate_limiter: None,
+        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
+        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
+        usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
+        price_table: oac_central::pricing::PriceTable::empty(),
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind central");
+    let addr = listener.local_addr().expect("central addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let http = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let resp = http
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "any-model",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "no provider configured must fail closed"
+    );
+    let body = resp.text().await.expect("body");
+    assert!(
+        !body.contains("sk-"),
+        "error responses must not leak key material: {body}"
     );
 }

@@ -134,7 +134,9 @@ impl UsageTracker {
             return Ok(None);
         }
 
-        let row = &rows[0];
+        let row = rows
+            .first()
+            .ok_or_else(|| Error::Database("usage row vanished after empty check".into()))?;
         Ok(Some(UsageSnapshot {
             user_subject: row.try_get("", "user_subject").unwrap_or_default(),
             period_date: row.try_get("", "period_date").unwrap_or_default(),

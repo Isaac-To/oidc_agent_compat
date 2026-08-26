@@ -21,6 +21,6 @@ pub mod entity;
 pub mod migration;
 pub mod policy;
 pub mod pricing;
+pub mod provider;
 pub mod proxy;
-pub mod secrets;
 pub mod usage;

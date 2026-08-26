@@ -17,6 +17,7 @@
 //! - **Audit logging**: every request is recorded with device, user, model,
 //!   status, latency, and token usage.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -69,7 +70,7 @@ pub async fn proxy_handler(
         .cloned();
 
     match forward_request(&state, request).await {
-        Ok((resp, model, status, stream, token_usage)) => {
+        Ok((resp, model, provider_name, status, stream, token_usage)) => {
             // Compute cost from the pricing table (async — uses RwLock read).
             let cost_usd = state
                 .price_table
@@ -92,7 +93,7 @@ pub async fn proxy_handler(
                     .map(|i| i.subject.clone())
                     .unwrap_or_else(|| "unknown".into()),
                 model,
-                backend: state.config.backend.name.clone(),
+                backend: provider_name,
                 status: status.as_u16() as i32,
                 latency_ms,
                 stream,
@@ -153,11 +154,26 @@ struct TokenUsage {
     total: Option<i32>,
 }
 
-/// Forwards a single request to the backend with the master key.
+/// Forwards a single request to a model-selected provider with an authorized
+/// provider key. A 401 or 429 response causes one retry per remaining
+/// authorized key, in priority order.
 async fn forward_request(
     state: &AppState,
     request: axum::extract::Request,
-) -> Result<(Response<Body>, Option<String>, StatusCode, bool, TokenUsage)> {
+) -> Result<(
+    Response<Body>,
+    Option<String>,
+    String,
+    StatusCode,
+    bool,
+    TokenUsage,
+)> {
+    let groups = request
+        .extensions()
+        .get::<super::auth::VerifiedRelayIdentity>()
+        .and_then(|identity| identity.groups.as_deref())
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default();
     let (parts, body) = request.into_parts();
 
     // Read the body and extract the model (for audit logging).
@@ -166,27 +182,57 @@ async fn forward_request(
         .map_err(|e| Error::Http(format!("read body: {e}")))?;
     let model = http_util::extract_model(&body_bytes);
 
-    // Build the upstream URL.
     let sanitized = http_util::sanitize_path(parts.uri.path())?;
-    let upstream_url = format!("{}{}", state.config.backend.base_url, sanitized);
-
-    // Build the upstream request with sanitized headers + master key.
     let forward_headers = http_util::build_forward_headers(&parts.headers);
-    let mut upstream = state
-        .client
-        .request(parts.method, &upstream_url)
-        .body(body_bytes)
-        .header("authorization", &**state.master_key);
+    let provider = state
+        .provider_store
+        .resolve_provider_for_model(model.as_deref())
+        .await?
+        .ok_or_else(|| Error::Config("no enabled provider matches the requested model".into()))?;
+    let mut excluded_key_ids = HashSet::new();
+    let mut key = state
+        .provider_store
+        .resolve_key(&provider.id, &groups, &excluded_key_ids)
+        .await?
+        .ok_or_else(|| {
+            Error::Auth(format!(
+                "no authorized enabled key for provider '{}'",
+                provider.id
+            ))
+        })?;
+    let upstream_resp = loop {
+        excluded_key_ids.insert(key.id.clone());
 
-    for (name, value) in &forward_headers {
-        upstream = upstream.header(name, value);
-    }
-
-    // Send the request.
-    let upstream_resp = upstream
-        .send()
-        .await
-        .map_err(|e| Error::Http(format!("upstream request: {e}")))?;
+        let upstream_url = format!("{}{}", provider.base_url.trim_end_matches('/'), sanitized);
+        let mut upstream = state
+            .client
+            .request(parts.method.clone(), &upstream_url)
+            .body(body_bytes.clone())
+            .header("authorization", key.secret.as_str());
+        for (name, value) in &forward_headers {
+            upstream = upstream.header(name, value);
+        }
+        let response = upstream
+            .send()
+            .await
+            .map_err(|e| Error::Http(format!("upstream request: {e}")))?;
+        if (response.status() == StatusCode::UNAUTHORIZED
+            || response.status() == StatusCode::TOO_MANY_REQUESTS)
+            && if let Some(next_key) = state
+                .provider_store
+                .resolve_key(&provider.id, &groups, &excluded_key_ids)
+                .await?
+            {
+                key = next_key;
+                true
+            } else {
+                false
+            }
+        {
+            continue;
+        }
+        break response;
+    };
 
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
@@ -215,7 +261,7 @@ async fn forward_request(
         let resp = response_builder
             .body(Body::from(resp_bytes))
             .map_err(|e| Error::Http(format!("build response: {e}")))?;
-        return Ok((resp, model, status, is_stream, usage));
+        return Ok((resp, model, provider.name, status, is_stream, usage));
     }
 
     // Streaming response: pass through as raw bytes, but intercept chunks to
@@ -240,7 +286,14 @@ async fn forward_request(
     // the response is sent. For now, we return default usage; a future
     // enhancement can use a oneshot channel to await the final usage.
     let _ = usage_handle;
-    Ok((resp, model, status, is_stream, TokenUsage::default()))
+    Ok((
+        resp,
+        model,
+        provider.name,
+        status,
+        is_stream,
+        TokenUsage::default(),
+    ))
 }
 
 /// Extracts token usage from a JSON response body (OpenAI format).

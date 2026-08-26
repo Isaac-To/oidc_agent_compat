@@ -2,7 +2,7 @@
 //!
 //! This module implements the Axum router, auth middleware, and forward
 //! handler that receives mTLS-authenticated relay requests and forwards
-//! them to the OpenAI-compatible backend with the master key.
+//! them to a runtime-selected OpenAI-compatible provider.
 //!
 //! # Security
 //!
@@ -14,32 +14,31 @@
 //! - **Raw byte SSE passthrough** for streaming responses.
 //! - **Audit logging**: every request is recorded.
 
+use std::sync::Arc;
+
 pub mod auth;
 pub mod forward;
 pub mod permissions;
 pub mod rate_limit;
 
-use std::sync::Arc;
-
-use axum::Router;
-use oidc_agent_common::config::CentralConfig;
-use oidc_agent_common::error::Result;
-use tower_http::limit::RequestBodyLimitLayer;
-use zeroize::Zeroizing;
-
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
 use crate::policy::PolicyStore;
 use crate::pricing::PriceTable;
+use crate::provider::ProviderStore;
 use crate::usage::UsageTracker;
+use axum::Router;
+use oidc_agent_common::config::CentralConfig;
+use oidc_agent_common::error::Result;
+use tower_http::limit::RequestBodyLimitLayer;
 
 /// The shared application state for the central proxy.
 #[derive(Clone)]
 pub struct AppState {
     /// The central proxy configuration.
     pub config: CentralConfig,
-    /// The master backend key, held in `Zeroizing` memory.
-    pub master_key: Arc<Zeroizing<String>>,
+    /// Runtime-managed providers and encrypted API keys.
+    pub provider_store: ProviderStore,
     /// The HTTP client for forwarding to the backend.
     pub client: reqwest::Client,
     /// The audit logger.
@@ -110,6 +109,7 @@ pub fn router(state: AppState) -> Router {
     if let Some(admin_group) = state.admin_group() {
         let admin_state = crate::admin::AdminState {
             policy_store: state.policy_store.clone(),
+            provider_store: state.provider_store.clone(),
             device_store: state.device_store.clone(),
             audit: state.audit.clone(),
             usage_tracker: state.usage_tracker.clone(),
@@ -135,7 +135,7 @@ pub fn router(state: AppState) -> Router {
 /// Returns [`Error`] if the server fails to bind or start.
 pub async fn serve(
     config: CentralConfig,
-    master_key: Zeroizing<String>,
+    encryption_key: zeroize::Zeroizing<[u8; 32]>,
     audit: AuditLogger,
 ) -> Result<()> {
     let client = forward::build_client()?;
@@ -149,6 +149,7 @@ pub async fn serve(
     };
     let policy_store = PolicyStore::new(audit.db().clone());
     let device_store = DeviceStore::new(audit.db().clone());
+    let provider_store = ProviderStore::new(audit.db().clone(), encryption_key);
     let usage_tracker = UsageTracker::new(audit.db().clone());
     let price_table = config
         .pricing
@@ -156,33 +157,18 @@ pub async fn serve(
         .map(PriceTable::from_config)
         .unwrap_or_else(PriceTable::empty);
 
-    // Auto-fetch prices from the backend at startup (best-effort). Manual
-    // config overrides take precedence over fetched prices.
-    if let Err(e) = price_table
-        .fetch_from_backend(&client, &config.backend.base_url)
-        .await
-    {
-        tracing::warn!(error = %e, "failed to fetch initial model prices from backend");
-    }
-    // Spawn a background task to refresh fetched prices periodically.
-    // The interval is configurable via [central.pricing] fetch_interval_secs
-    // (default 3600s = 1 hour; 0 disables auto-fetch).
+    // Provider-specific price refresh is not performed at startup because
+    // providers are runtime-managed. Manual pricing entries remain valid.
     let fetch_interval = config
         .pricing
         .as_ref()
         .map(|p| p.fetch_interval_secs)
         .unwrap_or(3600);
-    if fetch_interval > 0 {
-        price_table.spawn_refresh_task(
-            client.clone(),
-            config.backend.base_url.clone(),
-            std::time::Duration::from_secs(fetch_interval),
-        );
-    }
+    let _ = fetch_interval;
 
     let state = AppState {
         config: config.clone(),
-        master_key: Arc::new(master_key),
+        provider_store,
         client,
         audit,
         rate_limiter,

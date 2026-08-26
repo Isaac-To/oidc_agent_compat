@@ -1,7 +1,7 @@
 # Admin API
 
 The central proxy exposes an admin API at `/admin/v1/` for managing group
-policies, devices, audit logs, usage, and quotas. The admin API is only
+policies, providers, provider API keys, devices, audit logs, usage, and quotas. The admin API is only
 mounted if `[admin]` is present in the central config.
 
 ## Authentication
@@ -22,6 +22,76 @@ This means the user must:
 - Belong to the IdP group configured as `admin_group` (e.g. `oac-admins`).
 
 ## Endpoints
+
+### Providers
+
+Providers are runtime-managed. No provider URL or provider key is stored in
+the central TOML configuration.
+
+#### `GET /admin/v1/providers`
+
+List providers. The response contains provider metadata and never contains
+API-key material.
+
+#### `POST /admin/v1/providers`
+
+Create or update a provider.
+
+```json
+{
+  "id": "openai",
+  "name": "OpenAI",
+  "base_url": "https://api.openai.com",
+  "enabled": true,
+  "is_default": true,
+  "models": ["gpt-4o", "gpt-4o-mini"]
+}
+```
+
+`models` is an exact model-name list. A provider with `models: null` is a
+catch-all fallback. Model-specific providers take precedence over catch-all
+providers. At most one provider is marked as the default.
+
+#### `GET|PUT|DELETE /admin/v1/providers/{id}`
+
+Get, update, or delete a provider. Deleting a provider also deletes its keys.
+`PUT` uses the same fields as provider creation, except `id` is taken from the
+path.
+
+#### `POST /admin/v1/providers/{id}/default`
+
+Mark an enabled provider as the default fallback.
+
+### Provider keys
+
+#### `GET /admin/v1/providers/{id}/keys`
+
+List key metadata: key ID, label, priority, digest, enabled state, and allowed
+groups. Plaintext and encrypted key material are never returned.
+
+#### `POST /admin/v1/providers/{id}/keys`
+
+Add a key. The plaintext is accepted once and encrypted with AES-256-GCM
+before it is stored.
+
+```json
+{
+  "key": "sk-provider-key",
+  "label": "production-primary",
+  "priority": 0,
+  "allowed_groups": ["engineering"]
+}
+```
+
+Keys are selected by ascending priority and creation time. An empty
+`allowed_groups` list permits any authenticated user; otherwise at least one
+of the user's IdP groups must match. On upstream `401` or `429`, central
+tries the next authorized enabled key.
+
+#### `PUT|DELETE /admin/v1/providers/{id}/keys/{key_id}`
+
+Update key metadata/access rules or delete a key. Key plaintext cannot be
+changed by `PUT`; add a replacement key for rotation.
 
 ### Group policies
 

@@ -25,7 +25,10 @@ use oidc_agent_common::time_util;
 use crate::entity::group_policy;
 
 /// A resolved policy for a user, merging all their groups' policies.
-#[derive(Debug, Clone)]
+///
+/// The default value is the most-permissive policy: all models and endpoints
+/// allowed, no quotas.
+#[derive(Debug, Clone, Default)]
 pub struct ResolvedPolicy {
     /// The set of allowed models. `None` means all models are allowed.
     pub allowed_models: Option<HashSet<String>>,
@@ -53,18 +56,6 @@ impl ResolvedPolicy {
         match &self.allowed_endpoints {
             None => true,
             Some(endpoints) => endpoints.contains(endpoint),
-        }
-    }
-}
-
-impl Default for ResolvedPolicy {
-    fn default() -> Self {
-        // No policies = everything allowed (most permissive).
-        Self {
-            allowed_models: None,
-            allowed_endpoints: None,
-            daily_token_quota: None,
-            daily_request_quota: None,
         }
     }
 }

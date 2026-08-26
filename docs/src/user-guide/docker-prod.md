@@ -37,18 +37,19 @@ Agent → 127.0.0.1 relay (native binary, laptop) → mTLS → central (containe
    echo "OAC_OIDC_CLIENT_SECRET=your-secret" > docker/prod/.env
    ```
 
-3. **Master backend key** as a Docker secret (preferred) or mounted file.
+3. **Provider encryption key** as a Docker secret. Provider API keys are
+  added after startup through the admin API.
    With Docker Swarm:
 
    ```sh
-   echo -n 'sk-...' | docker secret create oac_master_key -
+  openssl rand -hex 32 | docker secret create oac_provider_encryption_key -
    ```
 
    Without Swarm, edit `docker/prod/docker-compose.yml` `secrets:` to use
    a `file:` source.
 
 4. **Config**: copy `docker/prod/configs/central.toml` and edit `issuer`
-   and `backend.base_url` for your environment.
+  and TLS settings for your environment. Add providers after startup.
 
 ### Deploy
 
@@ -59,7 +60,7 @@ docker compose logs -f central
 ```
 
 The central proxy serves mTLS on `:8443` with client cert required. The
-master key is read from `/run/secrets/master-key`, never as an env var,
+provider encryption key is read from `/run/secrets/provider-encryption-key`, never as an env var,
 never baked into the image.
 
 ### Healthcheck
@@ -72,7 +73,7 @@ required).
 
 - `dev_mode = false` in all prod configs. Central enforces mTLS and
   rejects relay requests lacking valid identity headers.
-- Master key read from Docker secret (`/run/secrets/master-key`), never
+- Provider encryption key read from Docker secret (`/run/secrets/provider-encryption-key`), never
   env var, never baked into image, never sent to laptop.
 - Central image runs as non-root user (`oac`).
 - Config and certs mounted read-only.
@@ -94,18 +95,10 @@ client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid", "email", "profile"]
 
-[backend]
-name = "openai"
-base_url = "https://api.openai.com"
-
 [mtls]
 ca_cert_path = "/certs/ca.crt"
 server_cert_path = "/certs/server.crt"
 server_key_path = "/certs/server.key"
-
-[secret_store]
-kind = "file"
-path = "/run/secrets/master-key"
 
 [admin]
 admin_group = "oac-admins"

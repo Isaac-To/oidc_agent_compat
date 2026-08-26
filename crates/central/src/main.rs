@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use oac_central::audit::AuditLogger;
 use oac_central::db;
+use oac_central::provider::ProviderStore;
 use oac_central::proxy;
-use oac_central::secrets;
 use oidc_agent_common::config::CentralConfig;
 use oidc_agent_common::error::Result;
 
@@ -37,8 +37,6 @@ struct Cli {
 enum Command {
     /// Start the central proxy server (default).
     Serve,
-    /// Set the master backend key in the secret store.
-    SetBackendKey,
     /// Admin API operations (manage policies, devices, audit logs).
     Admin(AdminCli),
 }
@@ -67,6 +65,50 @@ struct AdminCli {
 /// Admin subcommands.
 #[derive(Subcommand, Debug)]
 enum AdminSubcommand {
+    /// List all configured providers.
+    ProviderList,
+    /// Create or update a provider.
+    ProviderSet {
+        /// Stable provider identifier.
+        id: String,
+        /// Human-readable provider name.
+        #[arg(long)]
+        name: String,
+        /// OpenAI-compatible backend base URL.
+        #[arg(long)]
+        base_url: String,
+        /// Comma-separated exact model names; omit for all models.
+        #[arg(long)]
+        models: Option<String>,
+        /// Mark the provider as the default fallback.
+        #[arg(long)]
+        default: bool,
+        /// Disable the provider.
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Delete a provider and all of its keys.
+    ProviderDelete { id: String },
+    /// Set the default fallback provider.
+    ProviderDefault { id: String },
+    /// List metadata for a provider's keys.
+    ProviderKeyList { provider_id: String },
+    /// Add a provider key, reading its secret without echo.
+    ProviderKeyAdd {
+        /// Provider identifier.
+        provider_id: String,
+        /// Human-readable key label.
+        #[arg(long)]
+        label: String,
+        /// Selection priority; lower values are preferred.
+        #[arg(long, default_value = "0")]
+        priority: i32,
+        /// Comma-separated groups allowed to use this key.
+        #[arg(long)]
+        groups: Option<String>,
+    },
+    /// Delete a provider key.
+    ProviderKeyDelete { provider_id: String, key_id: String },
     /// List all group policies.
     PolicyList,
     /// Get a single group policy.
@@ -128,7 +170,6 @@ fn main() -> Result<()> {
     rt.block_on(async {
         match cli.command.unwrap_or(Command::Serve) {
             Command::Serve => serve(config).await,
-            Command::SetBackendKey => set_backend_key(config).await,
             Command::Admin(admin_cli) => admin(admin_cli).await,
         }
     })
@@ -147,30 +188,23 @@ async fn serve(config: CentralConfig) -> Result<()> {
     let db = db::setup(&config.database_url).await?;
     let audit = AuditLogger::new(db);
 
-    // Load the master key from the secret store.
-    let secret_store = secrets::from_config(&config.secret_store)?;
-    let master_key = secret_store.load_master_key().await?;
+    let encryption_key = load_provider_encryption_key()?;
+    let encryption_key = ProviderStore::encryption_key_from_hex(&encryption_key)?;
 
-    proxy::serve(config, master_key, audit).await
+    proxy::serve(config, encryption_key, audit).await
 }
 
-/// Sets the master backend key in the secret store.
-async fn set_backend_key(config: CentralConfig) -> Result<()> {
-    let secret_store = secrets::from_config(&config.secret_store)?;
-
-    // Prompt for the key via rpassword (no echo).
-    let key = rpassword::prompt_password("Enter master backend key: ")
-        .map_err(|e| oidc_agent_common::error::Error::SecretStore(format!("read password: {e}")))?;
-
-    if key.is_empty() {
-        return Err(oidc_agent_common::error::Error::SecretStore(
-            "master key must not be empty".into(),
-        ));
+/// Loads the provider-key encryption key from the environment or the
+/// conventional Docker secret path.
+fn load_provider_encryption_key() -> Result<String> {
+    if let Ok(value) = std::env::var("OAC_PROVIDER_ENCRYPTION_KEY") {
+        return Ok(value);
     }
-
-    secret_store.store_master_key(&key).await?;
-    println!("oac-central: master key stored in secret store");
-    Ok(())
+    std::fs::read_to_string("/run/secrets/provider-encryption-key").map_err(|_| {
+        oidc_agent_common::error::Error::Config(
+            "set OAC_PROVIDER_ENCRYPTION_KEY or mount /run/secrets/provider-encryption-key".into(),
+        )
+    })
 }
 
 /// Runs an admin CLI command through the relay (which authenticates the user
@@ -190,6 +224,98 @@ async fn admin(cli: AdminCli) -> Result<()> {
     let base_url = url.trim_end_matches('/');
 
     match cli.subcommand {
+        AdminSubcommand::ProviderList => {
+            let resp = admin_get(&client, base_url, &key, "/admin/v1/providers").await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::ProviderSet {
+            id,
+            name,
+            base_url: provider_base_url,
+            models,
+            default,
+            disabled,
+        } => {
+            let body = serde_json::json!({
+                "id": id,
+                "name": name,
+                "base_url": provider_base_url,
+                "enabled": !disabled,
+                "is_default": default,
+                "models": models.map(|m| m.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect::<Vec<_>>()),
+            });
+            let resp =
+                admin_post_json(&client, base_url, &key, "/admin/v1/providers", &body).await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::ProviderDelete { id } => {
+            admin_delete(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/providers/{id}"),
+            )
+            .await?;
+            println!("provider '{id}' deleted");
+        }
+        AdminSubcommand::ProviderDefault { id } => {
+            admin_post(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/providers/{id}/default"),
+            )
+            .await?;
+            println!("provider '{id}' is now the default");
+        }
+        AdminSubcommand::ProviderKeyList { provider_id } => {
+            let resp = admin_get(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/providers/{provider_id}/keys"),
+            )
+            .await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::ProviderKeyAdd {
+            provider_id,
+            label,
+            priority,
+            groups,
+        } => {
+            let secret = rpassword::prompt_password("Provider API key: ").map_err(|e| {
+                oidc_agent_common::error::Error::Internal(format!("read provider key: {e}"))
+            })?;
+            let body = serde_json::json!({
+                "key": secret,
+                "label": label,
+                "priority": priority,
+                "allowed_groups": groups.map(|g| g.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect::<Vec<_>>()).unwrap_or_default(),
+            });
+            let resp = admin_post_json(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/providers/{provider_id}/keys"),
+                &body,
+            )
+            .await?;
+            println!("{resp}");
+        }
+        AdminSubcommand::ProviderKeyDelete {
+            provider_id,
+            key_id,
+        } => {
+            admin_delete(
+                &client,
+                base_url,
+                &key,
+                &format!("/admin/v1/providers/{provider_id}/keys/{key_id}"),
+            )
+            .await?;
+            println!("provider key '{key_id}' deleted");
+        }
         AdminSubcommand::PolicyList => {
             let resp = admin_get(&client, base_url, &key, "/admin/v1/group-policies").await?;
             println!("{resp}");
@@ -318,6 +444,25 @@ async fn admin_put(
 ) -> Result<String> {
     let resp = client
         .put(format!("{base_url}{path}"))
+        .header("Authorization", format!("Bearer {key}"))
+        .header("Content-Type", "application/json")
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Http(format!("admin request: {e}")))?;
+    admin_response(resp).await
+}
+
+/// Sends an authenticated POST with a JSON body to the admin API.
+async fn admin_post_json(
+    client: &reqwest::Client,
+    base_url: &str,
+    key: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<String> {
+    let resp = client
+        .post(format!("{base_url}{path}"))
         .header("Authorization", format!("Bearer {key}"))
         .header("Content-Type", "application/json")
         .json(body)

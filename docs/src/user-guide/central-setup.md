@@ -1,12 +1,12 @@
 # Central Proxy Setup
 
-The central proxy (`oac-central`) is a company-hosted server that holds the
-master backend key in a secret store and forwards mTLS-authenticated relay
-requests to the OpenAI-compatible backend.
+The central proxy (`oac-central`) is a company-hosted server that manages
+multiple OpenAI-compatible providers and forwards mTLS-authenticated relay
+requests to the provider selected for each model.
 
-> The master key lives only in the central proxy's `Zeroizing` memory,
-> loaded from a secret store. It is never sent to a laptop, never logged,
-> never in a config file.
+> Provider API keys are encrypted at rest in the central database. Plaintext
+> keys exist only briefly in `Zeroizing` memory during forwarding; they are
+> never sent to a laptop, logged, or returned by the admin API.
 
 ## Configuration
 
@@ -25,18 +25,10 @@ client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid"]
 
-[backend]
-name = "openai"
-base_url = "https://api.openai.com"
-
 [mtls]
 ca_cert_path = "/etc/oac/ca.crt"
 server_cert_path = "/etc/oac/server.crt"
 server_key_path = "/etc/oac/server.key"
-
-[secret_store]
-kind = "file"
-path = "/run/secrets/master-key"
 
 [admin]
 admin_group = "oac-admins"
@@ -47,8 +39,8 @@ Key points:
 - `listen_addr` is `0.0.0.0:8443` (network-accessible) in production.
 - `dev_mode = false` enforces mTLS and rejects requests without
   relay-forwarded identity headers.
-- `[secret_store]` — only `kind = "file"` is implemented. The file must
-  be `0600` and contain the master key.
+- Provider and key records are not in the TOML file. Add them with the admin
+  API after central starts.
 - `[admin]` is optional. If present, the admin API is enabled and
   restricted to users in the `admin_group`.
 
@@ -60,24 +52,14 @@ Set the OIDC client secret:
 export OAC_OIDC_CLIENT_SECRET="your-oidc-client-secret"
 ```
 
-## Lifecycle
-
-### `oac-central set-backend-key` — store the master key
+Set the provider-key encryption key through your secret manager or Docker
+secret. For local development only, an environment variable can be used:
 
 ```sh
-oac-central set-backend-key --config config.toml
+export OAC_PROVIDER_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 ```
 
-Prompts for the master backend key (no echo) and stores it in the
-configured secret store. Prints:
-
-```
-Enter master backend key:
-oac-central: master key stored in secret store
-```
-
-For the `file` secret store, this writes the key to the path in
-`[secret_store].path` with `0600` permissions.
+## Lifecycle
 
 ### `oac-central serve` — start the central proxy
 
@@ -86,7 +68,7 @@ oac-central serve --config config.toml
 ```
 
 - Opens the database (runs migrations).
-- Loads the master key from the secret store into `Zeroizing` memory.
+- Loads the provider encryption key and opens the runtime provider store.
 - Builds the `reqwest` client for talking to the backend.
 - Initializes the policy store, device store, audit logger, usage
   tracker, and price table.
@@ -108,6 +90,13 @@ belong to the configured `admin_group`.
 # Set the relay URL and API key (from oac-relay login):
 export OAC_ADMIN_URL="http://127.0.0.1:8787"
 export OAC_API_KEY="oac_..."   # from oac-relay login
+
+# Add a provider and its first key (key is prompted without echo):
+oac-central admin provider-set openai --name openai --base-url https://api.openai.com --models gpt-4o,gpt-4o-mini --default
+oac-central admin provider-key-add openai --label production --groups engineering
+
+# List providers:
+oac-central admin provider-list
 
 # List policies:
 oac-central admin policy-list

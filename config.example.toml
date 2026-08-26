@@ -32,9 +32,8 @@
 # client_key_path = "~/.oac/client.key"
 
 # ─── Central proxy configuration (company-hosted) ───────────────────────────
-# Save as central.toml. The central proxy holds the master backend key in
-# a secret manager and forwards relay requests to the OpenAI-compatible
-# backend.
+# Save as central.toml. Providers and their API keys are managed at runtime
+# through the admin API and are not stored in this config file.
 #
 # listen_addr = "0.0.0.0:8443"
 # database_url = "postgres://central.example.com/oac"
@@ -49,18 +48,10 @@
 # redirect_uri = "http://127.0.0.1:0/callback"
 # scopes = ["openid"]
 #
-# [backend]
-# name = "openai"
-# base_url = "https://api.openai.com"
-#
 # [mtls]
 # ca_cert_path = "/etc/oac/ca.pem"
 # server_cert_path = "/etc/oac/server.pem"
 # server_key_path = "/etc/oac/server.key"
-#
-# [secret_store]
-# kind = "vault"   # vault | aws | gcp | azure (only "file" implemented)
-# path = "secret/data/oac/master-key"
 #
 # # Admin API (optional). If present, enables the /admin/v1/ endpoints for
 # # managing group policies, devices, and querying audit logs. Access is

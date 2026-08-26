@@ -70,6 +70,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 subtle = "2"
 sha2 = "0.10"
 hmac = "0.12"
+aes-gcm = "0.10"
+hkdf = "0.12"
 base64 = "0.22"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }

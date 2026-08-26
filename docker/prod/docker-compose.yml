@@ -10,8 +10,8 @@
 # Differences from the dev stack (docker/dev/docker-compose.yml):
 #   - Only our own server component — no bundled IdP or mock backend.
 #   - dev_mode = false everywhere (mTLS enforced, relay must bind loopback).
-#   - Master key loaded via a secret (Docker secret or mounted file), never
-#     an env var, never baked into the image.
+#   - Provider encryption key loaded via a Docker secret, never baked into
+#     the image. Provider API keys are added through the admin API.
 #   - Central serves mTLS on :8443 with client cert required.
 #   - Persistent data via named volumes; certs mounted read-only.
 #   - Healthchecks use the real mTLS endpoint where possible.
@@ -20,11 +20,11 @@
 #   docker compose -f docker/prod/docker-compose.yml up -d
 #
 # Prerequisites:
-#   1. Edit docker/prod/configs/central.toml (issuer, backend base_url).
+#   1. Edit docker/prod/configs/central.toml (issuer and TLS paths).
 #   2. Provide the OIDC client secret: echo -n '...' | docker secret create oac_oidc_client_secret -
 #      (or set OAC_OIDC_CLIENT_SECRET in an .env file next to this compose file).
-#   3. Provide the master backend key as a Docker secret named oac_master_key
-#      (or mount a file at /run/secrets/master-key).
+#   3. Provide a 64-character hex provider encryption key as a Docker secret
+#      named oac_provider_encryption_key.
 #   4. Provide mTLS certs under docker/prod/certs/ (ca.crt, server.crt, server.key).
 #      Generate with: ./docker/generate-certs.sh
 # ─────────────────────────────────────────────────────────────────────────
@@ -48,9 +48,8 @@ services:
       - ./certs:/certs:ro
       - central-data:/data
     secrets:
-      - source: oac_master_key
-        target: master-key
-        # Mounted at /run/secrets/master-key; central.toml points here.
+      - source: oac_provider_encryption_key
+        target: provider-encryption-key
     healthcheck:
       # In production the central proxy requires a client cert on :8443,
       # so a plain curl healthcheck will fail TLS handshake. We check the
@@ -71,8 +70,9 @@ volumes:
   central-data:
 
 secrets:
-  oac_master_key:
-    # Preferred: create with `echo -n 'sk-...' | docker secret create oac_master_key -`
+  oac_provider_encryption_key:
+    # Create with a securely generated 64-character hex value:
+    # `openssl rand -hex 32 | docker secret create oac_provider_encryption_key -`
     # For compose without swarm, use a file:
-    #   file: /run/secrets/master-key
+    #   file: /run/secrets/provider-encryption-key
     external: true

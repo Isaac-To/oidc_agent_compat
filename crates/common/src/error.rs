@@ -58,10 +58,6 @@ pub enum Error {
     #[error("tls error: {0}")]
     Tls(String),
 
-    /// A secret-store error (Vault, AWS Secrets Manager, etc.).
-    #[error("secret store error: {0}")]
-    SecretStore(String),
-
     /// Authentication failed (invalid local key, expired token, etc.).
     #[error("authentication error: {0}")]
     Auth(String),

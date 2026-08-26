@@ -218,7 +218,9 @@ async fn deny(
             .unwrap_or_else(|| identity.subject.clone()),
         user_subject: identity.subject.clone(),
         model: model.map(String::from),
-        backend: state.config.backend.name.clone(),
+        // Provider resolution occurs in the forward handler. Denials in this
+        // middleware happen before a provider is selected.
+        backend: "unresolved".into(),
         status: status.as_u16() as i32,
         latency_ms: 0,
         stream: false,

@@ -7,7 +7,7 @@
 # Services:
 #   keycloak      — OIDC IdP (pre-configured realm with test users)
 #   mock-backend  — OpenAI-compatible mock API (Flask)
-#   central       — Central proxy (holds master key, forwards to mock-backend)
+#   central       — Central proxy (holds encrypted provider keys, forwards to mock-backend)
 #   relay         — Laptop relay (forwards to central, exposed on 127.0.0.1:8787)
 #   goose         — AI agent (headless CLI, connects to relay)
 
@@ -48,6 +48,7 @@ services:
     command: ["oac-central", "--config", "/config/central.toml", "serve"]
     environment:
       OAC_OIDC_CLIENT_SECRET: "oac-relay-secret"
+      OAC_PROVIDER_ENCRYPTION_KEY: "0000000000000000000000000000000000000000000000000000000000000007"
       RUST_LOG: "info"
     ports:
       - "8443:8443"
@@ -55,27 +56,16 @@ services:
       - ./configs/central.toml:/config/central.toml:ro
       - ../certs:/certs:ro
       - central-data:/data
-      - central-secrets:/secrets
     depends_on:
       keycloak:
         condition: service_healthy
       mock-backend:
         condition: service_healthy
-      central-init:
-        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:8443/healthz"]
       interval: 5s
       timeout: 3s
       retries: 10
-
-  # One-shot container that writes the master key to the secrets volume
-  # before the central proxy starts.
-  central-init:
-    image: busybox
-    command: ["sh", "-c", "echo -n 'sk-mock-backend-master-key' > /secrets/master-key && chmod 600 /secrets/master-key"]
-    volumes:
-      - central-secrets:/secrets
 
   relay:
     build:
@@ -130,6 +120,5 @@ services:
 
 volumes:
   central-data:
-  central-secrets:
   relay-data:
   goose-config:

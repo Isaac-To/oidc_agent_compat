@@ -116,20 +116,28 @@ oac-central --config config.toml
 ```
 
 - Opens the database (runs migrations).
-- Loads the master key from the secret store into `Zeroizing` memory.
+- Loads the provider encryption key and opens the runtime provider store.
 - Binds the server (dev: plain HTTP; prod: mTLS with client cert required).
 - Serves with graceful shutdown.
 
-#### `set-backend-key`
+#### Provider administration
 
-Prompt for and store the master backend key in the secret store.
+Provider administration commands operate through the relay and require the
+admin IdP group. Provider API keys are never command-line arguments.
 
 ```sh
-oac-central set-backend-key --config config.toml
+oac-central admin provider-list
+oac-central admin provider-set openai --name OpenAI --base-url https://api.openai.com --models gpt-4o,gpt-4o-mini --default
+oac-central admin provider-default openai
+oac-central admin provider-delete openai
+oac-central admin provider-key-list openai
+oac-central admin provider-key-add openai --label production --priority 0 --groups engineering
+oac-central admin provider-key-delete openai KEY_ID
 ```
 
-Prompts via `rpassword` (no echo). Rejects empty keys. Prints
-`oac-central: master key stored in secret store` on success.
+`provider-key-add` prompts for the key with input hidden. Key listing returns
+metadata only; use a new key for rotation rather than attempting to update
+key material.
 
 #### `admin`
 
