@@ -130,7 +130,7 @@ async fn seed_dev_key(key_store: &KeyStore) -> Result<()> {
     // Only mint if the dev key is not already present (idempotent across
     // restarts — avoids duplicate rows).
     let existing = key_store.verify_key(DEV_KEY_PLAINTEXT).await?;
-    if existing.is_none() {
+    if matches!(existing, oac_relay::keystore::KeyVerification::Invalid) {
         key_store
             .mint_dev_key(&identity.id, "dev", DEV_KEY_PLAINTEXT)
             .await?;

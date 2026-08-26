@@ -40,7 +40,10 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String) {
         .upsert_identity("https://idp.example.com", "user123", None, None, None)
         .await
         .expect("identity");
-    let minted = key_store.mint_key(&ident.id, "test").await.expect("mint");
+    let minted = key_store
+        .mint_key(&ident.id, "test", None)
+        .await
+        .expect("mint");
     let key = minted.plaintext.to_string();
 
     // Set up a mock central proxy.
@@ -81,6 +84,7 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String) {
             client_key_path: "/client.key".into(),
         },
         dev_mode: true,
+        session_ttl_hours: None,
     };
 
     let client = proxy::forward::build_client(&config).expect("client");

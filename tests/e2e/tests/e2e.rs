@@ -174,7 +174,7 @@ async fn setup_full_system() -> (
         .await
         .expect("identity");
     let minted = key_store
-        .mint_key(&ident.id, "e2e-test")
+        .mint_key(&ident.id, "e2e-test", None)
         .await
         .expect("mint");
     let local_key = minted.plaintext.to_string();
@@ -196,6 +196,7 @@ async fn setup_full_system() -> (
             client_key_path: "/client.key".into(),
         },
         dev_mode: true,
+        session_ttl_hours: None,
     };
 
     let relay_client = relay_proxy::forward::build_client(&relay_config).expect("relay client");
@@ -515,7 +516,7 @@ async fn e2e_permissions_deny_disallowed_model() {
 
     // Mint a new key for this identity.
     let minted = key_store
-        .mint_key(&ident.id, "e2e-perm-test")
+        .mint_key(&ident.id, "e2e-perm-test", None)
         .await
         .expect("mint");
     let key_with_groups = minted.plaintext.to_string();
@@ -595,7 +596,7 @@ async fn e2e_permissions_allow_allowed_model() {
         .await
         .expect("upsert with groups");
     let minted = key_store
-        .mint_key(&ident.id, "e2e-perm-allow")
+        .mint_key(&ident.id, "e2e-perm-allow", None)
         .await
         .expect("mint");
     let key_with_groups = minted.plaintext.to_string();
@@ -639,7 +640,7 @@ async fn e2e_permissions_deny_disallowed_endpoint() {
         .await
         .expect("upsert with groups");
     let minted = key_store
-        .mint_key(&ident.id, "e2e-perm-endpoint")
+        .mint_key(&ident.id, "e2e-perm-endpoint", None)
         .await
         .expect("mint");
     let key_with_groups = minted.plaintext.to_string();
@@ -711,7 +712,7 @@ async fn e2e_device_revocation_blocks_request() {
         .await
         .expect("upsert");
     let minted = key_store
-        .mint_key(&ident.id, "e2e-device-test")
+        .mint_key(&ident.id, "e2e-device-test", None)
         .await
         .expect("mint");
     let key = minted.plaintext.to_string();

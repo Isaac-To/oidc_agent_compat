@@ -124,6 +124,8 @@ pub enum ApiKey {
     CreatedAt,
     /// Last-used timestamp.
     LastUsedAt,
+    /// Session expiry timestamp (NULL = never expires).
+    ExpiresAt,
 }
 
 /// The migrator that runs all relay migrations.
@@ -132,7 +134,54 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(Migration), Box::new(Migration0002RelayActivityLog)]
+        vec![
+            Box::new(Migration),
+            Box::new(Migration0002RelayActivityLog),
+            Box::new(Migration0003ApiKeyExpiry),
+        ]
+    }
+}
+
+/// Migration 0003: add the `expires_at` column to `api_keys`.
+///
+/// Keys minted after OIDC login can carry a session lifetime (relay config
+/// `session_ttl_hours`). `NULL` means the key never expires (the v1 default
+/// and the dev-mode seeded key). Expired keys are rejected at verification
+/// time and their rows deleted.
+pub struct Migration0003ApiKeyExpiry;
+
+impl MigrationName for Migration0003ApiKeyExpiry {
+    fn name(&self) -> &str {
+        "m000003_api_key_expiry"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0003ApiKeyExpiry {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ApiKey::Table)
+                    .add_column(
+                        ColumnDef::new(ApiKey::ExpiresAt)
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(ApiKey::Table)
+                    .drop_column(ApiKey::ExpiresAt)
+                    .to_owned(),
+            )
+            .await
     }
 }
 

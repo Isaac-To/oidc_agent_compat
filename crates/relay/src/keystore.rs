@@ -41,6 +41,18 @@ pub struct MintedKey {
     pub identity_id: String,
 }
 
+/// The outcome of verifying a bearer token against the key store.
+#[derive(Debug)]
+pub enum KeyVerification {
+    /// The token matches an active, unexpired key.
+    Valid(Box<(api_key::Model, identity::Model)>),
+    /// The token matches a stored hash but the session has expired; the
+    /// stored row has been deleted.
+    Expired,
+    /// No stored key matches the token.
+    Invalid,
+}
+
 impl KeyStore {
     /// Creates a new `KeyStore` wrapping the given database connection.
     #[must_use]
@@ -125,16 +137,25 @@ impl KeyStore {
     /// # Errors
     ///
     /// Returns [`Error::Database`] on insert failure.
-    pub async fn mint_key(&self, identity_id: &str, label: &str) -> Result<MintedKey> {
+    pub async fn mint_key(
+        &self,
+        identity_id: &str,
+        label: &str,
+        expires_at: Option<time::PrimitiveDateTime>,
+    ) -> Result<MintedKey> {
         let plaintext = LocalKey::generate();
         let hash = KeyHash::from_plaintext(&plaintext.to_string());
         let now = time_util::now_utc();
         let key_id = Uuid::new_v4().to_string();
         let now_str = time_util::format_time(&now);
 
+        let expires_val = expires_at
+            .map(|t| Value::String(Some(Box::new(time_util::format_time(&t)))))
+            .unwrap_or(Value::String(None));
+
         // Use parameterized SQL to prevent injection.
-        let sql = "INSERT INTO api_keys (id, identity_id, key_hash, label, created_at, last_used_at) \
-             VALUES ($1, $2, $3, $4, $5, NULL)";
+        let sql = "INSERT INTO api_keys (id, identity_id, key_hash, label, created_at, last_used_at, expires_at) \
+             VALUES ($1, $2, $3, $4, $5, NULL, $6)";
         self.db
             .execute(Statement::from_sql_and_values(
                 self.db.get_database_backend(),
@@ -145,6 +166,7 @@ impl KeyStore {
                     Value::Bytes(Some(Box::new(hash.as_bytes().to_vec()))),
                     label.to_string().into(),
                     now_str.into(),
+                    expires_val,
                 ],
             ))
             .await
@@ -212,23 +234,24 @@ impl KeyStore {
 
     /// Verifies a bearer token against the stored key hashes.
     ///
-    /// Returns the matching key + identity if found, or `None` if no key
-    /// matches. Uses constant-time comparison to prevent timing attacks.
+    /// Returns a [`KeyVerification`]: [`KeyVerification::Valid`] with the
+    /// matching key + identity, [`KeyVerification::Expired`] when the token
+    /// matches a key whose session has expired (the row is deleted), or
+    /// [`KeyVerification::Invalid`] when no key matches. Uses constant-time
+    /// comparison to prevent timing attacks.
     ///
     /// # Security
     ///
     /// Iterates through **all** keys and compares each in constant time,
     /// without early return — this prevents timing leaks that would reveal
     /// which key index matched (CWE-208). On a match, updates `last_used_at`
-    /// using parameterized SQL.
+    /// using parameterized SQL. Expired key rows are deleted so stale
+    /// credentials do not linger on the laptop.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Database`] on query failure.
-    pub async fn verify_key(
-        &self,
-        bearer_token: &str,
-    ) -> Result<Option<(api_key::Model, identity::Model)>> {
+    pub async fn verify_key(&self, bearer_token: &str) -> Result<KeyVerification> {
         let candidate_hash = KeyHash::from_plaintext(bearer_token);
 
         // Load all keys. For a laptop relay with a handful of keys this is
@@ -241,10 +264,19 @@ impl KeyStore {
             .map_err(|e| Error::Database(format!("load keys: {e}")))?;
 
         // Iterate ALL keys without early return to prevent timing leaks.
+        let now = time_util::now_utc();
         let mut found: Option<(api_key::Model, identity::Model)> = None;
+        let mut expired_id: Option<String> = None;
         for (key, ident) in &keys {
             let stored_hash = KeyHash::from_hash_bytes(&key.key_hash);
             if stored_hash.matches(&candidate_hash) && found.is_none() {
+                // A matched key may have an expired session.
+                if let Some(expires_at) = key.expires_at {
+                    if now >= expires_at {
+                        expired_id = Some(key.id.clone());
+                        continue;
+                    }
+                }
                 let ident = ident.clone().ok_or_else(|| {
                     Error::Database(format!(
                         "key {} has no associated identity (foreign key violation)",
@@ -253,6 +285,19 @@ impl KeyStore {
                 })?;
                 found = Some((key.clone(), ident));
             }
+        }
+
+        // Delete an expired matched key so the stale credential cannot be
+        // replayed later (best-effort; verification already rejected it).
+        if let Some(key_id) = expired_id {
+            tracing::warn!(
+                key_id = %key_id,
+                "session key expired — run `oac-relay login` to re-authenticate"
+            );
+            if let Err(e) = api_key::Entity::delete_by_id(key_id).exec(&self.db).await {
+                tracing::warn!(error = %e, "failed to delete expired api key");
+            }
+            return Ok(KeyVerification::Expired);
         }
 
         // Update last_used_at if we found a match (outside the loop).
@@ -271,7 +316,10 @@ impl KeyStore {
                 .map_err(|e| Error::Database(format!("update last_used_at: {e}")))?;
         }
 
-        Ok(found)
+        match found {
+            Some(pair) => Ok(KeyVerification::Valid(Box::new(pair))),
+            None => Ok(KeyVerification::Invalid),
+        }
     }
 
     /// Revokes (deletes) all keys for the given identity.
@@ -354,7 +402,10 @@ mod tests {
             .upsert_identity("https://idp.example.com", "user123", None, None, None)
             .await
             .expect("identity");
-        let minted = store.mint_key(&ident.id, "codex").await.expect("mint");
+        let minted = store
+            .mint_key(&ident.id, "codex", None)
+            .await
+            .expect("mint");
         // The plaintext key must have the oac_ prefix.
         assert!(minted.plaintext.to_string().starts_with("oac_"));
         // Verify the stored hash is 32 bytes and is NOT the plaintext.
@@ -405,16 +456,24 @@ mod tests {
             .expect("mint dev key");
         // The known plaintext must verify.
         let result = store.verify_key(known).await.expect("verify");
-        assert!(result.is_some(), "known dev key must verify");
-        let (key, identity) = result.unwrap();
-        assert_eq!(key.identity_id, ident.id);
-        assert_eq!(identity.subject, "dev-user");
+        assert!(
+            matches!(result, KeyVerification::Valid(_)),
+            "known dev key must verify"
+        );
+        if let KeyVerification::Valid(pair) = result {
+            let (key, identity) = &*pair;
+            assert_eq!(key.identity_id, ident.id);
+            assert_eq!(identity.subject, "dev-user");
+        }
         // A wrong key must not verify.
         let wrong = store
             .verify_key("oac_test_key_bob")
             .await
             .expect("verify wrong");
-        assert!(wrong.is_none(), "a different key must not verify");
+        assert!(
+            matches!(wrong, KeyVerification::Invalid),
+            "a different key must not verify"
+        );
     }
 
     #[tokio::test]
@@ -424,13 +483,21 @@ mod tests {
             .upsert_identity("https://idp.example.com", "user123", None, None, None)
             .await
             .expect("identity");
-        let minted = store.mint_key(&ident.id, "codex").await.expect("mint");
+        let minted = store
+            .mint_key(&ident.id, "codex", None)
+            .await
+            .expect("mint");
         let token = minted.plaintext.to_string();
         let result = store.verify_key(&token).await.expect("verify");
-        assert!(result.is_some(), "valid key must verify");
-        let (key, identity) = result.unwrap();
-        assert_eq!(key.identity_id, ident.id);
-        assert_eq!(identity.subject, "user123");
+        assert!(
+            matches!(result, KeyVerification::Valid(_)),
+            "valid key must verify"
+        );
+        if let KeyVerification::Valid(pair) = result {
+            let (key, identity) = &*pair;
+            assert_eq!(key.identity_id, ident.id);
+            assert_eq!(identity.subject, "user123");
+        }
     }
 
     #[tokio::test]
@@ -440,9 +507,15 @@ mod tests {
             .upsert_identity("https://idp.example.com", "user123", None, None, None)
             .await
             .expect("identity");
-        let _ = store.mint_key(&ident.id, "codex").await.expect("mint");
+        let _ = store
+            .mint_key(&ident.id, "codex", None)
+            .await
+            .expect("mint");
         let result = store.verify_key("oac_invalid_token").await.expect("verify");
-        assert!(result.is_none(), "invalid key must not verify");
+        assert!(
+            matches!(result, KeyVerification::Invalid),
+            "invalid key must not verify"
+        );
     }
 
     #[tokio::test]
@@ -452,7 +525,10 @@ mod tests {
             .upsert_identity("https://idp.example.com", "user123", None, None, None)
             .await
             .expect("identity");
-        let minted = store.mint_key(&ident.id, "codex").await.expect("mint");
+        let minted = store
+            .mint_key(&ident.id, "codex", None)
+            .await
+            .expect("mint");
         let token = minted.plaintext.to_string();
 
         // Before verification, last_used_at is None.
@@ -471,14 +547,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn key_with_future_expiry_verifies() {
+        let store = setup_test_db().await;
+        let ident = store
+            .upsert_identity("https://idp.example.com", "user123", None, None, None)
+            .await
+            .expect("identity");
+        let expires = time_util::now_utc() + time::Duration::hours(24);
+        let minted = store
+            .mint_key(&ident.id, "codex", Some(expires))
+            .await
+            .expect("mint");
+        let token = minted.plaintext.to_string();
+
+        let result = store.verify_key(&token).await.expect("verify");
+        assert!(
+            matches!(result, KeyVerification::Valid(_)),
+            "a key with future expiry must verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_key_is_rejected_and_deleted() {
+        let store = setup_test_db().await;
+        let ident = store
+            .upsert_identity("https://idp.example.com", "user123", None, None, None)
+            .await
+            .expect("identity");
+        let expires = time_util::now_utc() - time::Duration::hours(1);
+        let minted = store
+            .mint_key(&ident.id, "codex", Some(expires))
+            .await
+            .expect("mint");
+        let token = minted.plaintext.to_string();
+
+        // First verification reports Expired…
+        let result = store.verify_key(&token).await.expect("verify");
+        assert!(
+            matches!(result, KeyVerification::Expired),
+            "an expired key must be rejected as Expired"
+        );
+
+        // …and the row is deleted, so subsequent attempts are Invalid.
+        let result = store.verify_key(&token).await.expect("verify");
+        assert!(
+            matches!(result, KeyVerification::Invalid),
+            "a deleted expired key must report Invalid on retry"
+        );
+        let remaining = api_key::Entity::find().all(&store.db).await.expect("load");
+        assert!(remaining.is_empty(), "expired key row must be deleted");
+    }
+
+    #[tokio::test]
+    async fn key_without_expiry_never_expires() {
+        let store = setup_test_db().await;
+        let ident = store
+            .upsert_identity("https://idp.example.com", "user123", None, None, None)
+            .await
+            .expect("identity");
+        let minted = store
+            .mint_key(&ident.id, "codex", None)
+            .await
+            .expect("mint");
+        let keys = api_key::Entity::find().all(&store.db).await.expect("load");
+        assert!(keys[0].expires_at.is_none(), "no expiry configured");
+        let token = minted.plaintext.to_string();
+        let result = store.verify_key(&token).await.expect("verify");
+        assert!(
+            matches!(result, KeyVerification::Valid(_)),
+            "keys without expiry must keep verifying"
+        );
+    }
+
+    #[tokio::test]
     async fn revoke_all_keys_deletes_keys_for_identity() {
         let store = setup_test_db().await;
         let ident = store
             .upsert_identity("https://idp.example.com", "user123", None, None, None)
             .await
             .expect("identity");
-        let _ = store.mint_key(&ident.id, "codex").await.expect("mint 1");
-        let _ = store.mint_key(&ident.id, "copilot").await.expect("mint 2");
+        let _ = store
+            .mint_key(&ident.id, "codex", None)
+            .await
+            .expect("mint 1");
+        let _ = store
+            .mint_key(&ident.id, "copilot", None)
+            .await
+            .expect("mint 2");
 
         let deleted = store.revoke_all_keys(&ident.id).await.expect("revoke");
         assert_eq!(deleted, 2, "both keys must be deleted");
@@ -494,7 +649,10 @@ mod tests {
             .upsert_identity("https://idp.example.com", "user123", None, None, None)
             .await
             .expect("identity");
-        let minted = store.mint_key(&ident.id, "codex").await.expect("mint");
+        let minted = store
+            .mint_key(&ident.id, "codex", None)
+            .await
+            .expect("mint");
 
         let deleted = store.revoke_key(&minted.key_id).await.expect("revoke");
         assert!(deleted, "key must be deleted");

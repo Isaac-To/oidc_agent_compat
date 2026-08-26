@@ -20,6 +20,9 @@ pub struct Model {
     pub created_at: TimeDateTime,
     /// When the key was last used (updated on each proxied request).
     pub last_used_at: Option<TimeDateTime>,
+    /// When the session expires (NULL = never expires). Expired keys are
+    /// rejected at verification time and their rows deleted.
+    pub expires_at: Option<TimeDateTime>,
 }
 
 /// Relations.

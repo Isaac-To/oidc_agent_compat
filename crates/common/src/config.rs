@@ -54,6 +54,16 @@ pub struct RelayConfig {
     /// dev environments). Defaults to false for production safety.
     #[serde(default)]
     pub dev_mode: bool,
+    /// Local API key session lifetime in hours. Keys minted by
+    /// [`crate::keys::LocalKey`] after OIDC login expire after this long
+    /// and the user must re-run `oac-relay login`. `None` (the default)
+    /// means keys never expire. The dev-mode seeded key is exempt.
+    ///
+    /// This implements the documented v1 security posture: no OIDC tokens
+    /// are stored; the local key is the only credential kept on the laptop,
+    /// and this bounds how long it remains valid.
+    #[serde(default)]
+    pub session_ttl_hours: Option<u64>,
 }
 
 /// Configuration for the central proxy component.
@@ -223,6 +233,15 @@ impl RelayConfig {
         if !self.dev_mode {
             validate_central_url(&self.central.url)?;
         }
+        if let Some(ttl) = self.session_ttl_hours {
+            // 0 would expire keys immediately (login would be useless);
+            // 876_000 hours = 100 years is the sanity ceiling.
+            if ttl == 0 || ttl > 876_000 {
+                return Err(Error::Config(format!(
+                    "session_ttl_hours must be between 1 and 876000, got {ttl}"
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -377,6 +396,40 @@ server_key_path = "/server.key"
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         );
         assert!(cfg.dev_mode);
+        assert!(
+            cfg.session_ttl_hours.is_none(),
+            "session_ttl_hours must default to None (no expiry)"
+        );
+    }
+
+    #[test]
+    fn relay_session_ttl_parses_and_validates() {
+        let toml = valid_relay_toml().replace(
+            "database_url = \"sqlite://relay.db\"",
+            "database_url = \"sqlite://relay.db\"\nsession_ttl_hours = 24",
+        );
+        let cfg = RelayConfig::from_toml(&toml).expect("valid ttl");
+        assert_eq!(cfg.session_ttl_hours, Some(24));
+    }
+
+    #[test]
+    fn relay_rejects_zero_session_ttl() {
+        let toml = valid_relay_toml().replace(
+            "database_url = \"sqlite://relay.db\"",
+            "database_url = \"sqlite://relay.db\"\nsession_ttl_hours = 0",
+        );
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("session_ttl_hours"), "{err}");
+    }
+
+    #[test]
+    fn relay_rejects_absurd_session_ttl() {
+        let toml = valid_relay_toml().replace(
+            "database_url = \"sqlite://relay.db\"",
+            "database_url = \"sqlite://relay.db\"\nsession_ttl_hours = 9000000",
+        );
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("session_ttl_hours"), "{err}");
     }
 
     #[test]
