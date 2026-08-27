@@ -31,6 +31,20 @@ use oidc_agent_common::http_util;
 
 use super::AppState;
 use crate::audit::AuditEntry;
+use crate::optimizer::TokenSaverConfig;
+
+/// The token-saver config resolved for this request, attached to request
+/// extensions by the permissions middleware.
+///
+/// The forward handler reads this to apply the (admin-controlled) safe
+/// optimiser to the request body before forwarding. Attaching it here (a
+/// security boundary, after auth) guarantees the config comes from the
+/// resolved group policy — never from the client.
+#[derive(Debug, Clone, Copy)]
+pub struct TokenSaverGrant {
+    /// The resolved, admin-controlled token-saver config.
+    pub config: TokenSaverConfig,
+}
 
 /// The permission decision attached to request extensions after the
 /// permissions middleware runs.
@@ -235,12 +249,19 @@ pub async fn permissions_middleware(
     }
 
     // All checks passed — insert the permission decision for the forward
-    // handler to log.
+    // handler to log, and the resolved token-saver config for it to apply.
     request.extensions_mut().insert(PermissionDecision {
         decision: "allowed".into(),
         reason: None,
         request_reserved,
     });
+    // Only attach the token-saver grant when it is enabled; otherwise the
+    // forward handler treats the request as un-optimised (no change).
+    if policy.token_saver.enabled {
+        request.extensions_mut().insert(TokenSaverGrant {
+            config: policy.token_saver,
+        });
+    }
 
     Ok(next.run(request).await)
 }
@@ -286,6 +307,10 @@ async fn deny(
         permission_decision: Some("denied".into()),
         denial_reason: Some(reason.to_string()),
         cost_usd: None,
+        token_saver_applied: None,
+        tokens_saved: None,
+        messages_dropped: None,
+        saver_reasons: None,
     };
     if let Err(e) = state.audit.record(&entry).await {
         tracing::error!(error = %e, "failed to write denied audit entry");

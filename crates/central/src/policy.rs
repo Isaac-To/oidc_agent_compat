@@ -23,11 +23,12 @@ use oidc_agent_common::error::{Error, Result};
 use oidc_agent_common::time_util;
 
 use crate::entity::group_policy;
+use crate::optimizer::TokenSaverConfig;
 
 /// A resolved policy for a user, merging all their groups' policies.
 ///
 /// The default value is the most-permissive policy: all models and endpoints
-/// allowed, no quotas.
+/// allowed, no quotas, and the token saver disabled.
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedPolicy {
     /// The set of allowed models. `None` means all models are allowed.
@@ -38,6 +39,8 @@ pub struct ResolvedPolicy {
     pub daily_token_quota: Option<i64>,
     /// The daily request quota. `None` means unlimited.
     pub daily_request_quota: Option<i64>,
+    /// The admin-controlled token-saver configuration. Defaults to disabled.
+    pub token_saver: TokenSaverConfig,
 }
 
 impl ResolvedPolicy {
@@ -103,7 +106,8 @@ impl PolicyStore {
         let placeholder_str = placeholders.join(", ");
         let sql = format!(
             "SELECT group_name, allowed_models, allowed_endpoints, \
-             daily_token_quota, daily_request_quota \
+             daily_token_quota, daily_request_quota, \
+             token_saver_enabled, max_input_tokens \
              FROM group_policies WHERE group_name IN ({placeholder_str})"
         );
 
@@ -130,12 +134,20 @@ impl PolicyStore {
         let mut allowed_endpoints: Option<HashSet<String>> = Some(HashSet::new());
         let mut daily_token_quota: Option<i64> = None;
         let mut daily_request_quota: Option<i64> = None;
+        // Token saver: enabled if ANY group enables it; the budget is the
+        // most generous (largest) across groups, so a member of multiple
+        // groups is never more aggressively trimmed than their most
+        // permissive group allows.
+        let mut token_saver_enabled = false;
+        let mut max_input_tokens: Option<i64> = None;
 
         for row in rows {
             let row_models: Option<String> = row.try_get("", "allowed_models").ok();
             let row_endpoints: Option<String> = row.try_get("", "allowed_endpoints").ok();
             let row_token_quota: Option<i64> = row.try_get("", "daily_token_quota").ok();
             let row_request_quota: Option<i64> = row.try_get("", "daily_request_quota").ok();
+            let row_saver_enabled: Option<bool> = row.try_get("", "token_saver_enabled").ok();
+            let row_max_input: Option<i64> = row.try_get("", "max_input_tokens").ok();
 
             // Models: union. None = all allowed.
             match (row_models, &mut allowed_models) {
@@ -174,6 +186,24 @@ impl PolicyStore {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (a, None) => a,
             };
+
+            // Token saver: any group enabling it turns it on; budget is max.
+            // A NULL max_input_tokens row means "no budget" (unlimited),
+            // which is the most permissive and therefore wins over any
+            // numeric cap.
+            if row_saver_enabled.unwrap_or(false) {
+                token_saver_enabled = true;
+            }
+            // If any group grants an unlimited budget, the merged result is
+            // unlimited (None) — most permissive wins.
+            if row_max_input.is_none() {
+                max_input_tokens = None;
+            } else if let Some(row_budget) = row_max_input {
+                match max_input_tokens {
+                    None => max_input_tokens = Some(row_budget),
+                    Some(acc) => max_input_tokens = Some(acc.max(row_budget)),
+                }
+            }
         }
 
         Ok(ResolvedPolicy {
@@ -181,6 +211,10 @@ impl PolicyStore {
             allowed_endpoints,
             daily_token_quota,
             daily_request_quota,
+            token_saver: TokenSaverConfig {
+                enabled: token_saver_enabled,
+                max_input_tokens: max_input_tokens.map(|v| v as u64),
+            },
         })
     }
 
@@ -225,6 +259,38 @@ impl PolicyStore {
         daily_token_quota: Option<i64>,
         daily_request_quota: Option<i64>,
     ) -> Result<group_policy::Model> {
+        // The token-saver fields default to disabled/unbounded and are set
+        // via `set_token_saver`. Keeping this method's signature stable
+        // avoids churn across callers that only manage access/quotas.
+        self.upsert_policy_full(
+            group_name,
+            allowed_models,
+            allowed_endpoints,
+            daily_token_quota,
+            daily_request_quota,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Upserts a group policy including the admin-controlled token-saver
+    /// fields (`token_saver_enabled`, `max_input_tokens`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on insert/update failure.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_policy_full(
+        &self,
+        group_name: &str,
+        allowed_models: Option<&str>,
+        allowed_endpoints: Option<&str>,
+        daily_token_quota: Option<i64>,
+        daily_request_quota: Option<i64>,
+        token_saver_enabled: bool,
+        max_input_tokens: Option<i64>,
+    ) -> Result<group_policy::Model> {
         let existing = self.get_policy(group_name).await?;
         let now = time_util::now_utc();
         let now_str = time_util::format_time(&now);
@@ -241,12 +307,17 @@ impl PolicyStore {
         let request_quota_val = daily_request_quota
             .map(|v| Value::BigInt(Some(v)))
             .unwrap_or(Value::BigInt(None));
+        let saver_enabled_val = Value::Bool(Some(token_saver_enabled));
+        let max_input_val = max_input_tokens
+            .map(|v| Value::BigInt(Some(v)))
+            .unwrap_or(Value::BigInt(None));
 
         if let Some(model) = existing {
             // Update existing.
             let sql = "UPDATE group_policies SET allowed_models = $1, \
                  allowed_endpoints = $2, daily_token_quota = $3, \
-                 daily_request_quota = $4, updated_at = $5 WHERE id = $6";
+                 daily_request_quota = $4, token_saver_enabled = $5, \
+                 max_input_tokens = $6, updated_at = $7 WHERE id = $8";
             self.db
                 .execute(Statement::from_sql_and_values(
                     self.db.get_database_backend(),
@@ -256,6 +327,8 @@ impl PolicyStore {
                         endpoints_val,
                         token_quota_val,
                         request_quota_val,
+                        saver_enabled_val,
+                        max_input_val,
                         now_str.into(),
                         model.id.clone().into(),
                     ],
@@ -269,6 +342,8 @@ impl PolicyStore {
                 allowed_endpoints: allowed_endpoints.map(String::from),
                 daily_token_quota,
                 daily_request_quota,
+                token_saver_enabled,
+                max_input_tokens,
                 created_at: model.created_at,
                 updated_at: now,
             })
@@ -277,8 +352,9 @@ impl PolicyStore {
             let id = Uuid::new_v4().to_string();
             let sql = "INSERT INTO group_policies \
                  (id, group_name, allowed_models, allowed_endpoints, \
-                 daily_token_quota, daily_request_quota, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)";
+                 daily_token_quota, daily_request_quota, \
+                 token_saver_enabled, max_input_tokens, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
             self.db
                 .execute(Statement::from_sql_and_values(
                     self.db.get_database_backend(),
@@ -290,6 +366,8 @@ impl PolicyStore {
                         endpoints_val,
                         token_quota_val,
                         request_quota_val,
+                        saver_enabled_val,
+                        max_input_val,
                         now_str.clone().into(),
                         now_str.into(),
                     ],
@@ -303,6 +381,8 @@ impl PolicyStore {
                 allowed_endpoints: allowed_endpoints.map(String::from),
                 daily_token_quota,
                 daily_request_quota,
+                token_saver_enabled,
+                max_input_tokens,
                 created_at: now,
                 updated_at: now,
             })
@@ -507,5 +587,79 @@ mod tests {
 
         let deleted_again = store.delete_policy("engineering").await.expect("delete");
         assert!(!deleted_again);
+    }
+
+    #[tokio::test]
+    async fn token_saver_defaults_to_disabled() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy("engineering", None, None, None, None)
+            .await
+            .expect("upsert");
+        let policy = store
+            .resolve_policy(&["engineering".into()])
+            .await
+            .expect("resolve");
+        // Default-off: the saver must NOT apply unless an admin enables it.
+        assert!(!policy.token_saver.enabled);
+        assert!(policy.token_saver.max_input_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn token_saver_enabled_single_group() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy_full("engineering", None, None, None, None, true, Some(8000))
+            .await
+            .expect("upsert");
+        let policy = store
+            .resolve_policy(&["engineering".into()])
+            .await
+            .expect("resolve");
+        assert!(policy.token_saver.enabled);
+        assert_eq!(policy.token_saver.max_input_tokens, Some(8000));
+    }
+
+    #[tokio::test]
+    async fn token_saver_merge_any_enabled_wins_budget_is_max() {
+        let store = setup_test_db().await;
+        // Group A enables with a small budget; Group B disables but has a
+        // large budget.
+        store
+            .upsert_policy_full("group-a", None, None, None, None, true, Some(2000))
+            .await
+            .expect("upsert a");
+        store
+            .upsert_policy_full("group-b", None, None, None, None, false, Some(5000))
+            .await
+            .expect("upsert b");
+
+        let policy = store
+            .resolve_policy(&["group-a".into(), "group-b".into()])
+            .await
+            .expect("resolve");
+        // Any group enabling it turns it on.
+        assert!(policy.token_saver.enabled);
+        // The budget is the most generous (largest), so no member is more
+        // aggressively trimmed than their most permissive group allows.
+        assert_eq!(policy.token_saver.max_input_tokens, Some(5000));
+    }
+
+    #[tokio::test]
+    async fn token_saver_all_disabled_stays_off() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy_full("group-a", None, None, None, None, false, Some(1000))
+            .await
+            .expect("upsert a");
+        store
+            .upsert_policy_full("group-b", None, None, None, None, false, None)
+            .await
+            .expect("upsert b");
+        let policy = store
+            .resolve_policy(&["group-a".into(), "group-b".into()])
+            .await
+            .expect("resolve");
+        assert!(!policy.token_saver.enabled);
     }
 }

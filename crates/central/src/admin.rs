@@ -75,6 +75,7 @@ pub fn router(state: AdminState) -> Router {
             post(reinstate_device),
         )
         .route("/admin/v1/audit", get(query_audit))
+        .route("/admin/v1/token-saver", get(query_token_saver_summary))
         .route("/admin/v1/usage", get(query_usage))
         .route("/admin/v1/quotas/{subject}", get(get_quota))
         .route(
@@ -661,6 +662,10 @@ pub struct GroupPolicyResponse {
     pub daily_token_quota: Option<i64>,
     /// Daily request quota (None = unlimited).
     pub daily_request_quota: Option<i64>,
+    /// Whether the safe token-saver is enabled for this group.
+    pub token_saver_enabled: bool,
+    /// Per-request input-token budget (None = no budget trimming).
+    pub max_input_tokens: Option<i64>,
 }
 
 impl From<crate::entity::group_policy::Model> for GroupPolicyResponse {
@@ -677,6 +682,8 @@ impl From<crate::entity::group_policy::Model> for GroupPolicyResponse {
                 .and_then(|s| serde_json::from_str(s).ok()),
             daily_token_quota: m.daily_token_quota,
             daily_request_quota: m.daily_request_quota,
+            token_saver_enabled: m.token_saver_enabled,
+            max_input_tokens: m.max_input_tokens,
         }
     }
 }
@@ -730,6 +737,12 @@ pub struct UpsertPolicyRequest {
     pub daily_token_quota: Option<i64>,
     /// Daily request quota (None = unlimited).
     pub daily_request_quota: Option<i64>,
+    /// Whether the safe token-saver is enabled for this group.
+    #[serde(default)]
+    pub token_saver_enabled: bool,
+    /// Per-request input-token budget (None = no budget trimming).
+    #[serde(default)]
+    pub max_input_tokens: Option<i64>,
 }
 
 async fn upsert_policy(
@@ -747,14 +760,24 @@ async fn upsert_policy(
         .as_ref()
         .map(|e| serde_json::to_string(e).unwrap_or_default());
 
+    // Validate: a token-saver budget must be a positive integer when set.
+    if body.max_input_tokens.is_some_and(|v| v <= 0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "max_input_tokens must be a positive integer".into(),
+        ));
+    }
+
     let policy = state
         .policy_store
-        .upsert_policy(
+        .upsert_policy_full(
             &name,
             models_json.as_deref(),
             endpoints_json.as_deref(),
             body.daily_token_quota,
             body.daily_request_quota,
+            body.token_saver_enabled,
+            body.max_input_tokens,
         )
         .await
         .map_err(internal_error)?;
@@ -946,6 +969,10 @@ async fn query_audit(
                 "permission_decision": e.permission_decision,
                 "denial_reason": e.denial_reason,
                 "cost_usd": e.cost_usd,
+                "token_saver_applied": e.token_saver_applied,
+                "tokens_saved": e.tokens_saved,
+                "messages_dropped": e.messages_dropped,
+                "saver_reasons": e.saver_reasons,
                 "created_at": e.created_at.format(time::macros::format_description!(
                     "[year]-[month]-[day] [hour]:[minute]:[second]"
                 )).unwrap_or_default(),
@@ -953,6 +980,120 @@ async fn query_audit(
         })
         .collect();
     Ok(axum::Json(serde_json::Value::Array(serialized)))
+}
+
+/// Response for the token-saver summary endpoint.
+///
+/// Aggregates per-group engagement so an admin can "watch what is going on":
+/// how many requests were optimised, how many tokens were saved, and how
+/// many messages were dropped, alongside the current on/off configuration.
+#[derive(Debug, Serialize)]
+pub struct TokenSaverSummaryResponse {
+    /// Per-group rows.
+    pub groups: Vec<TokenSaverGroupSummary>,
+    /// Totals across all groups.
+    pub total_requests_optimized: i64,
+    /// Total tokens saved across all optimised requests.
+    pub total_tokens_saved: i64,
+    /// Total messages dropped across all optimised requests.
+    pub total_messages_dropped: i64,
+}
+
+/// Per-group token-saver summary + configuration.
+#[derive(Debug, Serialize)]
+pub struct TokenSaverGroupSummary {
+    /// The group name.
+    pub group: String,
+    /// Whether the token saver is enabled for the group.
+    pub enabled: bool,
+    /// The per-request input-token budget (None = no budget trimming).
+    pub max_input_tokens: Option<i64>,
+    /// Number of requests optimised for this group (where the saver applied).
+    pub requests_optimized: i64,
+    /// Tokens saved for this group.
+    pub tokens_saved: i64,
+    /// Messages dropped for this group.
+    pub messages_dropped: i64,
+}
+
+async fn query_token_saver_summary(
+    State(state): State<AdminState>,
+) -> HandlerResult<axum::Json<TokenSaverSummaryResponse>> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    // Pull the group policies to report configuration.
+    let policies = state
+        .policy_store
+        .list_policies()
+        .await
+        .map_err(internal_error)?;
+
+    // Aggregate over the audit log, grouping by group. We attribute a row to
+    // its first stored group (groups are a JSON array string). Because an
+    // admin consumes this as a coarse engagement report, using the first
+    // group is a reasonable, explicit approximation.
+    let entries = crate::entity::audit_log::Entity::find()
+        .filter(crate::entity::audit_log::Column::TokenSaverApplied.eq(true))
+        .all(state.audit.db())
+        .await
+        .map_err(|e| internal_error(Error::Database(format!("query saver summary: {e}"))))?;
+
+    let mut per_group: std::collections::HashMap<String, TokenSaverGroupSummary> =
+        std::collections::HashMap::new();
+    let mut total_requests = 0i64;
+    let mut total_tokens = 0i64;
+    let mut total_dropped = 0i64;
+
+    for e in &entries {
+        let group = e
+            .groups
+            .as_deref()
+            .and_then(|g| serde_json::from_str::<Vec<String>>(g).ok())
+            .and_then(|v| v.first().cloned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let row = per_group
+            .entry(group.clone())
+            .or_insert_with(|| TokenSaverGroupSummary {
+                group: group.clone(),
+                enabled: false,
+                max_input_tokens: None,
+                requests_optimized: 0,
+                tokens_saved: 0,
+                messages_dropped: 0,
+            });
+        row.requests_optimized += 1;
+        row.tokens_saved += e.tokens_saved.unwrap_or(0);
+        row.messages_dropped += e.messages_dropped.unwrap_or(0);
+        total_requests += 1;
+        total_tokens += e.tokens_saved.unwrap_or(0);
+        total_dropped += e.messages_dropped.unwrap_or(0);
+    }
+
+    // Overlay configuration from the current policies.
+    for p in &policies {
+        let row = per_group
+            .entry(p.group_name.clone())
+            .or_insert_with(|| TokenSaverGroupSummary {
+                group: p.group_name.clone(),
+                enabled: p.token_saver_enabled,
+                max_input_tokens: p.max_input_tokens,
+                requests_optimized: 0,
+                tokens_saved: 0,
+                messages_dropped: 0,
+            });
+        row.enabled = p.token_saver_enabled;
+        row.max_input_tokens = p.max_input_tokens;
+    }
+
+    let mut groups: Vec<TokenSaverGroupSummary> = per_group.into_values().collect();
+    groups.sort_by(|a, b| a.group.cmp(&b.group));
+
+    Ok(axum::Json(TokenSaverSummaryResponse {
+        groups,
+        total_requests_optimized: total_requests,
+        total_tokens_saved: total_tokens,
+        total_messages_dropped: total_dropped,
+    }))
 }
 
 // --- Usage & quota handlers ---
@@ -1391,6 +1532,10 @@ mod tests {
                     permission_decision: Some("allowed".into()),
                     denial_reason: None,
                     cost_usd: Some(0.0),
+                    token_saver_applied: None,
+                    tokens_saved: None,
+                    messages_dropped: None,
+                    saver_reasons: None,
                 })
                 .await
                 .expect("record audit entry");
@@ -1422,5 +1567,70 @@ mod tests {
         let next_page = next_page.as_array().expect("array");
         assert_eq!(next_page.len(), 1);
         assert_ne!(first_page[0]["id"], next_page[0]["id"]);
+    }
+
+    #[tokio::test]
+    async fn admin_can_enable_token_saver_via_api() {
+        use tower::ServiceExt;
+        let state = setup_test_state().await;
+        let app = router(state.clone());
+
+        // Admin (alice) enables the token saver for `engineering` with a
+        // budget.
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::PUT)
+            .uri("/admin/v1/group-policies/engineering")
+            .header("content-type", "application/json")
+            .header("x-oac-user-subject", "alice")
+            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .body(axum::body::Body::from(
+                r#"{"token_saver_enabled": true, "max_input_tokens": 8000}"#.to_string(),
+            ))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        // The response body must echo the saver config.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["token_saver_enabled"], true);
+        assert_eq!(json["max_input_tokens"], 8000);
+
+        // The resolved policy reflects it (persisted to the policy store).
+        let policy = state
+            .policy_store
+            .get_policy("engineering")
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(policy.token_saver_enabled);
+        assert_eq!(policy.max_input_tokens, Some(8000));
+    }
+
+    #[tokio::test]
+    async fn admin_rejects_invalid_token_saver_budget() {
+        use tower::ServiceExt;
+        let state = setup_test_state().await;
+        let app = router(state.clone());
+
+        // A non-positive budget must be rejected.
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::PUT)
+            .uri("/admin/v1/group-policies/engineering")
+            .header("content-type", "application/json")
+            .header("x-oac-user-subject", "alice")
+            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .body(axum::body::Body::from(
+                r#"{"token_saver_enabled": true, "max_input_tokens": -5}"#.to_string(),
+            ))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::BAD_REQUEST,
+            "negative budget must be rejected"
+        );
     }
 }

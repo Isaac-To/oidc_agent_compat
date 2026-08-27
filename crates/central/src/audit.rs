@@ -55,6 +55,14 @@ pub struct AuditEntry {
     pub denial_reason: Option<String>,
     /// The estimated cost in USD (enrichment; populated in phase 3).
     pub cost_usd: Option<f64>,
+    /// Whether the token saver optimised this request.
+    pub token_saver_applied: Option<bool>,
+    /// Estimated tokens saved by the token saver for this request.
+    pub tokens_saved: Option<i64>,
+    /// Total whole messages dropped (duplicates + budget + empty).
+    pub messages_dropped: Option<i64>,
+    /// Human-readable reason tags for what the saver did, as JSON.
+    pub saver_reasons: Option<String>,
 }
 
 /// The audit logger, backed by the central proxy's database.
@@ -141,14 +149,32 @@ impl AuditLogger {
             .cost_usd
             .map(|v| Value::Double(Some(v)))
             .unwrap_or(Value::Double(None));
+        let saver_applied_value = entry
+            .token_saver_applied
+            .map(|v| Value::Bool(Some(v)))
+            .unwrap_or(Value::Bool(None));
+        let tokens_saved_value = entry
+            .tokens_saved
+            .map(|v| Value::BigInt(Some(v)))
+            .unwrap_or(Value::BigInt(None));
+        let messages_dropped_value = entry
+            .messages_dropped
+            .map(|v| Value::BigInt(Some(v)))
+            .unwrap_or(Value::BigInt(None));
+        let saver_reasons_value = entry
+            .saver_reasons
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
 
         let sql = "INSERT INTO audit_log \
              (id, device_id, user_subject, model, backend, status, latency_ms, stream, \
              prompt_tokens, completion_tokens, total_tokens, created_at, \
              identity_id, email, groups, endpoint, request_id, \
-             permission_decision, denial_reason, cost_usd) \
+             permission_decision, denial_reason, cost_usd, \
+             token_saver_applied, tokens_saved, messages_dropped, saver_reasons) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-             $13, $14, $15, $16, $17, $18, $19, $20)";
+             $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)";
 
         self.db
             .execute(Statement::from_sql_and_values(
@@ -175,6 +201,10 @@ impl AuditLogger {
                     permission_decision_value,
                     denial_reason_value,
                     cost_value,
+                    saver_applied_value,
+                    tokens_saved_value,
+                    messages_dropped_value,
+                    saver_reasons_value,
                 ],
             ))
             .await
@@ -216,6 +246,10 @@ mod tests {
             permission_decision: Some("allowed".into()),
             denial_reason: None,
             cost_usd: Some(0.0021),
+            token_saver_applied: Some(true),
+            tokens_saved: Some(42),
+            messages_dropped: Some(3),
+            saver_reasons: Some(r#"["dedup"]"#.into()),
         };
         logger.record(&entry).await.expect("record");
 
@@ -264,6 +298,10 @@ mod tests {
             permission_decision: None,
             denial_reason: None,
             cost_usd: None,
+            token_saver_applied: None,
+            tokens_saved: None,
+            messages_dropped: None,
+            saver_reasons: None,
         };
         logger.record(&entry).await.expect("record");
 
@@ -301,6 +339,10 @@ mod tests {
             permission_decision: None,
             denial_reason: None,
             cost_usd: None,
+            token_saver_applied: None,
+            tokens_saved: None,
+            messages_dropped: None,
+            saver_reasons: None,
         };
         logger.record(&entry).await.expect("record");
 

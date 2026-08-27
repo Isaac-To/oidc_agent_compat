@@ -49,6 +49,14 @@ pub struct Model {
     pub denial_reason: Option<String>,
     /// The estimated cost in USD (enrichment; populated in phase 3).
     pub cost_usd: Option<f64>,
+    /// Whether the token saver optimised this request (enrichment).
+    pub token_saver_applied: Option<bool>,
+    /// Estimated tokens saved by the token saver for this request.
+    pub tokens_saved: Option<i64>,
+    /// Total whole messages dropped (duplicates + budget + empty).
+    pub messages_dropped: Option<i64>,
+    /// Human-readable reason tags for what the saver did, as JSON.
+    pub saver_reasons: Option<String>,
 }
 
 /// Relations (none for v1).
