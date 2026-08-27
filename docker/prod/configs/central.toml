@@ -13,10 +13,13 @@ dev_mode = false
 [oidc]
 # Your OIDC provider. Must be reachable from the central container.
 issuer = "https://idp.example.com/realms/your-realm"
-client_id = "oac-relay"
+# Central does NOT log in or validate tokens itself — it trusts the identity
+# forwarded by the relay over mTLS. This client_id is not used at runtime;
+# oac-relay is the OIDC relying party. (The relay must request "groups".)
+client_id = "oac-central"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
-scopes = ["openid", "email", "profile"]
+scopes = ["openid"]
 
 [mtls]
 # mTLS certs — mount read-only. The CA validates relay client certs.

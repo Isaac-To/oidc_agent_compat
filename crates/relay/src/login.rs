@@ -374,7 +374,17 @@ async fn wait_for_callback(
     let (stream, _) = match accept_result {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return Err(Error::oidc(format!("accept callback: {e}"))),
-        Err(_) => return Err(Error::oidc("timed out waiting for login callback")),
+        Err(_) => {
+            return Err(Error::oidc(format!(
+                "timed out waiting for login callback after {}s — \
+                 complete the login in your browser within this window, \
+                 and ensure the authorization URL was opened (if it did not \
+                 open automatically, copy and paste it into a browser). \
+                 If the IdP redirected to a non-loopback URL, check the \
+                 redirect_uri in your relay config",
+                timeout.as_secs()
+            )));
+        }
     };
 
     use tokio::io::AsyncReadExt;
