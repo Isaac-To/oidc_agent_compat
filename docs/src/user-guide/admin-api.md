@@ -119,11 +119,18 @@ Create or update a policy.
   "allowed_models": ["gpt-4o", "gpt-4o-mini"],
   "allowed_endpoints": ["/v1/chat/completions"],
   "daily_token_quota": 1000000,
-  "daily_request_quota": 1000
+  "daily_request_quota": 1000,
+  "token_saver_enabled": false,
+  "max_input_tokens": null,
+  "collapse_repeated_lines": false
 }
 ```
 
 All fields are optional (`null` means "all allowed" / "unlimited").
+`token_saver_enabled` defaults to `false`; `max_input_tokens` must be a
+positive integer when set. `collapse_repeated_lines` (default `false`)
+enables the RTK-adapted pass that folds consecutive exact-verbatim repeated
+lines inside a single message into `[×N]` markers.
 
 **Response:** `200` — [`GroupPolicyResponse`](#grouppolicyresponse).
 
@@ -176,7 +183,9 @@ table.
 `endpoint`, `request_id`, `status`, `latency_ms`, `stream`,
 `prompt_tokens`, `completion_tokens`, `total_tokens`,
 `permission_decision`, `denial_reason`, `cost_usd`, `created_at`
-(formatted `YYYY-MM-DD HH:MM:SS`).
+(formatted `YYYY-MM-DD HH:MM:SS`). When the token saver ran on a request,
+entries also carry `token_saver_applied`, `tokens_saved`, `messages_dropped`,
+and `saver_reasons`.
 
 ### Usage
 
@@ -217,7 +226,10 @@ not made a request today, the groups are unknown and both quotas are `null`.
   "allowed_models": ["gpt-4o", "gpt-4o-mini"],
   "allowed_endpoints": ["/v1/chat/completions"],
   "daily_token_quota": 1000000,
-  "daily_request_quota": 1000
+  "daily_request_quota": 1000,
+  "token_saver_enabled": false,
+  "max_input_tokens": null,
+  "collapse_repeated_lines": false
 }
 ```
 
@@ -228,6 +240,9 @@ not made a request today, the groups are unknown and both quotas are `null`.
 | `allowed_endpoints` | `Vec<String>` or `null` | `null` = all endpoints allowed |
 | `daily_token_quota` | `i64` or `null` | `null` = unlimited |
 | `daily_request_quota` | `i64` or `null` | `null` = unlimited |
+| `token_saver_enabled` | `bool` | Whether the safe token saver is enabled |
+| `max_input_tokens` | `i64` or `null` | Per-request budget; `null` = no trimming |
+| `collapse_repeated_lines` | `bool` | RTK-adapted repeated-line collapse; `false` = off |
 
 ### `UpsertPolicyRequest`
 
@@ -236,11 +251,46 @@ not made a request today, the groups are unknown and both quotas are `null`.
   "allowed_models": ["gpt-4o"],
   "allowed_endpoints": ["/v1/chat/completions"],
   "daily_token_quota": 1000000,
-  "daily_request_quota": 1000
+  "daily_request_quota": 1000,
+  "token_saver_enabled": true,
+  "max_input_tokens": 8000,
+  "collapse_repeated_lines": true
 }
 ```
 
 All fields are optional (`null` = all/unlimited).
+
+### Token saver
+
+#### `GET /admin/v1/token-saver`
+
+Aggregate token-saver engagement so admins can observe what the saver is
+doing across groups.
+
+**Response:** `200` — an object with:
+
+```json
+{
+  "groups": [
+    {
+      "group": "engineering",
+      "enabled": true,
+      "max_input_tokens": 8000,
+      "requests_optimized": 12,
+      "tokens_saved": 3400,
+      "messages_dropped": 24
+    }
+  ],
+  "total_requests_optimized": 12,
+  "total_tokens_saved": 3400,
+  "total_messages_dropped": 24
+}
+```
+
+`requests_optimized` counts audit rows where the saver applied; `tokens_saved`
+and `messages_dropped` are sums across those rows. The `enabled` and
+`max_input_tokens` fields reflect the *current* policy configuration. This
+endpoint returns metrics only — never prompt content.
 
 ### `DeviceResponse`
 

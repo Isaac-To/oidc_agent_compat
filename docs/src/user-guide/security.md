@@ -2,7 +2,9 @@
 
 This page is a user-facing summary of the security properties of the OIDC
 Agent Compatibility Server. For the full technical threat model, see
-[Threat Model](../reference/threat-model.md).
+[Threat Model](../reference/threat-model.md). For a consolidated, ordered
+set of deployment checks, see the
+[Production Hardening Checklist](./production-checklist.md).
 
 ## The master key never touches your laptop
 

@@ -26,6 +26,15 @@ pub struct Model {
     pub daily_token_quota: Option<i64>,
     /// Daily request quota (requests per day). `None` means unlimited.
     pub daily_request_quota: Option<i64>,
+    /// Whether the safe token-saver optimiser is enabled for this group.
+    pub token_saver_enabled: bool,
+    /// Whether the RTK-adapted consecutive repeated-line collapse pass is
+    /// enabled for this group (a sub-optimization of the token saver).
+    pub collapse_repeated_lines: bool,
+    /// Per-request input-token budget. When exceeded, the oldest whole turns
+    /// are dropped (never truncated) until the request fits. `None` disables
+    /// budget trimming.
+    pub max_input_tokens: Option<i64>,
     /// When this policy was created.
     pub created_at: TimeDateTime,
     /// When this policy was last updated.

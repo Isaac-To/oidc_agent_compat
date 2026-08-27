@@ -7,10 +7,12 @@ dev_mode = true
 
 [oidc]
 issuer = "http://keycloak:8080/realms/oac-dev"
-client_id = "oac-relay"
+# Central does NOT log in/validate tokens itself — identity comes from the
+# relay over mTLS. client_id is not used at runtime; oac-relay is the RP.
+client_id = "oac-central"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
-scopes = ["openid", "email", "profile"]
+scopes = ["openid"]
 
 [mtls]
 ca_cert_path = "/certs/ca.crt"

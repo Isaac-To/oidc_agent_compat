@@ -5,6 +5,9 @@ container. The relay runs as a **native binary** on each employee's laptop
 (it needs to open a host browser for OIDC login and receive a loopback
 callback — neither works reliably from inside a container).
 
+> Before you deploy, run through the
+> [Production Hardening Checklist](./production-checklist.md).
+
 ## Architecture
 
 ```
@@ -90,10 +93,12 @@ dev_mode = false
 
 [oidc]
 issuer = "https://idp.example.com/realms/your-realm"
-client_id = "oac-relay"
+# Central does not log in/validate tokens itself — identity comes from the
+# relay over mTLS. client_id is not used at runtime; oac-relay is the RP.
+client_id = "oac-central"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
-scopes = ["openid", "email", "profile"]
+scopes = ["openid"]
 
 [mtls]
 ca_cert_path = "/certs/ca.crt"
@@ -145,7 +150,8 @@ issuer = "https://idp.example.com/realms/your-realm"
 client_id = "oac-relay"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
-scopes = ["openid", "email", "profile"]
+# "groups" is REQUIRED for group-based policy enforcement and admin access.
+scopes = ["openid", "email", "profile", "groups"]
 
 [central]
 url = "https://central.example.com:8443"

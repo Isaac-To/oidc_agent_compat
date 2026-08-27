@@ -29,6 +29,7 @@ use oidc_agent_common::http_util;
 
 use super::AppState;
 use crate::audit::AuditEntry;
+use crate::optimizer::{self, OptimizationReport};
 
 /// Builds the HTTP client for forwarding to the backend.
 ///
@@ -79,6 +80,7 @@ pub async fn proxy_handler(
                 stream,
                 usage,
                 deferred,
+                saver_report,
             } = outcome;
             let context = AccountingContext {
                 state: state.clone(),
@@ -89,6 +91,7 @@ pub async fn proxy_handler(
                 provider_name,
                 status,
                 start,
+                saver_report,
             };
             match deferred {
                 // Streaming: the body (and its token usage) arrives after
@@ -173,6 +176,8 @@ struct AccountingContext {
     status: StatusCode,
     /// When the request arrived at the proxy handler.
     start: Instant,
+    /// The token-saver optimisation report for this request, if applied.
+    saver_report: Option<OptimizationReport>,
 }
 
 /// A handle for deferred accounting of a streaming response.
@@ -204,6 +209,8 @@ struct ForwardOutcome {
     usage: TokenUsage,
     /// For streaming responses: the deferred accounting handle.
     deferred: Option<DeferredAccounting>,
+    /// The token-saver optimisation report for this request, if applied.
+    saver_report: Option<OptimizationReport>,
 }
 
 /// Records the audit entry and increments the usage counters for a
@@ -262,6 +269,33 @@ async fn record_request_outcome(context: &AccountingContext, usage: TokenUsage, 
             .as_ref()
             .and_then(|d| d.reason.clone()),
         cost_usd: Some(cost_usd),
+        // Token-saver accounting, derived from the pure optimizer report.
+        // Only ever metrics/reason tags — never prompt content.
+        token_saver_applied: context.saver_report.as_ref().map(|r| r.applied),
+        tokens_saved: context.saver_report.as_ref().map(|r| r.tokens_saved as i64),
+        // `messages_dropped` counts only whole messages that were actually
+        // removed (dedup + budget + empty). Collapsed lines are NOT dropped
+        // messages — the RTK pass preserves every distinct line (folded into
+        // `[×N]` entries), so it never contributes to `messages_dropped`.
+        messages_dropped: context.saver_report.as_ref().map(|r| {
+            (r.dup_messages_dropped + r.budget_turns_dropped + r.empty_messages_dropped) as i64
+        }),
+        saver_reasons: context.saver_report.as_ref().map(|r| {
+            let mut reasons = Vec::new();
+            if r.dup_messages_dropped > 0 {
+                reasons.push("dedup".to_string());
+            }
+            if r.budget_turns_dropped > 0 {
+                reasons.push("budget_trim".to_string());
+            }
+            if r.empty_messages_dropped > 0 {
+                reasons.push("empty_removed".to_string());
+            }
+            if r.collapsed_lines > 0 {
+                reasons.push("rtk_collapse".to_string());
+            }
+            serde_json::to_string(&reasons).unwrap_or_default()
+        }),
     };
     if let Err(e) = context.state.audit.record(&entry).await {
         tracing::error!(error = %e, "failed to write audit log");
@@ -311,6 +345,29 @@ async fn forward_request(
         .await
         .map_err(|e| Error::Http(format!("read body: {e}")))?;
     let model = http_util::extract_model(&body_bytes);
+
+    // Apply the admin-controlled token-saver optimiser (if enabled for this
+    // user's groups). The config comes from the resolved policy attached by
+    // the permissions middleware — never from the client. The optimisation
+    // is safe-by-construction (see `optimizer`): it drops only exact
+    // duplicates, structurally-empty messages, and oldest whole turns under
+    // a budget, and never rewrites kept content.
+    let (body_bytes, saver_report) = match parts
+        .extensions
+        .get::<super::permissions::TokenSaverGrant>()
+        .copied()
+    {
+        Some(grant) => {
+            let (optimized, report) = optimizer::optimize_prompt(&body_bytes, grant.config);
+            if report.applied {
+                (optimized, Some(report))
+            } else {
+                (body_bytes, None)
+            }
+        }
+        None => (body_bytes, None),
+    };
+
     // Ask streaming backends to report token usage in the final SSE chunk
     // (OpenAI only sends `usage` when `stream_options.include_usage=true`).
     let body_bytes = inject_stream_usage_option(body_bytes);
@@ -402,6 +459,7 @@ async fn forward_request(
             stream: is_stream,
             usage,
             deferred: None,
+            saver_report,
         });
     }
 
@@ -436,6 +494,7 @@ async fn forward_request(
             usage: usage_handle,
             done,
         }),
+        saver_report,
     })
 }
 

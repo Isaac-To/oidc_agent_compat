@@ -176,6 +176,8 @@ impl MigratorTrait for Migrator {
             Box::new(Migration0003GroupPolicies),
             Box::new(Migration0004UsageCounters),
             Box::new(Migration0005Providers),
+            Box::new(Migration0006TokenSaver),
+            Box::new(Migration0007CollapseRepeatedLines),
         ]
     }
 }
@@ -699,4 +701,125 @@ pub enum UsageCounter {
     TokenCount,
     /// Cumulative cost in USD for the period.
     CostUsd,
+}
+
+/// Migration 0006: add the token-saver feature to `group_policies` and
+/// enrich `audit_log` with token-saver accounting.
+///
+/// The token-saver lets admins enable safe request optimisers per group. It
+/// is added as columns on `group_policies`:
+/// - `token_saver_enabled`: master on/off switch (default `false`).
+/// - `max_input_tokens`: a per-request input-token budget. When a request
+///   exceeds it, the oldest whole turns are dropped (never truncated) until
+///   it fits. `NULL` disables budget trimming.
+///
+/// The audit log gains per-request accounting so admins can "watch what is
+/// going on":
+/// - `token_saver_applied`: whether the optimiser changed the request.
+/// - `tokens_saved`: estimated tokens saved.
+/// - `messages_dropped`: total whole messages removed (dups + budget + empty).
+/// - `saver_reasons`: JSON array of human-readable reason tags.
+///
+/// All new columns are nullable, so existing rows remain valid. SQLite has no
+/// `DROP COLUMN` for these ALTERed columns; the `down` path is a no-op
+/// (consistent with the 0002 enrichment migration).
+pub struct Migration0006TokenSaver;
+
+impl MigrationName for Migration0006TokenSaver {
+    fn name(&self) -> &str {
+        "m000006_token_saver"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0006TokenSaver {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Add token-saver columns to group_policies.
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE group_policies \
+                 ADD COLUMN token_saver_enabled BOOLEAN NOT NULL DEFAULT false;",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE group_policies \
+                 ADD COLUMN max_input_tokens BIGINT NULL;",
+            )
+            .await?;
+
+        // Add token-saver accounting columns to audit_log.
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE audit_log \
+                 ADD COLUMN token_saver_applied BOOLEAN NULL;",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE audit_log \
+                 ADD COLUMN tokens_saved BIGINT NULL;",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE audit_log \
+                 ADD COLUMN messages_dropped BIGINT NULL;",
+            )
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE audit_log \
+                 ADD COLUMN saver_reasons TEXT NULL;",
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // SQLite does not support DROP COLUMN before 3.35 for ALTERed
+        // columns. This migration is forward-only in practice; no-op down.
+        let _ = manager;
+        Ok(())
+    }
+}
+
+/// Migration 0007: add the RTK-adapted repeated-line collapse toggle to
+/// `group_policies`.
+///
+/// `collapse_repeated_lines` lets admins enable the consecutive repeated-line
+/// collapse pass (adapting RTK's log-line collapse) on top of the token
+/// saver. It defaults to `false` — this pass is a more aggressive (still
+/// audited) optimization that admins opt into explicitly.
+pub struct Migration0007CollapseRepeatedLines;
+
+impl MigrationName for Migration0007CollapseRepeatedLines {
+    fn name(&self) -> &str {
+        "m000007_collapse_repeated_lines"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0007CollapseRepeatedLines {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE group_policies \
+                 ADD COLUMN collapse_repeated_lines BOOLEAN NOT NULL DEFAULT false;",
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let _ = manager;
+        Ok(())
+    }
 }

@@ -56,6 +56,13 @@ are non-negotiable.
   branches.
 - Squash-merge or rebase-merge into `master` when the work is complete and
   verified.
+- **CI/CD is a hard gate before merge.** Never merge (or ask a human to
+  merge) a branch into `master` until all CI checks on that branch pass:
+  formatting, clippy, tests, release build, and `./docker/dev.sh test` (if
+  Docker-relevant code changed). If CI is blocked on a pre-existing
+  failure or an environment issue, say so explicitly in the merge summary
+  rather than merging with red checks. Do not use "skip CI" or force
+  workflows as a workaround.
 
 ### 3. Test comprehensively
 
@@ -191,7 +198,8 @@ Key modules:
 - `crates/central/src/policy.rs` — `PolicyStore` + `resolve_policy` (group→policy merge, most-permissive-wins).
 - `crates/central/src/device_store.rs` — device registration + revocation store.
 - `crates/central/src/provider.rs` — runtime provider/key store; provider keys are AES-256-GCM encrypted at rest with the configured MEK.
-- `crates/central/src/audit.rs` — audit logger (enriched with identity, groups, endpoint, request-id, permission decision).
+- `crates/central/src/audit.rs` — audit logger (enriched with identity, groups, endpoint, request-id, permission decision, token-saver accounting).
+- `crates/central/src/optimizer.rs` — the safe, admin-controlled token saver: a pure module that dedupes exact-verbatim messages, removes structurally-empty messages/`tools`, drops oldest whole turns under a budget, and (opt-in via `collapse_repeated_lines`) collapses consecutive exact-verbatim repeated lines inside a single message into `[×N]` markers (RTK-adapted, lossless-by-construction). **Never rewrites kept content except for the opt-in repeated-line collapse.** Driven by `TokenSaverConfig` from the resolved policy; gated server-side only.
 - `crates/central/src/db.rs`, `migration.rs`, `entity/` — central persistence.
 
 ---

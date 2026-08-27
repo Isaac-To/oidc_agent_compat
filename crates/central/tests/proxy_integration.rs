@@ -1258,3 +1258,455 @@ async fn no_provider_configured_returns_error_without_key_leak() {
         "error responses must not leak key material: {body}"
     );
 }
+
+/// End-to-end test of the token saver:
+/// - Admin enables the token saver (via the policy store) for a group.
+/// - A request from that group containing an exact duplicate + an empty
+///   content message is forwarded.
+/// - The mock backend receives a DEDUPLICATED body (the duplicate and empty
+///   messages removed).
+/// - The audit log records the applied saver, tokens saved, and reason tags.
+/// - A request from a non-saver group is untouched (saver applies only to
+///   groups/admin-enabled).
+#[tokio::test]
+async fn token_saver_deduplicates_and_audits() {
+    use std::sync::{Arc, Mutex};
+
+    // Capturing mock backend that records the forwarded request body.
+    let received: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    let mock_backend = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |body: String| {
+            let captured = captured.clone();
+            async move {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    captured.lock().expect("lock").push(v);
+                }
+                (
+                    [("content-type", "application/json")],
+                    r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                )
+            }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_backend).await;
+    });
+
+    // Central DB + stores.
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-saver-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let url = format!("sqlite://{}?mode=rwc", tmp.display());
+    let db = oac_central::db::setup(&url).await.expect("db setup");
+    let audit = AuditLogger::new(db.clone());
+    let policy_store = oac_central::policy::PolicyStore::new(db.clone());
+    // Admin enables the token saver for the `engineering` group, with a
+    // budget large enough that only dedup/empty removal applies.
+    policy_store
+        .upsert_policy_full(
+            "engineering",
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some(100_000),
+            true,
+        )
+        .await
+        .expect("enable saver for engineering");
+
+    let config = oidc_agent_common::config::CentralConfig {
+        listen_addr: "127.0.0.1:0".parse().expect("addr"),
+        database_url: "sqlite://test.db".into(),
+        oidc: oidc_agent_common::config::OidcConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "test".into(),
+            client_secret_env: "TEST".into(),
+            redirect_uri: "http://127.0.0.1:0/callback".into(),
+            scopes: vec!["openid".into()],
+        },
+        mtls: oidc_agent_common::config::MtlsServerConfig {
+            ca_cert_path: "/ca.pem".into(),
+            server_cert_path: "/server.pem".into(),
+            server_key_path: "/server.key".into(),
+        },
+        admin: None,
+        pricing: None,
+        dev_mode: true,
+        rate_limit_requests: 60,
+        rate_limit_window_secs: 60,
+    };
+    let provider_store = ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&ProviderInput {
+            id: "mock".into(),
+            name: "mock".into(),
+            base_url: format!("http://{mock_addr}"),
+            enabled: true,
+            is_default: true,
+            models: Some(vec!["gpt-4".into()]),
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key("mock", "test-key", "sk-test-master-key-12345", 0, &[])
+        .await
+        .expect("provider key");
+    let client = proxy::forward::build_client().expect("client");
+    let state = proxy::AppState {
+        config: config.clone(),
+        provider_store,
+        client,
+        audit: audit.clone(),
+        rate_limiter: None,
+        policy_store: policy_store.clone(),
+        device_store: oac_central::device_store::DeviceStore::new(db.clone()),
+        usage_tracker: oac_central::usage::UsageTracker::new(db.clone()),
+        price_table: oac_central::pricing::PriceTable::empty(),
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind central");
+    let addr = listener.local_addr().expect("central addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let http = reqwest::Client::new();
+    // Request from the `engineering` group with one exact duplicate + one
+    // empty-content message. These are semantically lossless to remove.
+    let body = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "user", "content": "fix the bug"},
+            {"role": "user", "content": ""},
+            {"role": "user", "content": "fix the bug"},
+            {"role": "user", "content": "and add tests"}
+        ]
+    });
+    let resp = http
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            addr.port()
+        ))
+        .header("Content-Type", "application/json")
+        .header("x-oac-user-subject", "alice")
+        .header("x-oac-user-groups", r#"["engineering"]"#)
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // The backend must have received a body without the duplicate or the
+    // empty message.
+    let captured = received.lock().expect("lock").clone();
+    assert_eq!(captured.len(), 1, "backend received one request");
+    let upstream_msgs = captured[0]["messages"].as_array().expect("messages");
+    let contents: Vec<&str> = upstream_msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap())
+        .collect();
+    assert!(
+        !contents.contains(&""),
+        "empty-content message must be removed upstream"
+    );
+    // Exactly one occurrence of "fix the bug" survives (the other was an
+    // exact-verbatim duplicate).
+    let dedup_count = contents.iter().filter(|c| **c == "fix the bug").count();
+    assert_eq!(dedup_count, 1, "exact duplicate must be removed upstream");
+    assert_eq!(
+        contents.len(),
+        2,
+        "four messages -> two after dedup + empty removal"
+    );
+
+    // The audit log must record the saver application + savings.
+    use oac_central::entity::audit_log;
+    use sea_orm::EntityTrait;
+    let entries = audit_log::Entity::find()
+        .all(audit.db())
+        .await
+        .expect("load audit");
+    let entry = entries
+        .iter()
+        .find(|e| e.user_subject == "alice")
+        .expect("audit entry for alice exists");
+    assert_eq!(entry.token_saver_applied, Some(true));
+    assert_eq!(entry.messages_dropped, Some(2));
+    assert!(entry.tokens_saved.unwrap_or(0) > 0, "tokens saved > 0");
+    let reasons: Vec<String> =
+        serde_json::from_str(entry.saver_reasons.as_deref().unwrap_or("[]")).expect("reasons json");
+    assert!(
+        reasons.contains(&"dedup".to_string()),
+        "reason: {reasons:?}"
+    );
+    assert!(
+        reasons.contains(&"empty_removed".to_string()),
+        "reason: {reasons:?}"
+    );
+
+    // A request from a NON-saver group must pass through untouched.
+    let resp2 = http
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            addr.port()
+        ))
+        .header("Content-Type", "application/json")
+        .header("x-oac-user-subject", "bob")
+        .header("x-oac-user-groups", r#"["sales"]"#)
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+    let captured2 = received.lock().expect("lock").clone();
+    assert_eq!(captured2.len(), 2, "second request received");
+    assert_eq!(
+        captured2[1]["messages"].as_array().expect("messages").len(),
+        4,
+        "non-saver group must not be optimised"
+    );
+}
+
+/// End-to-end test of the RTK-adapted repeated-line collapse pass:
+/// - Admin enables the token saver WITH `collapse_repeated_lines` for a
+///   group.
+/// - A request from that group carries a single message whose content has a
+///   run of consecutive verbatim-repeated lines (as a multi-turn agent often
+///   accumulates in editors/logs).
+/// - The mock backend receives the SAME message with the repeated lines
+///   folded into `[×N]` markers; the representative first line survives.
+/// - The audit log records `rtk_collapse` in `saver_reasons`.
+/// - A group that enabled the saver but NOT collapse keeps its content
+///   byte-identical (collapse is independent of the budget pass).
+#[tokio::test]
+async fn rtk_collapse_repeated_lines_end_to_end() {
+    use std::sync::{Arc, Mutex};
+
+    // Capturing mock backend that records the forwarded request body.
+    let received: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = received.clone();
+    let mock_backend = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(move |body: String| {
+            let captured = captured.clone();
+            async move {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    captured.lock().expect("lock").push(v);
+                }
+                (
+                    [("content-type", "application/json")],
+                    r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#,
+                )
+            }
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(mock_listener, mock_backend).await;
+    });
+
+    // Central DB + stores.
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-rtk-collapse-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let url = format!("sqlite://{}?mode=rwc", tmp.display());
+    let db = oac_central::db::setup(&url).await.expect("db setup");
+    let audit = AuditLogger::new(db.clone());
+    let policy_store = oac_central::policy::PolicyStore::new(db.clone());
+
+    let config = oidc_agent_common::config::CentralConfig {
+        listen_addr: "127.0.0.1:0".parse().expect("addr"),
+        database_url: "sqlite://test.db".into(),
+        oidc: oidc_agent_common::config::OidcConfig {
+            issuer: "https://idp.example.com".into(),
+            client_id: "test".into(),
+            client_secret_env: "TEST".into(),
+            redirect_uri: "http://127.0.0.1:0/callback".into(),
+            scopes: vec!["openid".into()],
+        },
+        mtls: oidc_agent_common::config::MtlsServerConfig {
+            ca_cert_path: "/ca.pem".into(),
+            server_cert_path: "/server.pem".into(),
+            server_key_path: "/server.key".into(),
+        },
+        admin: None,
+        pricing: None,
+        dev_mode: true,
+        rate_limit_requests: 60,
+        rate_limit_window_secs: 60,
+    };
+    let provider_store = ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&ProviderInput {
+            id: "mock".into(),
+            name: "mock".into(),
+            base_url: format!("http://{mock_addr}"),
+            enabled: true,
+            is_default: true,
+            models: Some(vec!["gpt-4".into()]),
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key("mock", "test-key", "sk-test-master-key-12345", 0, &[])
+        .await
+        .expect("provider key");
+    let client = proxy::forward::build_client().expect("client");
+    let state = proxy::AppState {
+        config: config.clone(),
+        provider_store,
+        client,
+        audit: audit.clone(),
+        rate_limiter: None,
+        policy_store: policy_store.clone(),
+        device_store: oac_central::device_store::DeviceStore::new(db.clone()),
+        usage_tracker: oac_central::usage::UsageTracker::new(db.clone()),
+        price_table: oac_central::pricing::PriceTable::empty(),
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind central");
+    let addr = listener.local_addr().expect("central addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let http = reqwest::Client::new();
+
+    // --- Group A: collapse enabled. The request body has a single message
+    // whose content contains a long run of verbatim-repeated lines, as an
+    // editor/log heavy multiturn session would produce.
+    policy_store
+        .upsert_policy_full(
+            "group-collapse",
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some(50_000),
+            true,
+        )
+        .await
+        .expect("enable collapse for group-collapse");
+    let repeated_content = "refactor the parser module\nwarning: unused import detected in src/main.rs\nwarning: unused import detected in src/main.rs\nwarning: unused import detected in src/main.rs\nfinished refactor\nnext: tweak config tests\nwarning: cache miss retriggering build step\nwarning: cache miss retriggering build step";
+    let resp = http
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            addr.port()
+        ))
+        .header("Content-Type", "application/json")
+        .header("x-oac-user-subject", "alice")
+        .header("x-oac-user-groups", r#"["group-collapse"]"#)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": repeated_content}]
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    let collapsed_body = {
+        let guard = received.lock().expect("lock");
+        guard.last().expect("captured").clone()
+    };
+    let upstream_content = collapsed_body["messages"][0]["content"]
+        .as_str()
+        .expect("content string");
+    // Consecutive exact-verbatim duplicates are folded into `[×N]` markers,
+    // keeping the representative first line.
+    let expected = "refactor the parser module\n[×3] warning: unused import detected in src/main.rs\nfinished refactor\nnext: tweak config tests\n[×2] warning: cache miss retriggering build step";
+    assert_eq!(
+        upstream_content, expected,
+        "repeated lines must collapse to [×N] markers"
+    );
+    // The collapse never rewrites the surrounding structure: the message
+    // survives as a single user turn with the same role/model fields.
+    assert_eq!(collapsed_body["model"], serde_json::json!("gpt-4"));
+
+    // Audit must record the collapse reason tag.
+    use oac_central::entity::audit_log;
+    use sea_orm::EntityTrait;
+    let entries = audit_log::Entity::find()
+        .all(audit.db())
+        .await
+        .expect("load audit");
+    let entry = entries
+        .iter()
+        .find(|e| e.user_subject == "alice")
+        .expect("audit entry for alice exists");
+    assert_eq!(entry.token_saver_applied, Some(true));
+    assert!(entry.tokens_saved.unwrap_or(0) > 0, "tokens saved > 0");
+    let reasons: Vec<String> =
+        serde_json::from_str(entry.saver_reasons.as_deref().unwrap_or("[]")).expect("reasons json");
+    assert!(
+        reasons.contains(&"rtk_collapse".to_string()),
+        "reason: {reasons:?}"
+    );
+
+    // --- Group B: saver enabled but collapse OFF. The exact same content
+    // must pass through byte-identical — collapse is an independent opt-in.
+    policy_store
+        .upsert_policy_full(
+            "group-nocollapse",
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some(50_000),
+            false,
+        )
+        .await
+        .expect("enable saver (no collapse) for group-nocollapse");
+    let resp2 = http
+        .post(format!(
+            "http://127.0.0.1:{}/v1/chat/completions",
+            addr.port()
+        ))
+        .header("Content-Type", "application/json")
+        .header("x-oac-user-subject", "bob")
+        .header("x-oac-user-groups", r#"["group-nocollapse"]"#)
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": repeated_content}]
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp2.status(), reqwest::StatusCode::OK);
+    let nocollapse_body = {
+        let guard = received.lock().expect("lock");
+        guard.last().expect("captured").clone()
+    };
+    assert_eq!(
+        nocollapse_body["messages"][0]["content"].as_str(),
+        Some(repeated_content),
+        "collapse-disabled group must keep content verbatim"
+    );
+}

@@ -18,6 +18,7 @@
 - [Docker: Production](./user-guide/docker-prod.md)
 - [Troubleshooting](./user-guide/troubleshooting.md)
 - [Security for Users](./user-guide/security.md)
+- [Production Hardening Checklist](./user-guide/production-checklist.md)
 
 # Developer Guide
 

@@ -18,7 +18,10 @@ client_id = "oac-relay"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 # Loopback redirect, any port (RFC 8252). The relay picks a free port at login.
 redirect_uri = "http://127.0.0.1:0/callback"
-scopes = ["openid", "email", "profile"]
+# The "groups" scope is REQUIRED for group-based policy enforcement and
+# admin authorization. Without it, the IdP is never asked for the user's
+# group memberships and central cannot enforce group policies / admin group.
+scopes = ["openid", "email", "profile", "groups"]
 
 [central]
 # The company-hosted central proxy. mTLS is required in production.
