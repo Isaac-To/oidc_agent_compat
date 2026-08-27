@@ -267,7 +267,7 @@ fn home_dir() -> Result<Option<PathBuf>> {
             .or_else(|| {
                 let drive = std::env::var_os("HOMEDRIVE")?;
                 let path = std::env::var_os("HOMEPATH")?;
-                Some(PathBuf::from(drive).join(path))
+                Some(PathBuf::from(drive).join(path).into_os_string())
             })
             .map(PathBuf::from))
     }
