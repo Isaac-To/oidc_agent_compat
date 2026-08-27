@@ -20,13 +20,18 @@
 //!   arrays of `tools` are removed only when they are structurally empty and
 //!   therefore contribute nothing to the backend.
 //! - **Consecutive repeated-line collapse (RTK-adapted)**: within a *single*
-//!   message's `content`, runs of normalized-identical lines are collapsed
+//!   message's `content`, runs of exact-verbatim repeated lines are collapsed
 //!   into one representative line with a `[×N]` count (adapting RTK's
 //!   `analyze_logs`). This is limited to *consecutive* runs inside one
 //!   message, so it never merges distinct turns or non-adjacent information.
+//!   It is lossless-by-construction: only exact-verbatim consecutive
+//!   duplicates are folded, every distinct line is preserved verbatim (no
+//!   truncation, no entry-cap drop), and a run is only folded when the `[×N]`
+//!   marker is no longer than the original run (so the output never grows).
 //! - **Never rewrites content**: no token-level compression, no
 //!   rephrasing, no summarisation. The optimiser rewrites only structure and
-//!   drop granularity, never the text of any kept message.
+//!   drop granularity, never the text of any kept message (the opt-in
+//!   repeated-line collapse keeps representative lines verbatim).
 //!
 //! # What this does *not* do
 //!
@@ -42,11 +47,17 @@
 //!
 //! # Upstream attribution
 //!
-//! The repeated-line collapse pass adapts the line-normalization + collapse
-//! approach from [RTK](https://github.com/rtk-ai/rtk)
-//! (`src/cmds/system/log_cmd.rs`, Apache-2.0). The normalization
-//! (`normalize_log_line`) and count-preserving collapse are ported here with
-//! the upstream Apache-2.0 attribution retained.
+//! The repeated-line collapse pass is *inspired by* RTK
+//! ([https://github.com/rtk-ai/rtk](https://github.com/rtk-ai/rtk),
+//! `src/cmds/system/log_cmd.rs`, `normalize_log_line` + the count-preserving
+//! `[×N]` fold, Apache-2.0; vendored at `vendor/rtk` for source-tracking).
+//! We deliberately diverge from RTK's `analyze_logs` in one crucial way: RTK
+//! uses *fuzzy* normalization that strips timestamps/UUIDs/numbers/paths and
+//! truncates lines to 100 chars, which can merge lines that are actually
+//! distinct. Because this proxy must never lose meaning a developer intended,
+//! our collapse matches **exact-verbatim** consecutive duplicates only and
+//! never truncates or caps the number of kept lines. RTK is retained as a
+//! vendored reference/attribution, not linked as a runtime dependency.
 
 /// The outcome of applying the optimiser to a single request body.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -306,7 +317,13 @@ pub fn optimize_prompt(
     report.tokens_saved = report
         .input_tokens_before
         .saturating_sub(report.input_tokens_after);
-    report.applied = report.tokens_saved > 0;
+    // `applied` reflects that we actually rewrote the body (structure changed:
+    // a message/tool was dropped, and/or lines were collapsed). It is NOT
+    // derived from `tokens_saved`, because the chars/4 heuristic can round to
+    // zero savings (e.g. after removing a tiny message near a ceil boundary)
+    // even though the body differs. Reporting `applied=false` for a rewritten
+    // body would be inconsistent with the audit/`saver_reasons` accounting.
+    report.applied = changed;
 
     match serde_json::to_vec(&value) {
         Ok(encoded) => (bytes::Bytes::from(encoded), report),
@@ -333,32 +350,37 @@ fn body_for_estimate(value: &serde_json::Value) -> String {
     out
 }
 
-// --- RTK-adapted repeated-line collapse ------------------------------------
+// --- RTK-inspired repeated-line collapse ------------------------------------
 //
-// The following adapt RTK's `normalize_log_line` + `analyze_logs`
-// (https://github.com/rtk-ai/rtk, `src/cmds/system/log_cmd.rs`, Apache-2.0)
-// to collapse consecutive repeated lines inside a single message's content.
-// Attribution retained per Apache-2.0.
-
-/// Maximum distinct collapsed entries to retain within a single message.
-const MAX_COLLAPSED_ENTRIES: usize = 30;
-/// Long lines are truncated to this many chars (RTK uses 100).
-const MAX_LINE_CHARS: usize = 100;
+// Inspired by RTK's `normalize_log_line` + count-preserving `[×N]` fold
+// (https://github.com/rtk-ai/rtk, `src/cmds/system/log_cmd.rs`, Apache-2.0,
+// vendored at `vendor/rtk` for attribution). We intentionally use
+// exact-verbatim consecutive matching here (NOT RTK's fuzzy normalization),
+// because fuzzy stripping can merge distinct developer content. See the
+// module-level "Upstream attribution" section.
 
 /// Collapses consecutive runs of identical lines in `content` into `[×N]`
 /// representative lines.
 ///
-/// Operates on a *single* message's content string. Iff no run of length > 1
-/// is found, returns the original string unchanged. Only consecutive runs are
-/// collapsed (so ordering and non-adjacent distinct lines are preserved), and
-/// the count is preserved in the `[×N]` annotation.
+/// Operates on a *single* message's content string. Only *consecutive* runs
+/// are collapsed (so ordering and non-adjacent distinct lines are
+/// preserved). A run is folded into a `[×N]` marker **only when that marker
+/// is no longer than the original run of lines**, guaranteeing the output is
+/// never larger than the input (no pointless rewriting of content that is
+/// already token-cheap).
 ///
 /// # Safety
 ///
-/// Only **exact-verbatim** consecutive duplicate lines are collapsed, so the
-/// pass is lossless-by-construction: it can only remove a line that was
-/// already present byte-for-byte in the immediately preceding line. It never
-/// merges lines that merely "look similar" under fuzzy normalization.
+/// The pass is **lossless-by-construction**:
+/// - Only **exact-verbatim** consecutive duplicate lines are folded; the
+///   pass never merges lines that merely "look similar" under fuzzy
+///   normalization.
+/// - Every distinct line in the input is preserved, either bare or as the
+///   *full, untruncated* representative of a `[×N]` entry.
+/// - No entry-count cap discards distinct lines: if a message has 1,000
+///   distinct lines, all 1,000 survive (only genuine repeats are removed).
+/// - The count is preserved in the `[×N]` annotation, so nothing is lost
+///   that was not already present verbatim more than once.
 #[must_use]
 fn collapse_repeated_lines(content: &str) -> (String, u64) {
     // Fast path: no newlines -> nothing to collapse.
@@ -380,10 +402,24 @@ fn collapse_repeated_lines(content: &str) -> (String, u64) {
         }
 
         if run_len > 1 {
-            // Collapse the run, keeping the first line with a count marker.
-            let representative = truncate_to_chars(current, MAX_LINE_CHARS);
-            collapsed.push(format!("[×{run_len}] {representative}"));
-            removed += u64::try_from(run_len - 1).unwrap_or(0);
+            // Representative line is kept VERBATIM — never truncated — so no
+            // content is edited away.
+            let marker = format!("[×{run_len}] {current}");
+            // Byte size of the original run: `run_len` copies of the line,
+            // separated by newlines.
+            let literal_len = run_len
+                .saturating_mul(current.len())
+                .saturating_add(run_len.saturating_sub(1));
+            if marker.len() <= literal_len {
+                // Folding strictly-or-equally saves bytes; never grows.
+                collapsed.push(marker);
+                removed += u64::try_from(run_len - 1).unwrap_or(0);
+            } else {
+                // Folding would GROW the message — preserve the lines exactly.
+                for _ in 0..run_len {
+                    collapsed.push(current.to_string());
+                }
+            }
         } else {
             collapsed.push(current.to_string());
         }
@@ -394,25 +430,7 @@ fn collapse_repeated_lines(content: &str) -> (String, u64) {
         return (content.to_string(), 0);
     }
 
-    // Cap the collapsed output to the most relevant (first) entries.
-    if collapsed.len() > MAX_COLLAPSED_ENTRIES {
-        let extra = collapsed.len() - MAX_COLLAPSED_ENTRIES;
-        collapsed.truncate(MAX_COLLAPSED_ENTRIES);
-        collapsed.push(format!("… +{extra} more collapsed entries"));
-    }
-
     (collapsed.join("\n"), removed)
-}
-
-/// Truncates `s` to at most `limit` chars, appending `...` when truncated.
-#[must_use]
-fn truncate_to_chars(s: &str, limit: usize) -> String {
-    if s.chars().count() <= limit {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(limit.saturating_sub(3)).collect();
-    out.push_str("...");
-    out
 }
 
 #[cfg(test)]
@@ -978,21 +996,30 @@ mod tests {
 
     #[test]
     fn collapse_combines_consecutive_repeated_lines() {
-        let (collapsed, removed) = collapse_repeated_lines("a\na\na\nb\nb\nc");
+        // Lines are long enough that folding `[×N]` is strictly smaller than
+        // repeating the line, so the runs DO collapse.
+        let (collapsed, removed) = collapse_repeated_lines(
+            "alpha-alpha-alpha\nalpha-alpha-alpha\nalpha-alpha-alpha\nbeta-beta-beta\nbeta-beta-beta\ngamma",
+        );
         assert_eq!(removed, 3); // 2 from the run of 3 'a', 1 from the run of 2 'b'
-        assert!(collapsed.contains("[×3] a"), "{collapsed}");
-        assert!(collapsed.contains("[×2] b"), "{collapsed}");
+        assert!(collapsed.contains("[×3] alpha-alpha-alpha"), "{collapsed}");
+        assert!(collapsed.contains("[×2] beta-beta-beta"), "{collapsed}");
         // Non-repeated line untouched.
-        assert!(collapsed.contains("\nc"), "{collapsed}");
-        assert!(!collapsed.contains("c\nc"), "must not duplicate");
+        assert!(collapsed.contains("\ngamma"), "{collapsed}");
+        assert!(
+            !collapsed.contains("beta-beta-beta\nbeta-beta-beta"),
+            "must not duplicate"
+        );
     }
 
     #[test]
     fn collapse_only_folds_consecutive_runs() {
-        // "a b a" -> the two 'a' are NOT adjacent, so they are NOT merged.
-        let (collapsed, removed) = collapse_repeated_lines("a\nb\na");
+        // "alpha beta alpha" -> the two 'alpha' are NOT adjacent, so they are
+        // NOT merged even though folding would be smaller.
+        let (collapsed, removed) =
+            collapse_repeated_lines("alpha-alpha\nbeta-beta-beta\nalpha-alpha");
         assert_eq!(removed, 0);
-        assert_eq!(collapsed, "a\nb\na");
+        assert_eq!(collapsed, "alpha-alpha\nbeta-beta-beta\nalpha-alpha");
     }
 
     #[test]
@@ -1007,8 +1034,10 @@ mod tests {
         // Collapsing keeps the FIRST occurrence; order of entries is
         // preserved (no frequency re-sort), unlike RTK's display sort, so a
         // dev still sees chronological order.
-        let (collapsed, _) = collapse_repeated_lines("x1\nx2\nx2\nx3");
-        assert_eq!(collapsed, "x1\n[×2] x2\nx3");
+        let (collapsed, _) = collapse_repeated_lines(
+            "entry-one-one\nentry-one-one\nmiddle\nentry-two-two\nentry-two-two",
+        );
+        assert_eq!(collapsed, "[×2] entry-one-one\nmiddle\n[×2] entry-two-two");
     }
 
     #[test]
@@ -1029,10 +1058,11 @@ mod tests {
     fn exact_match_identical_log_lines_collapse() {
         // Even with volatile-looking content, byte-identical consecutive
         // lines still collapse (e.g. a repeated build step or spinner).
+        let line = "Compiling a very long crate with many dependencies";
         let (collapsed, removed) =
-            collapse_repeated_lines("Compiling thing\nCompiling thing\nCompiling thing\ndone");
+            collapse_repeated_lines(&format!("{line}\n{line}\n{line}\ndone"));
         assert_eq!(removed, 2);
-        assert!(collapsed.contains("[×3] Compiling thing"), "{collapsed}");
+        assert!(collapsed.contains(&format!("[×3] {line}")), "{collapsed}");
         assert!(collapsed.contains("\ndone"), "{collapsed}");
     }
 
@@ -1062,51 +1092,217 @@ mod tests {
     #[test]
     fn collapse_isolates_messages() {
         // A repeated line in one message must not collapse a distinct line in
-        // another message.
+        // another message (each message folds independently).
         let body = json(
             r#"{"model":"gpt-4","messages":[
-                {"role":"user","content":"a\na"},
-                {"role":"assistant","content":"a\na"}
+                {"role":"user","content":"same-line-content\nsame-line-content"},
+                {"role":"assistant","content":"same-line-content\nsame-line-content"}
             ]}"#,
         );
         let (out, report) = optimize_prompt(&body, rtk_enabled());
         let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
         // Both messages collapse independently (2 messages each with 1 run).
         assert_eq!(report.collapsed_messages, 2);
-        assert_eq!(value["messages"][0]["content"], "[×2] a");
-        assert_eq!(value["messages"][1]["content"], "[×2] a");
+        assert_eq!(value["messages"][0]["content"], "[×2] same-line-content");
+        assert_eq!(value["messages"][1]["content"], "[×2] same-line-content");
+    }
+
+    // --- Hard regression tests for the collapse safety contract ---
+
+    #[test]
+    fn collapse_never_truncates_a_representative_line() {
+        // Regression: previously the representative line of a repeated run
+        // was truncated to 100 chars, silently editing away content. The
+        // representative must be the FULL original line.
+        let line = "x".repeat(300);
+        let content = format!("{line}\n{line}\n{line}");
+        let (collapsed, removed) = collapse_repeated_lines(&content);
+        assert_eq!(removed, 2);
+        assert!(
+            collapsed.contains(&format!("[×3] {line}")),
+            "lost chars: {collapsed}"
+        );
+        // The FULL line survives; nothing was truncated to a 100-char ellipsis.
+        assert!(!collapsed.contains("..."), "representative was truncated");
     }
 
     #[test]
-    fn collapse_fuzz_never_looses_unique_lines() {
-        // Safety invariant: collapse is lossless for *distinct* lines — every
-        // distinct line is preserved either bare or as the representative of a
-        // [×N] entry, up to the MAX_COLLAPSED_ENTRIES cap (which truncates
-        // only the tail and reports the overflow count, never silently).
-        // Using fully unique lines, no two collapse together.
-        let lines: Vec<String> = (0..20).map(|i| format!("distinct-{i}-xyzzy")).collect();
-        let mut content = String::new();
-        for l in &lines {
-            // Some lines appear once, some repeat twice consecutively.
-            content.push_str(l);
-            content.push('\n');
-            if l == "distinct-3-xyzzy" || l == "distinct-9-xyzzy" {
-                content.push_str(l);
-                content.push('\n');
-            }
+    fn collapse_never_drops_entries_beyond_a_fixed_cap() {
+        // Regression: previously output was capped at 30 entries, silently
+        // discarding every distinct line after the 30th. With >30 distinct
+        // lines present, ALL distinct lines must survive.
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..100 {
+            lines.push(format!("distinct-line-number-{i}-payload"));
         }
+        let content = lines.join("\n");
         let (collapsed, removed) = collapse_repeated_lines(&content);
-        // Two repeated lines mean 2 removed (run of 2 -> 1 surviving each).
-        assert_eq!(removed, 2, "removed={removed}");
+        assert_eq!(removed, 0);
+        // Every one of the 100 distinct lines survives verbatim.
         for l in &lines {
-            // Every unique line must appear either bare or as a [×N] rep.
-            let present = collapsed
-                .lines()
-                .any(|x| x == l.as_str() || x.contains(l.as_str()));
-            assert!(present, "lost unique line {l:?} in collapse output");
+            assert!(collapsed.lines().any(|x| x == l), "lost {l}");
         }
-        // The collapse markers carry the correct counts.
-        assert!(collapsed.contains("[×2] distinct-3-xyzzy"), "{collapsed}");
-        assert!(collapsed.contains("distinct-9-xyzzy"), "{collapsed}");
+        assert_eq!(collapsed.lines().count(), 100);
+    }
+
+    #[test]
+    fn collapse_never_grows_content_for_short_repeated_lines() {
+        // Regression: for short repeated lines, folding into `[×N]` would be
+        // LARGER than the original run. The pass must preserve the lines
+        // verbatim rather than rewrite them into a bigger form.
+        let (collapsed, removed) = collapse_repeated_lines("a\na\na\nb\nb\nc");
+        assert_eq!(removed, 0, "short runs must not be folded");
+        assert_eq!(collapsed, "a\na\na\nb\nb\nc");
+        // Sanity: the fold must be strictly-no-bigger whenever it happens.
+        let long = "longenoughline";
+        let (c2, r2) = collapse_repeated_lines(&format!("{long}\n{long}\n{long}"));
+        assert_eq!(r2, 2);
+        assert!(
+            c2.len() < long.len() * 3,
+            "fold must shrink, got {} vs {}",
+            c2.len(),
+            long.len() * 3
+        );
+    }
+
+    #[test]
+    fn collapse_output_is_idempotent() {
+        // Folding a message that is already collapsed must be a no-op (no
+        // double-folding, no churn). Re-running the pass over its own output
+        // must return the identical string.
+        let content = "repeat-word-x\nrepeat-word-x\nrepeat-word-x\nunique-last";
+        let (once, _) = collapse_repeated_lines(content);
+        let (twice, removed2) = collapse_repeated_lines(&once);
+        assert_eq!(removed2, 0, "already-collapsed output must be stable");
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn collapse_reconstructs_line_count_from_markers() {
+        // Safety: the total number of ORIGINAL lines must be recoverable from
+        // the collapsed output by expanding `[×N]` markers. This proves no
+        // line was silently lost or invented.
+        let mut state: u64 = 0x11EE_AA22_3344;
+        for _ in 0..300 {
+            // Build a random content of 10..40 lines drawn from a small vocab
+            // (heavy repeats) so most runs collapse.
+            let vocab = ["alpha", "beta", "gamma-very-long-cont", "delta"];
+            let n = 10 + (rng_next(&mut state) as usize) % 31;
+            let mut parts = Vec::with_capacity(n);
+            for _ in 0..n {
+                parts.push(pick(&mut state, &vocab).to_string());
+            }
+            let content = parts.join("\n");
+            let (collapsed, removed) = collapse_repeated_lines(&content);
+            let orig_count = content.lines().count();
+            // `removed` can be at most the number of repeated lines; short
+            // runs are preserved verbatim (no-growth rule), so this is an
+            // upper bound, not an equality.
+            let repeat_count = orig_count - collapse_distinct_count(&content);
+            assert!(
+                removed <= repeat_count as u64,
+                "cannot remove more than the repeated lines ({content:?})"
+            );
+            // THE authoritative losslessness check: expanding `[×N]` markers
+            // must reconstruct the exact original line count — whether or not
+            // each run was folded. This proves no line was silently lost or
+            // invented.
+            let expanded = expand_collapsed(&collapsed);
+            assert_eq!(
+                expanded, orig_count,
+                "line-count mismatch for content {content:?}"
+            );
+        }
+    }
+
+    // --- Collapse property: no-growth & full-distinct-preservation fuzz ---
+
+    #[test]
+    fn collapse_fuzz_never_grows_and_never_loses_distinct_lines() {
+        let mut state: u64 = 0x5EED_F00D_BEEF;
+        let vocab = [
+            "short",
+            "medium length line that is long enough to fold well",
+            "alpha1",
+            "beta2",
+            "gamma-gamma-gamma-gamma-gamma",
+            "distinct-very-long-sentinel-value-xyz",
+        ];
+        for _ in 0..1000 {
+            let n = 1 + (rng_next(&mut state) as usize) % 25;
+            let mut lines = Vec::with_capacity(n);
+            for _ in 0..n {
+                lines.push(pick(&mut state, &vocab).to_string());
+            }
+            let content = lines.join("\n");
+            let (collapsed, removed) = collapse_repeated_lines(&content);
+
+            // 1) NEVER grow the message.
+            assert!(
+                collapsed.len() <= content.len(),
+                "collapse grew: {} > {} for {content:?}",
+                collapsed.len(),
+                content.len()
+            );
+
+            // 2) Never lose a DISTINCT line: every distinct line in the input
+            // must appear verbatim (bare or as a fold representative).
+            let mut distinct: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for l in lines.iter() {
+                distinct.insert(l.clone());
+            }
+            for d in &distinct {
+                let present = collapsed
+                    .lines()
+                    .any(|x| x == d.as_str() || x.ends_with(d.as_str()));
+                assert!(
+                    present,
+                    "lost distinct line {d:?} in {content:?} -> {collapsed:?}"
+                );
+            }
+
+            // 3) `removed` at most the number of repeated lines (short runs preserved).
+            let repeat_count = content.lines().count() - distinct.len();
+            assert!(
+                removed <= repeat_count as u64,
+                "removed {removed} > repeated {repeat_count} for {content:?}"
+            );
+            // 4) If nothing was removed, the output is byte-identical.
+            if removed == 0 {
+                assert_eq!(collapsed, content);
+            }
+            // 5) Life insurance: marker-expansion reconstructs the exact
+            // original line count (no line lost or invented).
+            assert_eq!(expand_collapsed(&collapsed), content.lines().count());
+        }
+    }
+
+    // ---- helpers for the hard collapse tests ----
+
+    /// Distinct (by value) line count of `content`.
+    fn collapse_distinct_count(content: &str) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for l in content.lines() {
+            seen.insert(l);
+        }
+        seen.len()
+    }
+
+    /// Expands a collapsed string back to its original line count by treating
+    /// each `[×N]` entry as `N` occurrences.
+    fn expand_collapsed(collapsed: &str) -> usize {
+        let mut count = 0usize;
+        for line in collapsed.lines() {
+            if let Some(rest) = line.strip_prefix("[×") {
+                if let Some(end) = rest.find(']') {
+                    if let Ok(n) = rest[..end].parse::<usize>() {
+                        count += n;
+                        continue;
+                    }
+                }
+            }
+            count += 1;
+        }
+        count
     }
 }

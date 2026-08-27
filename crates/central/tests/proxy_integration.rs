@@ -1613,7 +1613,7 @@ async fn rtk_collapse_repeated_lines_end_to_end() {
         )
         .await
         .expect("enable collapse for group-collapse");
-    let repeated_content = "refactor the parser\nwarning: unused import\nwarning: unused import\nwarning: unused import\ndone\nnext: tweak tests\ndone\ndone";
+    let repeated_content = "refactor the parser module\nwarning: unused import detected in src/main.rs\nwarning: unused import detected in src/main.rs\nwarning: unused import detected in src/main.rs\nfinished refactor\nnext: tweak config tests\nwarning: cache miss retriggering build step\nwarning: cache miss retriggering build step";
     let resp = http
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
@@ -1640,8 +1640,7 @@ async fn rtk_collapse_repeated_lines_end_to_end() {
         .expect("content string");
     // Consecutive exact-verbatim duplicates are folded into `[×N]` markers,
     // keeping the representative first line.
-    let expected =
-        "refactor the parser\n[×3] warning: unused import\ndone\nnext: tweak tests\n[×2] done";
+    let expected = "refactor the parser module\n[×3] warning: unused import detected in src/main.rs\nfinished refactor\nnext: tweak config tests\n[×2] warning: cache miss retriggering build step";
     assert_eq!(
         upstream_content, expected,
         "repeated lines must collapse to [×N] markers"

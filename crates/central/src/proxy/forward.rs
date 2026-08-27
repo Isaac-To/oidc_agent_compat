@@ -273,11 +273,12 @@ async fn record_request_outcome(context: &AccountingContext, usage: TokenUsage, 
         // Only ever metrics/reason tags — never prompt content.
         token_saver_applied: context.saver_report.as_ref().map(|r| r.applied),
         tokens_saved: context.saver_report.as_ref().map(|r| r.tokens_saved as i64),
+        // `messages_dropped` counts only whole messages that were actually
+        // removed (dedup + budget + empty). Collapsed lines are NOT dropped
+        // messages — the RTK pass preserves every distinct line (folded into
+        // `[×N]` entries), so it never contributes to `messages_dropped`.
         messages_dropped: context.saver_report.as_ref().map(|r| {
-            (r.dup_messages_dropped
-                + r.budget_turns_dropped
-                + r.empty_messages_dropped
-                + r.collapsed_lines) as i64
+            (r.dup_messages_dropped + r.budget_turns_dropped + r.empty_messages_dropped) as i64
         }),
         saver_reasons: context.saver_report.as_ref().map(|r| {
             let mut reasons = Vec::new();
