@@ -112,7 +112,27 @@ Agent (Codex, etc.)
 | Revoked device continues to access | Devices auto-register on first verified request; revocation checked in `permissions_middleware` (uses `identity_id` or `subject` as device ID) | ✅ Implemented |
 | Expired local session continues to access | OIDC-login API keys expire after `session_ttl_hours` (24 hours by default); expired rows are deleted | ✅ Implemented |
 
-## Security standards compliance
+## Token-saver trust model
+
+The token-saver is a safe, admin-controlled request optimizer on the central
+proxy. Its threat model deliberately *accepts* a small, well-defined content
+risk rather than pretending it can "understand" requests:
+
+| Behaviour | Control / rationale | Status |
+|---|---|---|
+| Saver enabled/disables & budget scope | Admin-only, per-group via the admin API; resolved server-side from the policy store (never client-controlled) | ✅ Implemented |
+| Exact-verbatim duplicate messages removed | Only *bit-identical* duplicates removed; cannot drop information not already present verbatim | ✅ Implemented (lossless) |
+| Structurally-empty messages removed | Only empty-string `content` removed; contributes nothing to the backend | ✅ Implemented (lossless) |
+| Empty `tools: []` removed | Empty definition list; no behavioural change | ✅ Implemented (lossless) |
+| Oldest whole turns dropped under budget | The single acknowledged case where content is dropped: the admin-opted-in budget trims the **oldest** whole turns (never truncates a message), always keeping the newest turn and any system prompt | ✅ Implemented (bounded, admin-opted-in) |
+| Request meaning preserved | Kept messages are never rewritten/re-ordered; the optimizer only drops, never rewrites text | ✅ Implemented |
+| Content never logged | Audit records metrics and reason tags only, never prompt content (consistent with secret-redaction conventions) | ✅ Implemented |
+| Saver bypass via direct client flag | There is no client-facing "enable" control; the saver config is attached by the permissions middleware only after auth | ✅ Implemented |
+
+**Accepted residual risk:** budget trimming can drop old context a developer
+still needs. This is a deliberate, admin-controlled trade-off (matching the
+industry-wide "drop oldest whole turns / keep newest" consensus for token
+saving) and is fully audited per request.
 
 | Standard | Requirement | Status |
 |---|---|---|

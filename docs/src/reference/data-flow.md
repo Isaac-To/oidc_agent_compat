@@ -114,6 +114,8 @@ User-Agent: codex/1.0
    - **Request quota check** — if `daily_request_quota` set and
      `usage.request_count >= quota` → `429` (`"quota_exceeded"`).
    - On allow: inserts `PermissionDecision` into extensions.
+   - If the resolved policy has the token saver enabled, attaches a
+     `TokenSaverGrant` (config) to the extensions for the forward handler.
 
 3. **Rate limit** (`rate_limit_middleware`, production only):
    - Per-IP token bucket (60 req/min default).
@@ -122,6 +124,11 @@ User-Agent: codex/1.0
 4. **Forward** (`proxy_handler` → `forward_request`):
    - Reads body (max 10 MB).
    - Extracts model.
+   - **Token saver** (if a `TokenSaverGrant` is present): applies the safe
+     optimizer to the body — removes exact-verbatim duplicate messages and
+     structurally-empty messages, drops empty `tools: []`, and, if a budget
+     is set, drops the oldest whole turns (never truncates) to fit. Kept
+     messages are never rewritten. Records `OptimizationReport`.
    - Sanitizes path.
   - Builds upstream URL: `{provider.base_url}{sanitized_path}`.
    - Builds forward headers (strips hop-by-hop + identity headers).
