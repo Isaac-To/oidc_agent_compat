@@ -19,6 +19,7 @@ pub mod db;
 pub mod device_store;
 pub mod entity;
 pub mod migration;
+pub mod optimizer;
 pub mod policy;
 pub mod pricing;
 pub mod provider;
