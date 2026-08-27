@@ -666,6 +666,8 @@ pub struct GroupPolicyResponse {
     pub token_saver_enabled: bool,
     /// Per-request input-token budget (None = no budget trimming).
     pub max_input_tokens: Option<i64>,
+    /// Whether the RTK-adapted repeated-line collapse pass is enabled.
+    pub collapse_repeated_lines: bool,
 }
 
 impl From<crate::entity::group_policy::Model> for GroupPolicyResponse {
@@ -684,6 +686,7 @@ impl From<crate::entity::group_policy::Model> for GroupPolicyResponse {
             daily_request_quota: m.daily_request_quota,
             token_saver_enabled: m.token_saver_enabled,
             max_input_tokens: m.max_input_tokens,
+            collapse_repeated_lines: m.collapse_repeated_lines,
         }
     }
 }
@@ -743,6 +746,9 @@ pub struct UpsertPolicyRequest {
     /// Per-request input-token budget (None = no budget trimming).
     #[serde(default)]
     pub max_input_tokens: Option<i64>,
+    /// Whether the RTK-adapted repeated-line collapse pass is enabled.
+    #[serde(default)]
+    pub collapse_repeated_lines: bool,
 }
 
 async fn upsert_policy(
@@ -778,6 +784,7 @@ async fn upsert_policy(
             body.daily_request_quota,
             body.token_saver_enabled,
             body.max_input_tokens,
+            body.collapse_repeated_lines,
         )
         .await
         .map_err(internal_error)?;

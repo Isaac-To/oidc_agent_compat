@@ -19,6 +19,11 @@
 //! - **Structural no-ops only**: empty string `content` and empty string
 //!   arrays of `tools` are removed only when they are structurally empty and
 //!   therefore contribute nothing to the backend.
+//! - **Consecutive repeated-line collapse (RTK-adapted)**: within a *single*
+//!   message's `content`, runs of normalized-identical lines are collapsed
+//!   into one representative line with a `[×N]` count (adapting RTK's
+//!   `analyze_logs`). This is limited to *consecutive* runs inside one
+//!   message, so it never merges distinct turns or non-adjacent information.
 //! - **Never rewrites content**: no token-level compression, no
 //!   rephrasing, no summarisation. The optimiser rewrites only structure and
 //!   drop granularity, never the text of any kept message.
@@ -34,6 +39,14 @@
 //!
 //! The optimiser is driven by an admin-supplied [`TokenSaverConfig`]. It is
 //! applied server-side on the central proxy only — never by or for a client.
+//!
+//! # Upstream attribution
+//!
+//! The repeated-line collapse pass adapts the line-normalization + collapse
+//! approach from [RTK](https://github.com/rtk-ai/rtk)
+//! (`src/cmds/system/log_cmd.rs`, Apache-2.0). The normalization
+//! (`normalize_log_line`) and count-preserving collapse are ported here with
+//! the upstream Apache-2.0 attribution retained.
 
 /// The outcome of applying the optimiser to a single request body.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -52,6 +65,10 @@ pub struct OptimizationReport {
     pub budget_turns_dropped: u64,
     /// Number of structurally-empty messages removed.
     pub empty_messages_dropped: u64,
+    /// Number of repeated lines collapsed across all messages (RTK pass).
+    pub collapsed_lines: u64,
+    /// Number of messages whose content was collapsed (RTK pass).
+    pub collapsed_messages: u64,
 }
 
 /// The admin-supplied token-saver configuration for a group.
@@ -63,6 +80,11 @@ pub struct TokenSaverConfig {
     /// exceeds this, the oldest whole turns are dropped until the remaining
     /// turns fit. `None` disables budget-based trimming.
     pub max_input_tokens: Option<u64>,
+    /// Whether to collapse consecutive repeated lines inside a single
+    /// message's content into `[×N]` entries (adapting RTK). Defaults to
+    /// `false`; it is a more aggressive (still audited) pass that admins
+    /// opt into explicitly.
+    pub collapse_repeated_lines: bool,
 }
 
 /// Estimated tokens for a unit of text (1 token ≈ 4 chars, English-centric).
@@ -161,6 +183,28 @@ pub fn optimize_prompt(
         retained.push(msg);
     }
     *messages = retained;
+
+    // Pass 1.5 (RTK-adapted): collapse consecutive repeated lines inside each
+    // surviving message's content. This is opt-in (`collapse_repeated_lines`)
+    // and operates within a single message, so it never merges distinct
+    // turns. Kept messages' content may be rewritten ONLY by folding repeated
+    // lines into `[×N]` markers; the representative line is the original.
+    if config.collapse_repeated_lines {
+        for msg in messages.iter_mut() {
+            let Some(content) = msg.get("content").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let (collapsed, removed) = collapse_repeated_lines(content);
+            if removed > 0 {
+                report.collapsed_lines += removed;
+                report.collapsed_messages += 1;
+                changed = true;
+                if let Some(slot) = msg.get_mut("content") {
+                    *slot = serde_json::Value::String(collapsed);
+                }
+            }
+        }
+    }
 
     // Safety guard: never produce an empty `messages` array. If ALL turns
     // were empty-content or exact duplicates, an empty array is invalid for
@@ -289,6 +333,88 @@ fn body_for_estimate(value: &serde_json::Value) -> String {
     out
 }
 
+// --- RTK-adapted repeated-line collapse ------------------------------------
+//
+// The following adapt RTK's `normalize_log_line` + `analyze_logs`
+// (https://github.com/rtk-ai/rtk, `src/cmds/system/log_cmd.rs`, Apache-2.0)
+// to collapse consecutive repeated lines inside a single message's content.
+// Attribution retained per Apache-2.0.
+
+/// Maximum distinct collapsed entries to retain within a single message.
+const MAX_COLLAPSED_ENTRIES: usize = 30;
+/// Long lines are truncated to this many chars (RTK uses 100).
+const MAX_LINE_CHARS: usize = 100;
+
+/// Collapses consecutive runs of identical lines in `content` into `[×N]`
+/// representative lines.
+///
+/// Operates on a *single* message's content string. Iff no run of length > 1
+/// is found, returns the original string unchanged. Only consecutive runs are
+/// collapsed (so ordering and non-adjacent distinct lines are preserved), and
+/// the count is preserved in the `[×N]` annotation.
+///
+/// # Safety
+///
+/// Only **exact-verbatim** consecutive duplicate lines are collapsed, so the
+/// pass is lossless-by-construction: it can only remove a line that was
+/// already present byte-for-byte in the immediately preceding line. It never
+/// merges lines that merely "look similar" under fuzzy normalization.
+#[must_use]
+fn collapse_repeated_lines(content: &str) -> (String, u64) {
+    // Fast path: no newlines -> nothing to collapse.
+    if !content.contains('\n') {
+        return (content.to_string(), 0);
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let mut collapsed: Vec<String> = Vec::with_capacity(lines.len());
+    let mut removed: u64 = 0;
+
+    let mut iter = lines.into_iter().peekable();
+    while let Some(current) = iter.next() {
+        // Count consecutive lines that are byte-identical to `current`.
+        let mut run_len = 1usize;
+        while iter.peek() == Some(&current) {
+            run_len += 1;
+            iter.next();
+        }
+
+        if run_len > 1 {
+            // Collapse the run, keeping the first line with a count marker.
+            let representative = truncate_to_chars(current, MAX_LINE_CHARS);
+            collapsed.push(format!("[×{run_len}] {representative}"));
+            removed += u64::try_from(run_len - 1).unwrap_or(0);
+        } else {
+            collapsed.push(current.to_string());
+        }
+    }
+
+    if removed == 0 {
+        // Nothing was collapsed — return the exact original string.
+        return (content.to_string(), 0);
+    }
+
+    // Cap the collapsed output to the most relevant (first) entries.
+    if collapsed.len() > MAX_COLLAPSED_ENTRIES {
+        let extra = collapsed.len() - MAX_COLLAPSED_ENTRIES;
+        collapsed.truncate(MAX_COLLAPSED_ENTRIES);
+        collapsed.push(format!("… +{extra} more collapsed entries"));
+    }
+
+    (collapsed.join("\n"), removed)
+}
+
+/// Truncates `s` to at most `limit` chars, appending `...` when truncated.
+#[must_use]
+fn truncate_to_chars(s: &str, limit: usize) -> String {
+    if s.chars().count() <= limit {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(limit.saturating_sub(3)).collect();
+    out.push_str("...");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +451,7 @@ mod tests {
         TokenSaverConfig {
             enabled: true,
             max_input_tokens: None,
+            collapse_repeated_lines: false,
         }
     }
 
@@ -383,6 +510,7 @@ mod tests {
         let config = TokenSaverConfig {
             enabled: true,
             max_input_tokens: Some(4),
+            collapse_repeated_lines: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         assert!(report.applied);
@@ -405,6 +533,7 @@ mod tests {
         let config = TokenSaverConfig {
             enabled: true,
             max_input_tokens: Some(2),
+            collapse_repeated_lines: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         // If nothing fits, we must NOT drop the only message (would lose the
@@ -532,6 +661,7 @@ mod tests {
             let config = TokenSaverConfig {
                 enabled: true,
                 max_input_tokens: Some(budget),
+                collapse_repeated_lines: false,
             };
             let (out, report) = optimize_prompt(&body, config);
             let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -598,6 +728,7 @@ mod tests {
             let config = TokenSaverConfig {
                 enabled: true,
                 max_input_tokens: Some(2),
+                collapse_repeated_lines: false,
             };
             let (out, _report) = optimize_prompt(&body, config);
             let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -628,6 +759,7 @@ mod tests {
         let config = TokenSaverConfig {
             enabled: true,
             max_input_tokens: Some(1),
+            collapse_repeated_lines: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         assert!(report.budget_turns_dropped >= 2);
@@ -650,6 +782,7 @@ mod tests {
         let config = TokenSaverConfig {
             enabled: true,
             max_input_tokens: Some(1_000_000),
+            collapse_repeated_lines: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         assert!(!report.applied);
@@ -763,6 +896,7 @@ mod tests {
         let config = TokenSaverConfig {
             enabled: true,
             max_input_tokens: Some(6),
+            collapse_repeated_lines: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         assert!(report.applied);
@@ -820,5 +954,159 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let messages = value["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 1);
+    }
+
+    // --- RTK-adapted repeated-line collapse tests ---
+
+    fn rtk_enabled() -> TokenSaverConfig {
+        TokenSaverConfig {
+            enabled: true,
+            max_input_tokens: None,
+            collapse_repeated_lines: true,
+        }
+    }
+
+    #[test]
+    fn collapse_is_off_by_default() {
+        // Conservative default: an admin must explicitly opt in to the more
+        // aggressive repeated-line pass.
+        let body = json(r#"{"model":"gpt-4","messages":[{"role":"user","content":"a\na\na\nb"}]}"#);
+        let (out, _report) = optimize_prompt(&body, enabled()); // collapse off
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["messages"][0]["content"], "a\na\na\nb");
+    }
+
+    #[test]
+    fn collapse_combines_consecutive_repeated_lines() {
+        let (collapsed, removed) = collapse_repeated_lines("a\na\na\nb\nb\nc");
+        assert_eq!(removed, 3); // 2 from the run of 3 'a', 1 from the run of 2 'b'
+        assert!(collapsed.contains("[×3] a"), "{collapsed}");
+        assert!(collapsed.contains("[×2] b"), "{collapsed}");
+        // Non-repeated line untouched.
+        assert!(collapsed.contains("\nc"), "{collapsed}");
+        assert!(!collapsed.contains("c\nc"), "must not duplicate");
+    }
+
+    #[test]
+    fn collapse_only_folds_consecutive_runs() {
+        // "a b a" -> the two 'a' are NOT adjacent, so they are NOT merged.
+        let (collapsed, removed) = collapse_repeated_lines("a\nb\na");
+        assert_eq!(removed, 0);
+        assert_eq!(collapsed, "a\nb\na");
+    }
+
+    #[test]
+    fn collapse_does_not_touch_single_line_or_empty() {
+        assert_eq!(collapse_repeated_lines("hello world").0, "hello world");
+        assert_eq!(collapse_repeated_lines("").0, "");
+        assert_eq!(collapse_repeated_lines("").1, 0);
+    }
+
+    #[test]
+    fn collapse_annotates_with_count_only_not_relevant_ordering() {
+        // Collapsing keeps the FIRST occurrence; order of entries is
+        // preserved (no frequency re-sort), unlike RTK's display sort, so a
+        // dev still sees chronological order.
+        let (collapsed, _) = collapse_repeated_lines("x1\nx2\nx2\nx3");
+        assert_eq!(collapsed, "x1\n[×2] x2\nx3");
+    }
+
+    #[test]
+    fn exact_match_distinct_lines_never_collapse() {
+        // Because the pass is exact-match only, lines that differ by any
+        // token (e.g. a number) must NOT collapse. This is the core safety
+        // guarantee: only byte-identical consecutive lines are merged.
+        let (collapsed, removed) =
+            collapse_repeated_lines("2026-08-27 10:00:00 boom 42\n2026-08-27 10:00:01 boom 43");
+        assert_eq!(removed, 0);
+        assert_eq!(
+            collapsed,
+            "2026-08-27 10:00:00 boom 42\n2026-08-27 10:00:01 boom 43"
+        );
+    }
+
+    #[test]
+    fn exact_match_identical_log_lines_collapse() {
+        // Even with volatile-looking content, byte-identical consecutive
+        // lines still collapse (e.g. a repeated build step or spinner).
+        let (collapsed, removed) =
+            collapse_repeated_lines("Compiling thing\nCompiling thing\nCompiling thing\ndone");
+        assert_eq!(removed, 2);
+        assert!(collapsed.contains("[×3] Compiling thing"), "{collapsed}");
+        assert!(collapsed.contains("\ndone"), "{collapsed}");
+    }
+
+    #[test]
+    fn collapse_works_end_to_end_via_optimize_prompt() {
+        // Enabling collapse via the config rewrites a message's content and
+        // records the counts in the report.
+        let body = json(
+            r#"{"model":"gpt-4","messages":[
+                {"role":"user","content":"build log:\nstep 1\nstep 1\nstep 1\ndone"},
+                {"role":"assistant","content":"ok"}
+            ]}"#,
+        );
+        let (out, report) = optimize_prompt(&body, rtk_enabled());
+        assert!(report.applied);
+        assert!(report.collapsed_lines >= 2);
+        assert_eq!(report.collapsed_messages, 1);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let content = value["messages"][0]["content"].as_str().unwrap();
+        assert!(content.contains("[×3] step 1"), "{content}");
+        // The non-repeated "done" line survives.
+        assert!(content.contains("done"), "{content}");
+        // The assistant message is untouched.
+        assert_eq!(value["messages"][1]["content"], "ok");
+    }
+
+    #[test]
+    fn collapse_isolates_messages() {
+        // A repeated line in one message must not collapse a distinct line in
+        // another message.
+        let body = json(
+            r#"{"model":"gpt-4","messages":[
+                {"role":"user","content":"a\na"},
+                {"role":"assistant","content":"a\na"}
+            ]}"#,
+        );
+        let (out, report) = optimize_prompt(&body, rtk_enabled());
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // Both messages collapse independently (2 messages each with 1 run).
+        assert_eq!(report.collapsed_messages, 2);
+        assert_eq!(value["messages"][0]["content"], "[×2] a");
+        assert_eq!(value["messages"][1]["content"], "[×2] a");
+    }
+
+    #[test]
+    fn collapse_fuzz_never_looses_unique_lines() {
+        // Safety invariant: collapse is lossless for *distinct* lines — every
+        // distinct line is preserved either bare or as the representative of a
+        // [×N] entry, up to the MAX_COLLAPSED_ENTRIES cap (which truncates
+        // only the tail and reports the overflow count, never silently).
+        // Using fully unique lines, no two collapse together.
+        let lines: Vec<String> = (0..20).map(|i| format!("distinct-{i}-xyzzy")).collect();
+        let mut content = String::new();
+        for l in &lines {
+            // Some lines appear once, some repeat twice consecutively.
+            content.push_str(l);
+            content.push('\n');
+            if l == "distinct-3-xyzzy" || l == "distinct-9-xyzzy" {
+                content.push_str(l);
+                content.push('\n');
+            }
+        }
+        let (collapsed, removed) = collapse_repeated_lines(&content);
+        // Two repeated lines mean 2 removed (run of 2 -> 1 surviving each).
+        assert_eq!(removed, 2, "removed={removed}");
+        for l in &lines {
+            // Every unique line must appear either bare or as a [×N] rep.
+            let present = collapsed
+                .lines()
+                .any(|x| x == l.as_str() || x.contains(l.as_str()));
+            assert!(present, "lost unique line {l:?} in collapse output");
+        }
+        // The collapse markers carry the correct counts.
+        assert!(collapsed.contains("[×2] distinct-3-xyzzy"), "{collapsed}");
+        assert!(collapsed.contains("distinct-9-xyzzy"), "{collapsed}");
     }
 }

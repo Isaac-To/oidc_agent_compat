@@ -28,6 +28,9 @@ pub struct Model {
     pub daily_request_quota: Option<i64>,
     /// Whether the safe token-saver optimiser is enabled for this group.
     pub token_saver_enabled: bool,
+    /// Whether the RTK-adapted consecutive repeated-line collapse pass is
+    /// enabled for this group (a sub-optimization of the token saver).
+    pub collapse_repeated_lines: bool,
     /// Per-request input-token budget. When exceeded, the oldest whole turns
     /// are dropped (never truncated) until the request fits. `None` disables
     /// budget trimming.

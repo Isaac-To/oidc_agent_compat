@@ -177,6 +177,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migration0004UsageCounters),
             Box::new(Migration0005Providers),
             Box::new(Migration0006TokenSaver),
+            Box::new(Migration0007CollapseRepeatedLines),
         ]
     }
 }
@@ -784,6 +785,40 @@ impl MigrationTrait for Migration0006TokenSaver {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         // SQLite does not support DROP COLUMN before 3.35 for ALTERed
         // columns. This migration is forward-only in practice; no-op down.
+        let _ = manager;
+        Ok(())
+    }
+}
+
+/// Migration 0007: add the RTK-adapted repeated-line collapse toggle to
+/// `group_policies`.
+///
+/// `collapse_repeated_lines` lets admins enable the consecutive repeated-line
+/// collapse pass (adapting RTK's log-line collapse) on top of the token
+/// saver. It defaults to `false` — this pass is a more aggressive (still
+/// audited) optimization that admins opt into explicitly.
+pub struct Migration0007CollapseRepeatedLines;
+
+impl MigrationName for Migration0007CollapseRepeatedLines {
+    fn name(&self) -> &str {
+        "m000007_collapse_repeated_lines"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0007CollapseRepeatedLines {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE group_policies \
+                 ADD COLUMN collapse_repeated_lines BOOLEAN NOT NULL DEFAULT false;",
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let _ = manager;
         Ok(())
     }

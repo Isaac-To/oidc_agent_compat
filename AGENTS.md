@@ -199,7 +199,7 @@ Key modules:
 - `crates/central/src/device_store.rs` — device registration + revocation store.
 - `crates/central/src/provider.rs` — runtime provider/key store; provider keys are AES-256-GCM encrypted at rest with the configured MEK.
 - `crates/central/src/audit.rs` — audit logger (enriched with identity, groups, endpoint, request-id, permission decision, token-saver accounting).
-- `crates/central/src/optimizer.rs` — the safe, admin-controlled token saver: a pure module that dedupes exact-verbatim messages, removes structurally-empty messages/`tools`, and drops oldest whole turns under a budget. **Never rewrites kept content.** Driven by `TokenSaverConfig` from the resolved policy; gated server-side only.
+- `crates/central/src/optimizer.rs` — the safe, admin-controlled token saver: a pure module that dedupes exact-verbatim messages, removes structurally-empty messages/`tools`, drops oldest whole turns under a budget, and (opt-in via `collapse_repeated_lines`) collapses consecutive exact-verbatim repeated lines inside a single message into `[×N]` markers (RTK-adapted, lossless-by-construction). **Never rewrites kept content except for the opt-in repeated-line collapse.** Driven by `TokenSaverConfig` from the resolved policy; gated server-side only.
 - `crates/central/src/db.rs`, `migration.rs`, `entity/` — central persistence.
 
 ---

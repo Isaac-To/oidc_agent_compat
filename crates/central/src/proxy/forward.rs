@@ -274,7 +274,10 @@ async fn record_request_outcome(context: &AccountingContext, usage: TokenUsage, 
         token_saver_applied: context.saver_report.as_ref().map(|r| r.applied),
         tokens_saved: context.saver_report.as_ref().map(|r| r.tokens_saved as i64),
         messages_dropped: context.saver_report.as_ref().map(|r| {
-            (r.dup_messages_dropped + r.budget_turns_dropped + r.empty_messages_dropped) as i64
+            (r.dup_messages_dropped
+                + r.budget_turns_dropped
+                + r.empty_messages_dropped
+                + r.collapsed_lines) as i64
         }),
         saver_reasons: context.saver_report.as_ref().map(|r| {
             let mut reasons = Vec::new();
@@ -286,6 +289,9 @@ async fn record_request_outcome(context: &AccountingContext, usage: TokenUsage, 
             }
             if r.empty_messages_dropped > 0 {
                 reasons.push("empty_removed".to_string());
+            }
+            if r.collapsed_lines > 0 {
+                reasons.push("rtk_collapse".to_string());
             }
             serde_json::to_string(&reasons).unwrap_or_default()
         }),

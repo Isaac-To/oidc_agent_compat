@@ -127,8 +127,11 @@ User-Agent: codex/1.0
    - **Token saver** (if a `TokenSaverGrant` is present): applies the safe
      optimizer to the body — removes exact-verbatim duplicate messages and
      structurally-empty messages, drops empty `tools: []`, and, if a budget
-     is set, drops the oldest whole turns (never truncates) to fit. Kept
-     messages are never rewritten. Records `OptimizationReport`.
+     is set, drops the oldest whole turns (never truncates) to fit. If the
+     policy enabled `collapse_repeated_lines`, consecutive exact-verbatim
+     repeated lines inside a single message are folded into `[×N]` markers
+     (RTK-adapted); kept messages are otherwise never rewritten. Records
+     `OptimizationReport`.
    - Sanitizes path.
   - Builds upstream URL: `{provider.base_url}{sanitized_path}`.
    - Builds forward headers (strips hop-by-hop + identity headers).
