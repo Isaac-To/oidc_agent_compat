@@ -56,6 +56,13 @@ are non-negotiable.
   branches.
 - Squash-merge or rebase-merge into `master` when the work is complete and
   verified.
+- **CI/CD is a hard gate before merge.** Never merge (or ask a human to
+  merge) a branch into `master` until all CI checks on that branch pass:
+  formatting, clippy, tests, release build, and `./docker/dev.sh test` (if
+  Docker-relevant code changed). If CI is blocked on a pre-existing
+  failure or an environment issue, say so explicitly in the merge summary
+  rather than merging with red checks. Do not use "skip CI" or force
+  workflows as a workaround.
 
 ### 3. Test comprehensively
 

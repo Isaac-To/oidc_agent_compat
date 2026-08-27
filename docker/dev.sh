@@ -1,8 +1,8 @@
 #!/bin/bash
 # Dev environment orchestration for the OIDC Agent Compatibility Server.
 #
-# Everything runs in Docker containers. Goose runs on the host and connects
-# to the relay at 127.0.0.1:8787.
+# Everything runs in Docker containers, including Goose (headless).
+# The relay is exposed to the host on 127.0.0.1:8787 for direct tests.
 #
 # Usage:
 #   ./docker/dev.sh up      — generate certs, start all containers
@@ -134,9 +134,9 @@ cmd_test() {
     info "Sending test requests through the full chain..."
     info "  Goose → relay (127.0.0.1:8787) → central (8443) → mock-backend (8090)"
 
-    # In dev mode, the relay doesn't have a real OIDC login yet, so we
-    # need to mint a key directly. Let's use the relay's DB to insert one.
-    # For now, test the relay's healthz and the mock backend directly.
+    # In dev mode the relay auto-mints the dev key `oac_test_key_alice`;
+    # the tests below exercise the full relay → central → backend chain
+    # with that key, plus the security negative paths (401/400).
 
     info "Testing relay healthz..."
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8787/healthz)

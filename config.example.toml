@@ -16,6 +16,8 @@
 # listen_addr = "127.0.0.1:8787"
 # database_url = "sqlite://~/.oac/relay.db"
 # dev_mode = false
+# # Lifetime of OIDC-login API keys in hours (default 24; null disables expiry).
+# session_ttl_hours = 24
 #
 # [oidc]
 # issuer = "https://idp.example.com"
@@ -23,7 +25,9 @@
 # # The env var holding the OIDC client secret (never a literal here):
 # client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 # redirect_uri = "http://127.0.0.1:0/callback"
-# scopes = ["openid", "email", "profile"]
+# # The "groups" scope is REQUIRED for group-based policy enforcement and
+# # admin authorization. Without it central cannot enforce group policies.
+# scopes = ["openid", "email", "profile", "groups"]
 #
 # [central]
 # url = "https://central.example.com"
@@ -46,6 +50,9 @@
 #
 # [oidc]
 # issuer = "https://idp.example.com"
+# # The central proxy does NOT perform its own OIDC login or token validation —
+# # it trusts identity forwarded by the relay over mTLS. This client_id is not
+# # used at runtime; oac-relay is the OIDC relying party.
 # client_id = "oac-central"
 # client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 # redirect_uri = "http://127.0.0.1:0/callback"
@@ -61,5 +68,15 @@
 # # authorized by IdP group membership — users in the configured admin_group
 # # (authenticated via the relay's OIDC login flow) may call the admin API.
 # # No static admin token is used; the admin's OIDC identity is the auth.
+# # Requires the relay to request the "groups" scope (see relay [oidc] above).
 # [admin]
 # admin_group = "oac-admins"
+#
+# # Optional per-model pricing for cost tracking in usage/audit reports.
+# # If omitted, prices are auto-fetched (OpenAI-compatible) on a timer.
+# [pricing]
+# # fetch_interval_secs = 3600
+# # [[pricing.models]]
+# # model = "gpt-4o"
+# # input_per_1k_usd = 0.005
+# # output_per_1k_usd = 0.015

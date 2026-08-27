@@ -70,7 +70,9 @@ dev_mode = false
 
 [oidc]
 issuer = "https://idp.example.com/realms/your-realm"   # ← your IdP
-client_id = "oac-relay"
+# Central does not log in/validate tokens itself — identity comes from the
+# relay over mTLS. client_id is not used at runtime; oac-relay is the RP.
+client_id = "oac-central"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
 scopes = ["openid", "email", "profile"]
@@ -158,7 +160,8 @@ issuer = "https://idp.example.com/realms/your-realm"
 client_id = "oac-relay"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
-scopes = ["openid", "email", "profile"]
+# "groups" is REQUIRED for group-based policy enforcement and admin access.
+scopes = ["openid", "email", "profile", "groups"]
 
 [central]
 url = "https://central.example.com:8443"   # ← your central proxy
