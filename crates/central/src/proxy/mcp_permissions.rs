@@ -31,8 +31,8 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use oidc_agent_common::http_util;
 use oac_mcp::parse;
+use oidc_agent_common::http_util;
 
 use super::AppState;
 use crate::audit::AuditEntry;
@@ -105,13 +105,19 @@ pub async fn mcp_permissions_middleware(
             oac_mcp::protocol::METHOD_TOOLS_CALL.to_string()
         } else {
             // Non-tools/call request method surfaced in `tool` by the parser.
-            tool_call.as_ref().map(|c| c.tool.clone()).unwrap_or_default()
+            tool_call
+                .as_ref()
+                .map(|c| c.tool.clone())
+                .unwrap_or_default()
         }
     } else {
         "unknown".to_string()
     };
     let tool_name = if is_tool_call_method {
-        tool_call.as_ref().map(|c| c.tool.clone()).unwrap_or_default()
+        tool_call
+            .as_ref()
+            .map(|c| c.tool.clone())
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -150,15 +156,7 @@ pub async fn mcp_permissions_middleware(
         };
         // Audit the denial.
         if let Some(identity) = &identity {
-            record_mcp_audit(
-                &state,
-                identity,
-                &grant,
-                StatusCode::FORBIDDEN,
-                0,
-                false,
-            )
-            .await;
+            record_mcp_audit(&state, identity, &grant, StatusCode::FORBIDDEN, 0, false).await;
         }
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -198,19 +196,24 @@ fn parse_server_path(path: &str) -> Option<String> {
 
 /// Minimal percent-decoder (server ids are short, opaque strings).
 fn percent_decode(s: &str) -> String {
-    // Decode %xx escapes.
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+        let Some(&cur) = bytes.get(i) else {
+            break;
+        };
+        if cur == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex_val),
+                bytes.get(i + 2).copied().and_then(hex_val),
+            ) {
                 out.push((hi << 4) | lo);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i]);
+        out.push(cur);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -240,7 +243,9 @@ async fn is_tool_allowed(
         Ok(true) => (true, None),
         Ok(false) => (
             false,
-            Some(format!("tool '{tool}' is not allowed on MCP server '{server}'")),
+            Some(format!(
+                "tool '{tool}' is not allowed on MCP server '{server}'"
+            )),
         ),
         Err(e) => {
             // Fail closed on policy-store errors: do not leak an upstream
@@ -253,7 +258,11 @@ async fn is_tool_allowed(
 
 /// Returns whether a non-`tools/call` method is allowed (deny-all applies
 /// when the policy is an explicit empty allowlist).
-async fn is_method_allowed(state: &AppState, groups: &[String], server: &str) -> (bool, Option<String>) {
+async fn is_method_allowed(
+    state: &AppState,
+    groups: &[String],
+    server: &str,
+) -> (bool, Option<String>) {
     let at_least_one = state
         .policy_store
         .resolve_mcp_has_any_tool(groups, server)
@@ -262,7 +271,9 @@ async fn is_method_allowed(state: &AppState, groups: &[String], server: &str) ->
         Ok(true) => (true, None),
         Ok(false) => (
             false,
-            Some(format!("MCP server '{server}' has no allowed tools for this group")),
+            Some(format!(
+                "MCP server '{server}' has no allowed tools for this group"
+            )),
         ),
         Err(e) => {
             tracing::error!(error = %e, server = %server, "MCP policy resolution failed");
@@ -314,5 +325,157 @@ async fn record_mcp_audit(
     };
     if let Err(e) = state.audit.record(&entry).await {
         tracing::error!(error = %e, "failed to write MCP audit log");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use oidc_agent_common::identity;
+    use tower::ServiceExt;
+    use zeroize::Zeroizing;
+
+    async fn test_state() -> AppState {
+        let url = oidc_agent_common::persistence::temp_sqlite_url("mcp-perms");
+        let db = crate::db::setup(&url).await.expect("db");
+        let mcp_db = db.clone();
+        AppState {
+            config: oidc_agent_common::config::CentralConfig {
+                listen_addr: "127.0.0.1:0".parse().expect("addr"),
+                database_url: "sqlite://test.db".into(),
+                oidc: oidc_agent_common::config::OidcConfig {
+                    issuer: "https://idp".into(),
+                    client_id: "c".into(),
+                    client_secret_env: "E".into(),
+                    redirect_uri: "http://127.0.0.1:0/cb".into(),
+                    scopes: vec!["openid".into()],
+                },
+                mtls: oidc_agent_common::config::MtlsServerConfig {
+                    ca_cert_path: "/c".into(),
+                    server_cert_path: "/s".into(),
+                    server_key_path: "/k".into(),
+                },
+                admin: None,
+                pricing: None,
+                dev_mode: true,
+                rate_limit_requests: 60,
+                rate_limit_window_secs: 60,
+            },
+            provider_store: crate::provider::ProviderStore::new(
+                db.clone(),
+                Zeroizing::new([7_u8; 32]),
+            ),
+            client: reqwest::Client::new(),
+            audit: crate::audit::AuditLogger::new(db.clone()),
+            rate_limiter: None,
+            policy_store: crate::policy::PolicyStore::new(db.clone()),
+            device_store: crate::device_store::DeviceStore::new(db.clone()),
+            usage_tracker: crate::usage::UsageTracker::new(db),
+            price_table: crate::pricing::PriceTable::empty(),
+            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+        }
+    }
+
+    fn test_router(state: AppState) -> Router {
+        Router::new()
+            .route("/mcp/{server}", axum::routing::any(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                mcp_permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(())
+    }
+
+    fn mcp_request(subject: &str, groups: &str, tool: &str) -> Request<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": { "path": "/x" } },
+        })
+        .to_string();
+        Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/mcp/fs")
+            .header("content-type", "application/json")
+            .header(identity::HEADER_USER_SUBJECT, subject)
+            .header(identity::HEADER_IDENTITY_ID, format!("{subject}-identity"))
+            .header(identity::HEADER_USER_GROUPS, groups)
+            .body(Body::from(body))
+            .expect("build request")
+    }
+
+    #[tokio::test]
+    async fn allowlisted_tool_passes() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string()]))
+            .await
+            .expect("policy");
+        let app = test_router(state);
+        let resp = app
+            .oneshot(mcp_request("u", r#"["eng"]"#, "read_file"))
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn non_allowlisted_tool_is_denied() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string()]))
+            .await
+            .expect("policy");
+        let app = test_router(state);
+        let resp = app
+            .oneshot(mcp_request("u", r#"["eng"]"#, "delete_file"))
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn no_policy_blocks_all_tools() {
+        let state = test_state().await;
+        // No MCP policy configured for this group → deny-all for tools.
+        let app = test_router(state);
+        let resp = app
+            .oneshot(mcp_request("u", r#"["eng"]"#, "read_file"))
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn allow_all_policy_permits_any_tool() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", None)
+            .await
+            .expect("policy");
+        let app = test_router(state);
+        let resp = app
+            .oneshot(mcp_request("u", r#"["eng"]"#, "delete_file"))
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn parses_server_path() {
+        assert_eq!(parse_server_path("/mcp/fs").as_deref(), Some("fs"));
+        assert_eq!(parse_server_path("/mcp/fs/extra"), None);
+        assert_eq!(parse_server_path("/v1/models"), None);
+        assert_eq!(parse_server_path("/mcp/").as_deref(), None);
     }
 }

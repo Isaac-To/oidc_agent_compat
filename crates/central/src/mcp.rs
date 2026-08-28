@@ -12,8 +12,8 @@ use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
 use rand::RngCore;
 use sea_orm::{
-    ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryOrder, Set,
-    Statement, Value,
+    ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryOrder, Set, Statement,
+    Value,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -123,10 +123,12 @@ impl McpManager {
     /// an HTTP client tailored for MCP forwarding (no redirects followed).
     #[must_use]
     pub fn new(db: DatabaseConnection, encryption_key: Zeroizing<[u8; 32]>) -> Self {
+        // The builder can only fail on a misconfiguration that never occurs
+        // here; fall back to a plain client rather than aborting startup.
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("mcp client builder should never fail");
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             db,
             encryption_key: Arc::new(encryption_key),
@@ -160,11 +162,15 @@ impl McpManager {
         }
         let mut key = Zeroizing::new([0u8; 32]);
         for (i, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
-            let byte = u8::from_str_radix(std::str::from_utf8(chunk).map_err(|_| {
-                Error::Config("MCP encryption key must be hexadecimal".into())
-            })?, 16)
+            let byte = u8::from_str_radix(
+                std::str::from_utf8(chunk)
+                    .map_err(|_| Error::Config("MCP encryption key must be hexadecimal".into()))?,
+                16,
+            )
             .map_err(|_| Error::Config("MCP encryption key must be hexadecimal".into()))?;
-            key[i] = byte;
+            if let Some(slot) = key.get_mut(i) {
+                *slot = byte;
+            }
         }
         Ok(key)
     }
@@ -313,8 +319,8 @@ impl McpManager {
 
 /// Encrypts `secret` with AES-256-GCM using `key`.
 fn encrypt(key: &[u8; 32], secret: &str) -> Result<(Vec<u8>, [u8; 12])> {
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|_| Error::crypto("invalid MCP encryption key"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|_| Error::crypto("invalid MCP encryption key"))?;
     let mut nonce_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from(nonce_bytes);
@@ -330,8 +336,8 @@ fn decrypt(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8]) -> Result<Zeroizing<
         .try_into()
         .map_err(|_| Error::crypto("invalid MCP auth header nonce"))?;
     let nonce = Nonce::from(*nonce);
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|_| Error::crypto("invalid MCP encryption key"))?;
+    let cipher =
+        Aes256Gcm::new_from_slice(key).map_err(|_| Error::crypto("invalid MCP encryption key"))?;
     let plain = cipher
         .decrypt(&nonce, ciphertext)
         .map_err(|_| Error::crypto("decrypt MCP auth header"))?;
@@ -361,7 +367,9 @@ mod tests {
     async fn setup_manager(key: Zeroizing<[u8; 32]>) -> McpManager {
         let url = persistence::temp_sqlite_url("mcp");
         let db = sea_orm::Database::connect(&url).await.expect("connect");
-        crate::migration::Migrator::up(&db, None).await.expect("migrate");
+        crate::migration::Migrator::up(&db, None)
+            .await
+            .expect("migrate");
         McpManager::new(db, key)
     }
 

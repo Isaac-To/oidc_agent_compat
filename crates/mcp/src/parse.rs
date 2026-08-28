@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::errors::{McpError, Result};
 use crate::jsonrpc::{JsonRpcRequest, parse_request_body};
-use crate::protocol::{ToolCall, ToolCallParams, METHOD_TOOLS_CALL};
+use crate::protocol::{METHOD_TOOLS_CALL, ToolCall, ToolCallParams};
 
 /// Length cap for the redacted argument preview stored in audit logs.
 pub const ARGS_PREVIEW_MAX_CHARS: usize = 512;
@@ -43,17 +43,13 @@ pub fn extract_tool_call(body: &[u8], server: &str) -> Result<Option<ToolCall>> 
             .clone()
             .map(serde_json::from_value)
             .transpose()
-            .map_err(|e| {
-                McpError::Malformed(format!("invalid tools/call params: {e}"))
-            })?
+            .map_err(|e| McpError::Malformed(format!("invalid tools/call params: {e}")))?
             .unwrap_or_else(|| ToolCallParams {
                 name: String::new(),
                 arguments: None,
             });
         if params.name.is_empty() {
-            return Err(McpError::Malformed(
-                "tools/call missing tool name".into(),
-            ));
+            return Err(McpError::Malformed("tools/call missing tool name".into()));
         }
         return Ok(Some(ToolCall {
             server: server.to_string(),
@@ -110,7 +106,9 @@ mod tests {
 
     #[test]
     fn tools_call_is_extracted() {
-        let b = body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/tmp/x"}}}"#);
+        let b = body(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/tmp/x"}}}"#,
+        );
         let call = extract_tool_call(&b, "fs").expect("parse").expect("some");
         assert_eq!(call.server, "fs");
         assert_eq!(call.tool, "read_file");
@@ -120,7 +118,8 @@ mod tests {
 
     #[test]
     fn tools_call_without_args() {
-        let b = body(r#"{"jsonrpc":"2.0","id":"abc","method":"tools/call","params":{"name":"ping"}}"#);
+        let b =
+            body(r#"{"jsonrpc":"2.0","id":"abc","method":"tools/call","params":{"name":"ping"}}"#);
         let call = extract_tool_call(&b, "srv").expect("parse").expect("some");
         assert_eq!(call.tool, "ping");
         assert!(call.args_preview.is_none());
@@ -178,8 +177,16 @@ mod tests {
 
     #[test]
     fn scalar_body_is_ignored() {
-        assert!(extract_tool_call(&body("42"), "srv").expect("parse").is_none());
-        assert!(extract_tool_call(&body("null"), "srv").expect("parse").is_none());
+        assert!(
+            extract_tool_call(&body("42"), "srv")
+                .expect("parse")
+                .is_none()
+        );
+        assert!(
+            extract_tool_call(&body("null"), "srv")
+                .expect("parse")
+                .is_none()
+        );
     }
 
     #[test]

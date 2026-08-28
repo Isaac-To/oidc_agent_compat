@@ -294,7 +294,11 @@ impl MigrationTrait for Migration0009Mcp {
                             .not_null()
                             .unique_key(),
                     )
-                    .col(ColumnDef::new(McpServerPolicy::AllowedTools).string().null())
+                    .col(
+                        ColumnDef::new(McpServerPolicy::AllowedTools)
+                            .string()
+                            .null(),
+                    )
                     .col(
                         ColumnDef::new(McpServerPolicy::CreatedAt)
                             .timestamp_with_time_zone()

@@ -18,10 +18,10 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
+use oac_mcp::parse;
 use oidc_agent_common::error::{Error, Result};
 use oidc_agent_common::http_util;
 use oidc_agent_common::identity;
-use oac_mcp::parse;
 
 use super::AppState;
 
@@ -207,9 +207,10 @@ async fn forward_request(
             .map_err(|e| Error::Http(format!("build MCP stream response: {e}")))?;
         Ok(resp)
     } else {
-        let bytes = upstream_resp.bytes().await.map_err(|e| {
-            Error::Http(format!("read MCP upstream response: {e}"))
-        })?;
+        let bytes = upstream_resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Http(format!("read MCP upstream response: {e}")))?;
         let resp = response_builder
             .body(Body::from(bytes))
             .map_err(|e| Error::Http(format!("build MCP response: {e}")))?;

@@ -35,10 +35,10 @@ use oidc_agent_common::error::{Error, Result};
 
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
+use crate::mcp::McpManager;
 use crate::policy::PolicyStore;
 use crate::provider::{ProviderKeyInfo, ProviderKeyUpdate, ProviderStore};
 use crate::usage::UsageTracker;
-use crate::mcp::McpManager;
 
 /// The shared application state for the admin API.
 #[derive(Clone)]
@@ -115,7 +115,9 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/admin/v1/mcp/policies/{group}",
-            get(get_mcp_policy).put(set_mcp_policy).delete(delete_mcp_policy),
+            get(get_mcp_policy)
+                .put(set_mcp_policy)
+                .delete(delete_mcp_policy),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -1362,7 +1364,9 @@ async fn list_mcp_servers(
         .list_servers()
         .await
         .map_err(internal_error)?;
-    Ok(axum::Json(servers.into_iter().map(McpServerResponse::from).collect()))
+    Ok(axum::Json(
+        servers.into_iter().map(McpServerResponse::from).collect(),
+    ))
 }
 
 async fn upsert_mcp_server(
@@ -1371,7 +1375,11 @@ async fn upsert_mcp_server(
     Path(id): Path<String>,
     axum::Json(body): axum::Json<McpServerRequest>,
 ) -> HandlerResult<axum::Json<McpServerResponse>> {
-    let actual_id = if body.id.is_empty() { id } else { body.id.clone() };
+    let actual_id = if body.id.is_empty() {
+        id
+    } else {
+        body.id.clone()
+    };
     let input = crate::mcp::McpServerInput {
         id: actual_id.clone(),
         name: body.name,
@@ -1404,7 +1412,12 @@ async fn get_mcp_server(
         .get_server(&id)
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("MCP server '{id}' not found")))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("MCP server '{id}' not found"),
+            )
+        })?;
     Ok(axum::Json(McpServerResponse::from(server)))
 }
 
@@ -1413,7 +1426,11 @@ async fn delete_mcp_server(
     admin: AdminIdentity,
     Path(id): Path<String>,
 ) -> HandlerResult<axum::Json<serde_json::Value>> {
-    let deleted = state.mcp_manager.delete_server(&id).await.map_err(internal_error)?;
+    let deleted = state
+        .mcp_manager
+        .delete_server(&id)
+        .await
+        .map_err(internal_error)?;
     record_admin_audit(
         state.audit.db(),
         &admin.subject,
@@ -1497,9 +1514,7 @@ async fn delete_mcp_policy(
 /// Maps MCP config/database errors to the appropriate admin HTTP status.
 fn map_mcp_err(e: oidc_agent_common::error::Error) -> (StatusCode, String) {
     match &e {
-        oidc_agent_common::error::Error::Config(msg) => {
-            (StatusCode::BAD_REQUEST, msg.to_string())
-        }
+        oidc_agent_common::error::Error::Config(msg) => (StatusCode::BAD_REQUEST, msg.to_string()),
         _ => internal_error(e),
     }
 }

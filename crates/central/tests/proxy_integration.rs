@@ -111,7 +111,10 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
         device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -276,7 +279,10 @@ async fn streaming_response_records_token_usage_after_stream_completes() {
         device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
         usage_tracker: usage_tracker.clone(),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -432,7 +438,10 @@ async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
         device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -664,7 +673,10 @@ async fn setup_mtls_central() -> SocketAddr {
         device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
 
@@ -912,7 +924,10 @@ async fn setup_multi_provider_central(
         device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1147,7 +1162,10 @@ async fn key_falls_back_on_upstream_401() {
         device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1231,7 +1249,10 @@ async fn no_provider_configured_returns_error_without_key_leak() {
         device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1383,7 +1404,10 @@ async fn token_saver_deduplicates_and_audits() {
         device_store: oac_central::device_store::DeviceStore::new(db.clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(db.clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1602,7 +1626,10 @@ async fn ansi_strip_end_to_end() {
         device_store: oac_central::device_store::DeviceStore::new(db.clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(db.clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1768,7 +1795,10 @@ async fn rtk_collapse_repeated_lines_end_to_end() {
         device_store: oac_central::device_store::DeviceStore::new(db.clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(db.clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1975,7 +2005,10 @@ async fn upstream_failure_releases_request_quota_reservation() {
         device_store: oac_central::device_store::DeviceStore::new(db.clone()),
         usage_tracker: usage_tracker.clone(),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

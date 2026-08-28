@@ -77,8 +77,8 @@ pub fn parse_request_body(body: &[u8]) -> Result<Option<JsonRpcRequest>, crate::
     let text = std::str::from_utf8(body).map_err(|_| crate::McpError::InvalidUtf8)?;
     // A batch (array) is not a single request object. Strings, numbers, and
     // null are also invalid JSON-RPC requests.
-    let value: Value = serde_json::from_str(text)
-        .map_err(|e| crate::McpError::InvalidJsonRpc(e.to_string()))?;
+    let value: Value =
+        serde_json::from_str(text).map_err(|e| crate::McpError::InvalidJsonRpc(e.to_string()))?;
     match value {
         Value::Array(_) => Ok(None),
         Value::Object(_) => {

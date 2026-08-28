@@ -66,7 +66,16 @@ pub async fn mcp_handler(
         Err(e) => {
             let latency_ms = start.elapsed().as_millis() as i64;
             tracing::error!(error = %e, server = %server, "failed to resolve MCP server");
-            record_audit(&state, &identity, &grant, &server, StatusCode::BAD_GATEWAY, latency_ms, false).await;
+            record_audit(
+                &state,
+                &identity,
+                &grant,
+                &server,
+                StatusCode::BAD_GATEWAY,
+                latency_ms,
+                false,
+            )
+            .await;
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
                 "error": { "code": -32603, "message": "MCP server lookup failed" },
@@ -85,19 +94,30 @@ pub async fn mcp_handler(
         Ok(outcome) => {
             let (resp, status, stream) = outcome;
             let latency_ms = start.elapsed().as_millis() as i64;
-            record_audit(&state, &identity, &grant, &server, status, latency_ms, stream).await;
+            record_audit(
+                &state, &identity, &grant, &server, status, latency_ms, stream,
+            )
+            .await;
             resp
         }
         Err(e) => {
             let status = StatusCode::BAD_GATEWAY;
             let latency_ms = start.elapsed().as_millis() as i64;
             tracing::error!(error = %e, server = %server, "MCP forward failed");
-            record_audit(&state, &identity, &grant, &server, status, latency_ms, false).await;
+            record_audit(
+                &state, &identity, &grant, &server, status, latency_ms, false,
+            )
+            .await;
             let body = serde_json::json!({
                 "jsonrpc": "2.0",
                 "error": { "code": -32603, "message": "upstream MCP request failed" },
             });
-            (status, [("content-type", "application/json")], body.to_string()).into_response()
+            (
+                status,
+                [("content-type", "application/json")],
+                body.to_string(),
+            )
+                .into_response()
         }
     }
 }
@@ -119,9 +139,11 @@ async fn forward(
     let suffix = mcp_path_suffix(parts.uri.path(), server);
     let url = format!("{base}{suffix}");
 
-    let body_bytes = axum::body::to_bytes(body, http_util::MAX_BODY_SIZE).await.map_err(
-        |e| oidc_agent_common::error::Error::Http(format!("read MCP request body: {e}")),
-    )?;
+    let body_bytes = axum::body::to_bytes(body, http_util::MAX_BODY_SIZE)
+        .await
+        .map_err(|e| {
+            oidc_agent_common::error::Error::Http(format!("read MCP request body: {e}"))
+        })?;
 
     // Build the upstream header set: forwardable headers + the per-server
     // auth header (if any). Hop-by-hop headers are stripped.
@@ -151,8 +173,9 @@ async fn forward(
         .map(|(n, v)| {
             let name = reqwest::header::HeaderName::from_bytes(n.as_str().as_bytes())
                 .map_err(|_| oidc_agent_common::error::Error::Http("invalid header".into()))?;
-            let value = reqwest::header::HeaderValue::from_bytes(v.as_bytes())
-                .map_err(|_| oidc_agent_common::error::Error::Http("invalid header value".into()))?;
+            let value = reqwest::header::HeaderValue::from_bytes(v.as_bytes()).map_err(|_| {
+                oidc_agent_common::error::Error::Http("invalid header value".into())
+            })?;
             Ok((name, value))
         })
         .collect::<Result<reqwest::header::HeaderMap>>()?;

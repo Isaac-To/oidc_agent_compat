@@ -141,6 +141,10 @@ async fn setup_full_system() -> (
         device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
+        mcp_manager: oac_central::mcp::McpManager::new(
+            audit.db().clone(),
+            Zeroizing::new([7_u8; 32]),
+        ),
     };
     let central_app = central_proxy::router(central_state);
     let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")

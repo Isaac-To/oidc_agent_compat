@@ -326,7 +326,9 @@ impl MigrationTrait for Migration0004McpActivity {
         ] {
             manager
                 .get_connection()
-                .execute_unprepared(&format!("ALTER TABLE relay_activity_log ADD COLUMN {col} {ty};"))
+                .execute_unprepared(&format!(
+                    "ALTER TABLE relay_activity_log ADD COLUMN {col} {ty};"
+                ))
                 .await?;
         }
         Ok(())

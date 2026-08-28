@@ -476,15 +476,13 @@ impl PolicyStore {
     /// # Errors
     ///
     /// Returns [`Error::Database`] on query failure.
-    pub async fn resolve_mcp_has_any_tool(
-        &self,
-        groups: &[String],
-        server: &str,
-    ) -> Result<bool> {
+    pub async fn resolve_mcp_has_any_tool(&self, groups: &[String], server: &str) -> Result<bool> {
         let allowed = self.resolve_mcp_allowed_tools(groups).await?;
         Ok(match allowed {
             None => true,
-            Some(set) => set.iter().any(|entry| entry.starts_with(&format!("{server}:"))),
+            Some(set) => set
+                .iter()
+                .any(|entry| entry.starts_with(&format!("{server}:"))),
         })
     }
 
@@ -536,20 +534,20 @@ impl PolicyStore {
             return Ok(Some(HashSet::new()));
         }
 
-        let mut union: Option<HashSet<String>> = None;
+        let mut union: HashSet<String> = HashSet::new();
         for row in rows {
             let row_tools: Option<String> = row.try_get("", "allowed_tools").ok();
-            match (row_tools, &mut union) {
-                (None, _) => return Ok(None), // allow-all policy wins
-                (Some(json), Some(acc)) => {
+            match row_tools {
+                // allow-all policy wins outright.
+                None => return Ok(None),
+                Some(json) => {
                     if let Ok(entries) = parse_json_array(&json) {
-                        acc.extend(entries);
+                        union.extend(entries);
                     }
                 }
-                (Some(_), None) => return Ok(None),
             }
         }
-        Ok(union)
+        Ok(Some(union))
     }
 
     /// Returns the MCP server policy for a single group, if present.
@@ -557,7 +555,10 @@ impl PolicyStore {
     /// # Errors
     ///
     /// Returns [`Error::Database`] on query failure.
-    pub async fn get_mcp_policy(&self, group_name: &str) -> Result<Option<mcp_server_policy::Model>> {
+    pub async fn get_mcp_policy(
+        &self,
+        group_name: &str,
+    ) -> Result<Option<mcp_server_policy::Model>> {
         use sea_orm::{ColumnTrait, QueryFilter};
         mcp_server_policy::Entity::find()
             .filter(mcp_server_policy::Column::GroupName.eq(group_name))
@@ -1096,5 +1097,81 @@ mod tests {
             .expect("resolve");
         // No group opted into ANSI stripping, so it must remain off.
         assert!(!policy.token_saver.strip_ansi);
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_allowed_with_explicit_allowlist() {
+        let store = setup_test_db().await;
+        store
+            .upsert_mcp_policy(
+                "eng",
+                Some(&["fs:read_file".to_string(), "gh:list".to_string()]),
+            )
+            .await
+            .expect("policy");
+        assert!(
+            store
+                .resolve_mcp_tool_allowed(&["eng".into()], "fs", "read_file")
+                .await
+                .expect("resolve")
+        );
+        assert!(
+            !store
+                .resolve_mcp_tool_allowed(&["eng".into()], "fs", "delete_file")
+                .await
+                .expect("resolve"),
+            "tool outside the allowlist must be denied"
+        );
+        assert!(
+            !store
+                .resolve_mcp_tool_allowed(&["eng".into()], "gh", "read_file")
+                .await
+                .expect("resolve"),
+            "same tool on a different server must be denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_denied_when_no_policy() {
+        let store = setup_test_db().await;
+        assert!(
+            !store
+                .resolve_mcp_tool_allowed(&["eng".into()], "fs", "read_file")
+                .await
+                .expect("resolve"),
+            "no policy must deny all tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_allowed_when_allow_all_policy() {
+        let store = setup_test_db().await;
+        store.upsert_mcp_policy("eng", None).await.expect("policy");
+        assert!(
+            store
+                .resolve_mcp_tool_allowed(&["eng".into()], "fs", "anything")
+                .await
+                .expect("resolve")
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_union_across_groups_is_most_permissive() {
+        let store = setup_test_db().await;
+        store
+            .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string()]))
+            .await
+            .expect("policy a");
+        store
+            .upsert_mcp_policy("gh", Some(&["fs:delete_file".to_string()]))
+            .await
+            .expect("policy b");
+        // A user in both groups may call either tool.
+        assert!(
+            store
+                .resolve_mcp_tool_allowed(&["eng".into(), "gh".into()], "fs", "delete_file")
+                .await
+                .expect("resolve")
+        );
     }
 }
