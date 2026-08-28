@@ -265,6 +265,14 @@ impl McpManager {
         Ok(rows.into_iter().map(|m| self.info(m)).collect())
     }
 
+    /// Lists all configured servers that are currently enabled, ordered by
+    /// id. Used by the combined hub to fan out `tools/list` and route
+    /// `tools/call`.
+    pub async fn list_enabled_servers(&self) -> Result<Vec<McpServerInfo>> {
+        let servers = self.list_servers().await?;
+        Ok(servers.into_iter().filter(|s| s.enabled).collect())
+    }
+
     /// Deletes an MCP server. Returns `true` if a server was removed.
     pub async fn delete_server(&self, id: &str) -> Result<bool> {
         let result = mcp_server::Entity::delete_by_id(id)
@@ -432,6 +440,37 @@ mod tests {
         assert!(mgr.delete_server("s").await.expect("delete"));
         assert!(!mgr.delete_server("s").await.expect("delete again"));
         assert!(mgr.get_server("s").await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn list_enabled_servers_filters_disabled() {
+        let mgr = setup_manager(Zeroizing::new([7u8; 32])).await;
+        for (id, enabled) in [("a", true), ("b", false), ("c", true)] {
+            mgr.upsert_server(&McpServerInput {
+                id: id.into(),
+                name: "S".into(),
+                base_url: "https://mcp.example.com".into(),
+                enabled,
+                auth_header: None,
+            })
+            .await
+            .expect("upsert");
+        }
+        let enabled = mgr.list_enabled_servers().await.expect("list");
+        let ids: Vec<&str> = enabled.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn server_id_cannot_contain_highway_separator() {
+        let input = McpServerInput {
+            id: "fs__gh".into(),
+            name: "S".into(),
+            base_url: "https://mcp.example.com".into(),
+            enabled: true,
+            auth_header: None,
+        };
+        assert!(input.validate().is_err(), "'__' collides with the hub separator");
     }
 
     #[tokio::test]

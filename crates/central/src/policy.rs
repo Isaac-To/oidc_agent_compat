@@ -486,6 +486,35 @@ impl PolicyStore {
         })
     }
 
+    /// Returns the set of MCP server ids the caller's groups may reach, or
+    /// `None` when an allow-all policy is present (all servers reachable).
+    ///
+    /// This is derived from the unioned `"server:tool"` entries: the server
+    /// is the part before the first `:`. A group with no policy contributes
+    /// nothing (deny-by-default).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on query failure.
+    pub async fn resolve_mcp_allowed_servers(
+        &self,
+        groups: &[String],
+    ) -> Result<Option<HashSet<String>>> {
+        let allowed = self.resolve_mcp_allowed_tools(groups).await?;
+        Ok(match allowed {
+            None => None,
+            Some(set) => {
+                let mut servers = HashSet::new();
+                for entry in set {
+                    if let Some((server, _)) = entry.split_once(':') {
+                        servers.insert(server.to_string());
+                    }
+                }
+                Some(servers)
+            }
+        })
+    }
+
     /// Loads the union of allowed `"server:tool"` entries across all of the
     /// caller's groups.
     ///
@@ -1173,5 +1202,50 @@ mod tests {
                 .await
                 .expect("resolve")
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_allowed_servers_derives_from_entries() {
+        let store = setup_test_db().await;
+        store
+            .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string(), "gh:list".to_string()]))
+            .await
+            .expect("policy");
+        let servers = store
+            .resolve_mcp_allowed_servers(&["eng".into()])
+            .await
+            .expect("resolve")
+            .expect("some");
+        assert!(servers.contains("fs"));
+        assert!(servers.contains("gh"));
+        assert_eq!(servers.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn mcp_allowed_servers_none_when_allow_all() {
+        let store = setup_test_db().await;
+        store
+            .upsert_mcp_policy("eng", None)
+            .await
+            .expect("policy");
+        assert!(
+            store
+                .resolve_mcp_allowed_servers(&["eng".into()])
+                .await
+                .expect("resolve")
+                .is_none(),
+            "allow-all policy means all servers reachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_allowed_servers_empty_set_when_no_policy() {
+        let store = setup_test_db().await;
+        let servers = store
+            .resolve_mcp_allowed_servers(&["eng".into()])
+            .await
+            .expect("resolve")
+            .expect("some (empty)");
+        assert!(servers.is_empty(), "no policy → no servers reachable");
     }
 }
