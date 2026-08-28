@@ -50,14 +50,15 @@
 //! The repeated-line collapse pass is *inspired by* RTK
 //! ([https://github.com/rtk-ai/rtk](https://github.com/rtk-ai/rtk),
 //! `src/cmds/system/log_cmd.rs`, `normalize_log_line` + the count-preserving
-//! `[×N]` fold, Apache-2.0; vendored at `vendor/rtk` for source-tracking).
-//! We deliberately diverge from RTK's `analyze_logs` in one crucial way: RTK
-//! uses *fuzzy* normalization that strips timestamps/UUIDs/numbers/paths and
-//! truncates lines to 100 chars, which can merge lines that are actually
-//! distinct. Because this proxy must never lose meaning a developer intended,
-//! our collapse matches **exact-verbatim** consecutive duplicates only and
-//! never truncates or caps the number of kept lines. RTK is retained as a
-//! vendored reference/attribution, not linked as a runtime dependency.
+//! `[×N]` fold, Apache-2.0). **No RTK code is vendored, linked, or copied** —
+//! this implementation is written from scratch and only adopts the general
+//! idea. We deliberately diverge from RTK's `analyze_logs` in one crucial
+//! way: RTK uses *fuzzy* normalization that strips
+//! timestamps/UUIDs/numbers/paths and truncates lines to 100 chars, which
+//! can merge lines that are actually distinct. Because this proxy must never
+//! lose meaning a developer intended, our collapse matches
+//! **exact-verbatim** consecutive duplicates only and never truncates or
+//! caps the number of kept lines.
 
 /// The outcome of applying the optimiser to a single request body.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

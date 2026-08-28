@@ -90,9 +90,8 @@ jobs:
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@v2
 
-      # Vendor / cargo home: the workspace depends on a vendored source in
-      # vendor/rtk (not a workspace member), plus network crates.io. Pin
-      # crates.io as the registry. This is a real release build, so we do
+      # Vendor / cargo home: the workspace builds against network crates.io.
+      # Pin crates.io as the registry. This is a real release build, so we do
       # NOT pass --offline; a fresh runner will fetch from crates.io.
       # Force bash explicitly: on Windows the default shell is PowerShell,
       # which does not understand the `\` line-continuation used below.

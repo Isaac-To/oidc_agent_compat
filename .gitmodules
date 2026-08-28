@@ -1,4 +1,0 @@
-[submodule "vendor/rtk"]
-	path = vendor/rtk
-	url = https://github.com/rtk-ai/rtk
-	branch = develop
