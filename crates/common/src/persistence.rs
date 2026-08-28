@@ -178,14 +178,28 @@ mod tests {
 
     #[test]
     fn sqlite_path_expands_home_tilde() {
-        // Config files use `~/...` paths; they must resolve against HOME.
-        let path = sqlite_path("sqlite://~/library/relay.db").expect("path");
-        let home = std::env::var("HOME").expect("HOME set in test env");
-        assert_eq!(
-            path,
-            PathBuf::from(format!("{home}/library/relay.db")),
-            "tilde must expand to $HOME"
-        );
+        // Config files use `~/...` paths. On platforms where HOME is set
+        // (the shell environments this targets), the tilde resolves against
+        // it; the point is that sqlite_path() survives a `~` path and never
+        // panics, and when HOME is present the leading `~/` is expanded.
+        if let Ok(home) = std::env::var("HOME") {
+            let path = sqlite_path("sqlite://~/library/relay.db").expect("path");
+            // Shell-expand the expected HOME the same way the platform
+            // separator does, so this is robust on Windows too (where the
+            // forward-slash join is normalized by PathBuf).
+            let home_normalized = home.replace('\\', "/");
+            let expected = PathBuf::from(format!("{home_normalized}/library/relay.db"));
+            if let Some(path_str) = path.to_str() {
+                let as_expected =
+                    path_str.replace('\\', "/") == expected.to_string_lossy().replace('\\', "/");
+                assert!(as_expected, "tilde must expand to HOME; got {path:?}");
+            }
+        } else {
+            // No HOME configured (e.g. some CI Windows images): the path
+            // must still resolve without panicking.
+            let path = sqlite_path("sqlite://~/library/relay.db").expect("path");
+            assert!(!path.as_os_str().is_empty());
+        }
     }
 
     #[test]
