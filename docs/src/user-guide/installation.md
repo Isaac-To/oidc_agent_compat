@@ -38,6 +38,79 @@
   mdbook serve docs/ --open
   ```
 
+## Download prebuilt binaries
+
+If you do not want to build from source (and you are not on a platform we
+ship binaries for), you normally do **not** need the Rust toolchain at all.
+Every tagged release publishes prebuilt, binaries-only `.zip` archives to
+the project's **GitHub Releases** page:
+
+> **https://github.com/isaac-to/oidc-agent-compat/releases**
+
+### Available platforms
+
+| Platform | Archive | Notes |
+|---|---|---|
+| macOS (Apple Silicon) | `oac-<version>-aarch64-apple-darwin.zip` | Most laptop-relay users |
+| Linux (x86_64) | `oac-<version>-x86_64-unknown-linux-gnu.zip` | Typical servers |
+| Linux (ARM64) | `oac-<version>-aarch64-unknown-linux-gnu.zip` | e.g. AWS Graviton |
+| Windows (x86_64) | `oac-<version>-x86_64-pc-windows-msvc.zip` | Windows laptops |
+
+Each archive is pure binaries — it contains `oac-relay` and `oac-central`
+at the top level (plus `oac-relay.exe` / `oac-central.exe` on Windows) and
+**no config files or secrets**. Alongside the archives, releases also host
+a `SHA256SUMS` file so you can verify downloads.
+
+> **Intended audience**
+> - The **relay** (`oac-relay`) is what you install on employee laptops.
+> - The **central proxy** (`oac-central`) is typically deployed to a server,
+>   often as a [Docker container](./docker-prod.md). The standalone binary
+>   is just as valid if you run it on a bare-metal or VM host.
+
+### macOS (Apple Silicon) — quick start
+
+```sh
+VERSION="0.1.0"
+curl -fsSL -o oac-relay.zip \
+  "https://github.com/isaac-to/oidc-agent-compat/releases/download/v${VERSION}/oac-${VERSION}-aarch64-apple-darwin.zip"
+unzip oac-relay.zip
+mv oac-relay oac-central /usr/local/bin/
+```
+
+### Linux (x86_64) — quick start
+
+```sh
+VERSION="0.1.0"
+curl -fsSL -o oac-linux.zip \
+  "https://github.com/isaac-to/oidc-agent-compat/releases/download/v${VERSION}/oac-${VERSION}-x86_64-unknown-linux-gnu.zip"
+unzip oac-linux.zip
+sudo mv oac-relay oac-central /usr/local/bin/
+```
+
+### Windows (x86_64) — quick start
+
+Download `oac-<version>-x86_64-pc-windows-msvc.zip`, extract it, and add
+the folder containing `oac-relay.exe` to your `PATH`, or move the binaries
+to a location already on your `PATH`:
+
+```powershell
+# PowerShell
+Expand-Archive .\oac-<version>-x86_64-pc-windows-msvc.zip -DestinationPath .\oac
+```
+
+### Verify the download (optional)
+
+Compute the SHA-256 of each downloaded archive and compare against the
+`SHA256SUMS` file attached to the same release:
+
+```sh
+# macOS / Linux
+curl -fsSL \
+  "https://github.com/isaac-to/oidc-agent-compat/releases/download/v0.1.0/SHA256SUMS"
+shasum -c SHA256SUMS       # macOS
+# sha256sum -c SHA256SUMS  # Linux
+```
+
 ## Build
 
 From the repository root:

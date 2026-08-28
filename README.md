@@ -40,6 +40,12 @@ Or read the source files directly:
 **New here?** Start with the
 [Quickstart](docs/src/user-guide/quickstart.md).
 
+**Prefer downloads over building?** Every release publishes prebuilt,
+binaries-only `.zip` archives for macOS (Apple Silicon), Linux (x86_64 +
+ARM64), and Windows (x86_64) on the
+[**GitHub Releases**](https://github.com/isaac-to/oidc-agent-compat/releases)
+page. See [Installation](docs/src/user-guide/installation.md#download-prebuilt-binaries).
+
 For full Rust API type signatures, run `cargo doc --workspace --open`.
 
 ## Quickstart
