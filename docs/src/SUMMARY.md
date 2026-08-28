@@ -14,6 +14,7 @@
 - [Configuration Reference](./user-guide/configuration.md)
 - [CLI Reference](./user-guide/cli-reference.md)
 - [Admin API](./user-guide/admin-api.md)
+- [MCP Support](./user-guide/mcp.md)
 - [Docker: Dev Stack](./user-guide/docker-dev.md)
 - [Docker: Production](./user-guide/docker-prod.md)
 - [Troubleshooting](./user-guide/troubleshooting.md)

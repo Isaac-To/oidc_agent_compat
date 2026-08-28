@@ -167,6 +167,16 @@ pub struct VerifiedIdentity {
   - If SSE: streams via `bytes_stream()` → `Body::from_stream`.
   - Otherwise: buffers and returns.
 
+### MCP forwarding (`proxy/mcp_forward.rs`)
+
+MCP requests arrive on `/mcp/{server}` (shown to the agent as
+`http://127.0.0.1:<relay>/mcp/{server}`). The relay treats MCP as a raw byte
+tunnel: it reads the JSON-RPC body once, best-effort parses the MCP
+server/tool/method for the activity log, then forwards the bytes to central
+with the identity headers, exactly like the OpenAI path. **The relay never
+inspects JSON-RPC for policy** — per-tool enforcement happens on the central
+proxy. SSE responses pass through unchanged.
+
 ## KeyStore (`keystore.rs`)
 
 ```rust
@@ -249,21 +259,24 @@ file to `0600`.
 
 ### `migration.rs`
 
-Two migrations:
+Four migrations:
 
 - `m000001_initial_schema` — creates `identities` and `api_keys` tables
   (FK `ON DELETE CASCADE`).
 - `m000002_relay_activity_log` — creates `relay_activity_log` + two
   append-only triggers.
+- `m000003_api_key_expiry` — adds nullable `expires_at` to `api_keys`.
+- `m000004_mcp_activity` — adds nullable `mcp_server`, `mcp_tool`,
+  `mcp_method` columns to `relay_activity_log`.
 
 ### Entities
 
 - `identity::Model` — `id`, `issuer`, `subject`, `email`, `display_name`,
   `groups`, `created_at`.
 - `api_key::Model` — `id`, `identity_id`, `key_hash` (Binary(32)), `label`,
-  `created_at`, `last_used_at`.
+  `created_at`, `last_used_at`, `expires_at`.
 - `relay_activity_log::Model` — `id`, `identity_id`, `key_id`, `method`,
   `endpoint`, `model`, `central_status`, `latency_ms`, `request_id`,
-  `created_at`.
+  `mcp_server`, `mcp_tool`, `mcp_method`, `created_at`.
 
 See [Persistence](./persistence.md) for full schemas.

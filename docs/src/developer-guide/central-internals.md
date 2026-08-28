@@ -30,6 +30,7 @@ pub struct AppState {
     pub device_store: DeviceStore,
     pub usage_tracker: UsageTracker,
     pub price_table: PriceTable,
+    pub mcp_manager: McpManager,
 }
 ```
 
@@ -279,6 +280,39 @@ pub struct UsageSnapshot {
 
 Precedence: manual config (`Override`) > auto-fetched (`Fetched`).
 
+## MCP servers (`mcp.rs`)
+
+`McpManager` manages centrally-hosted MCP servers at runtime, mirroring the
+`ProviderStore` pattern. A configured server has a `base_url` (the MCP
+Streamable HTTP endpoint) and an optional per-server `auth_header` stored as
+AES-256-GCM `ciphertext`/`nonce` encrypted at rest with the master key.
+
+- `upsert_server` / `get_server` / `list_servers` / `delete_server`.
+- `resolve_server(id)` — returns a `ResolvedMcpServer` with the decrypted
+  auth header in `Zeroizing` memory (only for the forwarding path).
+- `encryption_key_from_hex` — parses the 32-byte master key.
+
+## MCP forwarding + permissions (`proxy/mcp_forward.rs`, `proxy/mcp_permissions.rs`)
+
+MCP traffic uses the Streamable HTTP transport (JSON-RPC 2.0 over HTTP). The
+relay tunnels raw bytes to central on `/mcp/{server}`.
+
+- `mcp_permissions_middleware` (runs after auth) reads the JSON-RPC body,
+  extracts the tool name via `oac-mcp::parse`, and resolves the caller's
+  per-group, per-server, per-tool policy
+  (`PolicyStore::resolve_mcp_tool_allowed`). Denials return `403` and are
+  audit-logged with the tool, server, method, and a redacted argument preview.
+- `mcp_forward::mcp_handler` resolves the upstream server, injects its auth
+  header, strips hop-by-hop headers, forwards the bytes, and passes SSE
+  responses through. Records an `AuditEntry` with `mcp_server`, `mcp_tool`,
+  `mcp_method`, and `mcp_args_preview`.
+
+MCP policy resolution (`policy.rs`) treats tools as **deny-by-default**:
+`resolve_mcp_allowed_tools` returns `None` only for an explicit allow-all
+(`allowed_tools = NULL`) policy; otherwise it returns the union of
+`"server:tool"` entries across the user's groups, or an empty set (deny all)
+when none exist.
+
 ## Rate limiting (`proxy/rate_limit.rs`)
 
 `RateLimiter` — token bucket per IP.
@@ -317,7 +351,7 @@ All mutations write to `admin_audit_log` (append-only).
 
 ## Persistence
 
-### Migrations (4)
+### Migrations
 
 1. `m000001_initial_schema` — `devices`, `audit_log` + append-only
    triggers.
@@ -326,5 +360,13 @@ All mutations write to `admin_audit_log` (append-only).
    triggers.
 4. `m000004_usage_counters` — `usage_counters` with unique index on
    `(user_subject, period_date, period_kind)`.
+5. `m000005_providers` — `providers`, `provider_keys` (encrypted),
+   `provider_key_access`.
+6. `m000006_token_saver` — token-saver + budget columns on `group_policies`;
+   saver accounting columns on `audit_log`.
+7. `m000007_collapse_repeated_lines` — RTK collapse toggle.
+8. `m000008_strip_ansi` — ANSI-strip toggle.
+9. `m000009_mcp` — `mcp_servers` (encrypted auth), `mcp_server_policies`,
+   and MCP audit columns.
 
 See [Persistence](./persistence.md) for full schemas.

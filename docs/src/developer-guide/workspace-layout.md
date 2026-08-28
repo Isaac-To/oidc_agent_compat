@@ -5,9 +5,10 @@ full source file tree.
 
 ## Crate overview
 
-| Crate | Path | Binary | Lib | Role |
+| **Crate** | **Path** | **Binary** | **Lib** | **Role** |
 |---|---|---|---|---|
 | `oidc-agent-common` | `crates/common` | — | `oidc_agent_common` | Shared primitives |
+| `oac-mcp` | `crates/mcp` | — | `oac_mcp` | MCP/JSON-RPC protocol types & parsing |
 | `oac-relay` | `crates/relay` | `oac-relay` | `oac_relay` | Laptop relay |
 | `oac-central` | `crates/central` | `oac-central` | `oac_central` | Central proxy |
 | `oac-e2e-tests` | `tests/e2e` | — | `oac_e2e_tests` | In-process E2E tests |
@@ -33,6 +34,17 @@ crates/common/src/
 └── test_certs.rs       # Test cert generation (rcgen, behind test-certs feature)
 ```
 
+### `crates/mcp/` — MCP protocol types & parsing
+
+```
+crates/mcp/src/
+├── lib.rs              # Crate root; re-exports modules
+├── errors.rs           # McpError enum + Result alias
+├── jsonrpc.rs          # JSON-RPC 2.0 request/response framing
+├── protocol.rs         # MCP method constants + ToolCall/initialize types
+└── parse.rs            # extract_tool_call, redaction, validation helpers
+```
+
 ### `crates/relay/` — Laptop relay
 
 ```
@@ -42,13 +54,14 @@ crates/relay/src/
 ├── login.rs            # OIDC auth-code + PKCE flow, ID-token validation, agent config injection
 ├── keystore.rs         # KeyStore: key minting, identity upsert, key verification
 ├── db.rs               # Relay DB setup
-├── migration.rs        # SeaORM migrations (2 migrations)
+├── migration.rs        # SeaORM migrations (4 migrations)
 ├── activity.rs         # Relay-side activity logger (append-only)
 ├── agent_config.rs     # Agent config injection (Codex config.json / ~/.oac/agent-env.sh)
 ├── proxy/
 │   ├── mod.rs          # Router, AppState, serve()
 │   ├── auth.rs         # Local key auth middleware
 │   ├── forward.rs      # Relay→central forwarding (mTLS client, SSE passthrough)
+│   ├── mcp_forward.rs  # MCP byte-tunnel (JSON-RPC → central with identity)
 │   └── host_guard.rs   # DNS rebinding defense (Host header validation)
 └── entity/
     ├── mod.rs
@@ -67,11 +80,12 @@ crates/central/src/
 ├── lib.rs              # Lib exposed for integration tests
 ├── main.rs             # Binary: serve and admin CLI
 ├── db.rs               # Central DB setup
-├── migration.rs        # SeaORM migrations (4 migrations)
+├── migration.rs        # SeaORM migrations (9 migrations)
 ├── admin.rs            # Admin API (/admin/v1/) router, handlers, auth middleware
-├── policy.rs           # PolicyStore + resolve_policy (group→policy merge)
+├── policy.rs           # PolicyStore + resolve_policy (group→policy merge) + MCP tool policies
 ├── device_store.rs     # Device registration + revocation store
 ├── provider.rs         # Runtime providers; AES-256-GCM encrypted keys
+├── mcp.rs              # McpManager (runtime MCP servers; encrypted auth headers)
 ├── audit.rs            # Audit logger (enriched with identity, groups, endpoint, etc.)
 ├── usage.rs            # UsageTracker (per-user daily token/request quotas)
 ├── pricing.rs          # PriceTable (model cost computation, auto-fetch from backend)
@@ -80,6 +94,8 @@ crates/central/src/
 │   ├── auth.rs         # Validates relay-forwarded identity headers
 │   ├── forward.rs      # Central→backend forwarding (SSE, provider-key injection)
 │   ├── permissions.rs  # Group-based model/endpoint/quota enforcement
+│   ├── mcp_forward.rs      # MCP forwarding (auth-header injection, SSE passthrough)
+│   ├── mcp_permissions.rs  # Per-server/per-tool MCP enforcement
 │   └── rate_limit.rs   # Per-IP token bucket rate limiter
 └── entity/
     ├── mod.rs
@@ -87,7 +103,9 @@ crates/central/src/
     ├── usage_counter.rs    # usage_counter entity
     ├── device.rs           # device entity
     ├── admin_audit_log.rs  # admin_audit_log entity (append-only)
-    └── group_policy.rs     # group_policy entity
+    ├── group_policy.rs     # group_policy entity
+    ├── mcp_server.rs       # mcp_server entity (encrypted auth)
+    └── mcp_server_policy.rs# mcp_server_policy entity
 
 crates/central/tests/
 └── proxy_integration.rs    # 10 integration tests (dev + prod + mTLS modes)
@@ -111,7 +129,7 @@ Key workspace settings:
 ```toml
 [workspace]
 resolver = "2"
-members = ["crates/common", "crates/relay", "crates/central", "tests/e2e"]
+members = ["crates/common", "crates/mcp", "crates/relay", "crates/central", "tests/e2e"]
 
 [workspace.package]
 version = "0.1.0"
