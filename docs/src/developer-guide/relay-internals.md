@@ -169,13 +169,14 @@ pub struct VerifiedIdentity {
 
 ### MCP forwarding (`proxy/mcp_forward.rs`)
 
-MCP requests arrive on `/mcp/{server}` (shown to the agent as
-`http://127.0.0.1:<relay>/mcp/{server}`). The relay treats MCP as a raw byte
-tunnel: it reads the JSON-RPC body once, best-effort parses the MCP
-server/tool/method for the activity log, then forwards the bytes to central
-with the identity headers, exactly like the OpenAI path. **The relay never
-inspects JSON-RPC for policy** — per-tool enforcement happens on the central
-proxy. SSE responses pass through unchanged.
+MCP requests arrive on `/mcp` (the combined hub) and `/mcp/{server}` (a
+single server), shown to the agent as `http://127.0.0.1:<relay>/mcp...`. The
+relay treats MCP as a raw byte tunnel: it reads the JSON-RPC body once,
+best-effort parses the MCP server/tool/method for the activity log, then
+forwards the bytes to central with the identity headers, exactly like the
+OpenAI path. **The relay never inspects JSON-RPC for policy** — per-tool
+enforcement happens on the central proxy. SSE responses pass through
+unchanged.
 
 ## KeyStore (`keystore.rs`)
 

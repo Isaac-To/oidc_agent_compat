@@ -235,8 +235,8 @@ Create or update an MCP server.
 
 ```json
 {
-  "id": "fs",
-  "name": "Filesystem",
+  "id": "github",
+  "name": "GitHub",
   "base_url": "https://mcp.example.com/mcp",
   "enabled": true,
   "auth_header": "Authorization: Bearer <token>"
@@ -248,6 +248,10 @@ central forwards to this server and is **encrypted at rest** (AES-256-GCM)
 with the master encryption key. It is never returned by any API and never
 logged.
 
+> **Naming constraint:** a server `id` must not contain `__` (double
+> underscore). The hub reserves `__` as the separator between a server id
+> and a tool name (`github__list_files`).
+
 #### `GET|PUT|DELETE /admin/v1/mcp/servers/{id}`
 
 Get, update, or delete an MCP server. `PUT` matches the `POST` body except
@@ -257,7 +261,10 @@ existing per-group policies that reference it become inert.
 ### MCP policies
 
 MCP policies grant a group permission to call specific tools on specific
-MCP servers. Tool entries are written as `"server:tool"`.
+MCP servers. Policy entries are written as **`"server:tool"`** (colon form).
+When a user's agent uses the combined `/mcp` hub, the same tool is exposed
+with a **`server__tool`** prefix; an admin's policy key and the agent's tool
+name refer to the same pair.
 
 #### `GET /admin/v1/mcp/policies/{group}`
 
@@ -265,7 +272,7 @@ Get a group's MCP policy.
 
 **Response body:**
 ```json
-{ "group_name": "engineering", "allowed_tools": ["fs:read_file", "gh:list"] }
+{ "group_name": "engineering", "allowed_tools": ["github:list_files"] }
 ```
 
 `allowed_tools: null` means **all tools allowed** on all configured servers.

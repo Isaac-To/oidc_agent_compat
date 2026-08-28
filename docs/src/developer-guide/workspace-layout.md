@@ -95,6 +95,7 @@ crates/central/src/
 │   ├── forward.rs      # Central→backend forwarding (SSE, provider-key injection)
 │   ├── permissions.rs  # Group-based model/endpoint/quota enforcement
 │   ├── mcp_forward.rs      # MCP forwarding (auth-header injection, SSE passthrough)
+│   ├── mcp_hub.rs          # Combined /mcp hub (aggregates all servers, prefixes tools)
 │   ├── mcp_permissions.rs  # Per-server/per-tool MCP enforcement
 │   └── rate_limit.rs   # Per-IP token bucket rate limiter
 └── entity/

@@ -292,26 +292,39 @@ AES-256-GCM `ciphertext`/`nonce` encrypted at rest with the master key.
   auth header in `Zeroizing` memory (only for the forwarding path).
 - `encryption_key_from_hex` — parses the 32-byte master key.
 
-## MCP forwarding + permissions (`proxy/mcp_forward.rs`, `proxy/mcp_permissions.rs`)
+## MCP forwarding + permissions (`proxy/mcp_forward.rs`, `proxy/mcp_permissions.rs`, `proxy/mcp_hub.rs`)
 
 MCP traffic uses the Streamable HTTP transport (JSON-RPC 2.0 over HTTP). The
-relay tunnels raw bytes to central on `/mcp/{server}`.
+relay tunnels raw bytes to central on `/mcp` (combined hub) and
+`/mcp/{server}` (a single server).
 
 - `mcp_permissions_middleware` (runs after auth) reads the JSON-RPC body,
   extracts the tool name via `oac-mcp::parse`, and resolves the caller's
   per-group, per-server, per-tool policy
-  (`PolicyStore::resolve_mcp_tool_allowed`). Denials return `403` and are
-  audit-logged with the tool, server, method, and a redacted argument preview.
+  (`PolicyStore::resolve_mcp_tool_allowed`) on `/mcp/{server}`. Denials return
+  `403` and are audit-logged with the tool, server, method, and a redacted
+  argument preview.
+- `mcp_hub::mcp_hub_handler` handles the combined `/mcp`: `initialize`,
+  `tools/list` (fans out to enabled reachable servers, prefixes tools as
+  `server__tool`, filters by per-tool policy, aggregates), `tools/call`
+  (splits the prefixed name, enforces the policy inline, routes to the target
+  server), `ping`, and `notifications/*` (best-effort broadcast).
 - `mcp_forward::mcp_handler` resolves the upstream server, injects its auth
   header, strips hop-by-hop headers, forwards the bytes, and passes SSE
   responses through. Records an `AuditEntry` with `mcp_server`, `mcp_tool`,
   `mcp_method`, and `mcp_args_preview`.
 
+**Naming consistency:** policy keys are the colon form `server:tool` (what
+admins write); the hub exposes the underscore form `server__tool` (what
+agents see). `oac-mcp::hub` owns the join/split so both representations and
+the two endpoints stay in sync. Server ids must not contain `__`.
+
 MCP policy resolution (`policy.rs`) treats tools as **deny-by-default**:
 `resolve_mcp_allowed_tools` returns `None` only for an explicit allow-all
 (`allowed_tools = NULL`) policy; otherwise it returns the union of
 `"server:tool"` entries across the user's groups, or an empty set (deny all)
-when none exist.
+when none exist. `resolve_mcp_allowed_servers` derives the reachable server
+ids for the hub's `tools/list` fan-out.
 
 ## Rate limiting (`proxy/rate_limit.rs`)
 
