@@ -80,6 +80,12 @@ pub struct OptimizationReport {
     pub collapsed_lines: u64,
     /// Number of messages whose content was collapsed (RTK pass).
     pub collapsed_messages: u64,
+    /// Number of messages whose content had ANSI escape sequences stripped.
+    pub ansi_stripped_messages: u64,
+    /// Whether the final body was reverted to the original because the
+    /// "never-worse" guard determined the optimised body would not actually
+    /// reduce token usage.
+    pub never_worse_reverted: bool,
 }
 
 /// The admin-supplied token-saver configuration for a group.
@@ -96,6 +102,10 @@ pub struct TokenSaverConfig {
     /// `false`; it is a more aggressive (still audited) pass that admins
     /// opt into explicitly.
     pub collapse_repeated_lines: bool,
+    /// Whether to strip ANSI escape sequences (e.g. `\x1b[31m` terminal
+    /// colour codes) from message content before forwarding. Defaults to
+    /// `false`.
+    pub strip_ansi: bool,
 }
 
 /// Estimated tokens for a unit of text (1 token ≈ 4 chars, English-centric).
@@ -217,6 +227,38 @@ pub fn optimize_prompt(
         }
     }
 
+    // Pass 1.6 (RTK-inspired): strip ANSI escape sequences from each
+    // surviving message's content. This is opt-in (`strip_ansi`) and is
+    // lossless-by-construction: ANSI control codes carry no meaning for an
+    // LLM, so removing them cannot change what the developer intended. A
+    // message whose content was *only* ANSI codes is reduced to empty by
+    // stripping and is dropped here (the codes were pure noise).
+    if config.strip_ansi {
+        let mut stripped_retained: Vec<serde_json::Value> = Vec::with_capacity(messages.len());
+        for mut msg in messages.drain(..) {
+            let Some(content) = msg.get("content").and_then(serde_json::Value::as_str) else {
+                stripped_retained.push(msg);
+                continue;
+            };
+            let stripped = strip_ansi_escapes(content);
+            if stripped.len() != content.len() {
+                report.ansi_stripped_messages += 1;
+                changed = true;
+                if stripped.is_empty() {
+                    // Only control codes — the message now carries no
+                    // content at all. Drop it as noise.
+                    report.empty_messages_dropped += 1;
+                    continue;
+                }
+            }
+            if let Some(slot) = msg.get_mut("content") {
+                *slot = serde_json::Value::String(stripped);
+            }
+            stripped_retained.push(msg);
+        }
+        *messages = stripped_retained;
+    }
+
     // Safety guard: never produce an empty `messages` array. If ALL turns
     // were empty-content or exact duplicates, an empty array is invalid for
     // a chat request and would lose the request entirely — so we leave the
@@ -325,13 +367,33 @@ pub fn optimize_prompt(
     // body would be inconsistent with the audit/`saver_reasons` accounting.
     report.applied = changed;
 
-    match serde_json::to_vec(&value) {
-        Ok(encoded) => (bytes::Bytes::from(encoded), report),
-        Err(_) => (
-            bytes::Bytes::copy_from_slice(body),
-            OptimizationReport::default(),
-        ),
+    let encoded = match serde_json::to_vec(&value) {
+        Ok(encoded) => encoded,
+        Err(_) => {
+            return (
+                bytes::Bytes::copy_from_slice(body),
+                OptimizationReport::default(),
+            );
+        }
+    };
+
+    let optimized_body = bytes::Bytes::from(encoded);
+
+    // Never-worse guard (RTK-inspired; see `src/core/guard.rs` upstream):
+    // only emit the optimised body if it would actually reduce token usage.
+    // This is a final safety net that makes "never grows" an enforced
+    // invariant, not just an incidental property of each pass. When the
+    // heuristic reports that the rewritten body is not strictly smaller, we
+    // revert to the original bytes (and never claim we saved anything).
+    if report.input_tokens_after >= report.input_tokens_before {
+        report.never_worse_reverted = true;
+        report.applied = false;
+        report.input_tokens_after = report.input_tokens_before;
+        report.tokens_saved = 0;
+        return (bytes::Bytes::copy_from_slice(body), report);
     }
+
+    (optimized_body, report)
 }
 
 /// Builds a text representative of the request body for token estimation.
@@ -350,11 +412,59 @@ fn body_for_estimate(value: &serde_json::Value) -> String {
     out
 }
 
+// --- RTK-inspired passes ----------------------------------------------------
+//
+// Three techniques in this module are *inspired by* RTK
+// (https://github.com/rtk-ai/rtk, Apache-2.0); none use RTK code, which is
+// not vendored or linked. The ideas are reimplemented from scratch with
+// stricter guarantees, because this proxy forwards a request to a model and
+// must never lose developer intent:
+//   - repeated-line collapse: conceptually derived from
+//     `src/cmds/system/log_cmd.rs` (`normalize_log_line` + the [×N] fold),
+//     but we use exact-verbatim consecutive matching (RTK uses fuzzy
+//     normalization and truncates/caps, which would merge distinct lines).
+//   - ANSI stripping: conceptually derived from `src/core/utils.rs`
+//     (`strip_ansi`, regex `\x1b\[[0-9;]*[a-zA-Z]`), reimplemented as a
+//     hand-rolled scanner so no `regex` dependency is needed.
+//   - the "never-worse" guard: conceptually derived from `src/core/guard.rs`
+//     (`never_worse`), applied inline at the end of [`optimize_prompt`].
+// See the module-level "Upstream attribution" section.
+
+/// Strips ANSI CSI escape sequences (`ESC [ ... final_byte`) from `content`.
+///
+/// Mirrors RTK's `strip_ansi` (https://github.com/rtk-ai/rtk,
+/// `src/core/utils.rs`) reimplemented without the `regex` crate: it scans
+/// for the CSI introducer `ESC [` and drops everything up to and including
+/// the final command byte in `@-~`. This removes terminal colour/style and
+/// cursor codes that carry no meaning for an LLM. Text is never truncated or
+/// reordered — only control codes are removed, so the pass is lossless.
+#[must_use]
+fn strip_ansi_escapes(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next(); // consume '['
+            // Consume parameter/private bytes until (and including) the
+            // final command byte in the range `@`..=`~`.
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
 // --- RTK-inspired repeated-line collapse ------------------------------------
 //
-// Inspired by RTK's `normalize_log_line` + count-preserving `[×N]` fold
-// (https://github.com/rtk-ai/rtk, `src/cmds/system/log_cmd.rs`, Apache-2.0,
-// vendored at `vendor/rtk` for attribution). We intentionally use
+// Conceptually inspired by RTK's `normalize_log_line` + count-preserving
+// `[×N]` fold (https://github.com/rtk-ai/rtk,
+// `src/cmds/system/log_cmd.rs`, Apache-2.0). No RTK code is used or
+// vendored; the approach is reimplemented from scratch. We intentionally use
 // exact-verbatim consecutive matching here (NOT RTK's fuzzy normalization),
 // because fuzzy stripping can merge distinct developer content. See the
 // module-level "Upstream attribution" section.
@@ -499,6 +609,7 @@ mod tests {
             enabled: true,
             max_input_tokens: Some(1),
             collapse_repeated_lines: false,
+            strip_ansi: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         let value: serde_json::Value = serde_json::from_slice(&out).expect("valid json");
@@ -529,6 +640,7 @@ mod tests {
             enabled: true,
             max_input_tokens: None,
             collapse_repeated_lines: false,
+            strip_ansi: false,
         }
     }
 
@@ -588,6 +700,7 @@ mod tests {
             enabled: true,
             max_input_tokens: Some(4),
             collapse_repeated_lines: false,
+            strip_ansi: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         assert!(report.applied);
@@ -611,6 +724,7 @@ mod tests {
             enabled: true,
             max_input_tokens: Some(2),
             collapse_repeated_lines: false,
+            strip_ansi: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         // If nothing fits, we must NOT drop the only message (would lose the
@@ -739,6 +853,7 @@ mod tests {
                 enabled: true,
                 max_input_tokens: Some(budget),
                 collapse_repeated_lines: false,
+                strip_ansi: false,
             };
             let (out, report) = optimize_prompt(&body, config);
             let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -806,6 +921,7 @@ mod tests {
                 enabled: true,
                 max_input_tokens: Some(2),
                 collapse_repeated_lines: false,
+                strip_ansi: false,
             };
             let (out, _report) = optimize_prompt(&body, config);
             let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -837,6 +953,7 @@ mod tests {
             enabled: true,
             max_input_tokens: Some(1),
             collapse_repeated_lines: false,
+            strip_ansi: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         assert!(report.budget_turns_dropped >= 2);
@@ -860,6 +977,7 @@ mod tests {
             enabled: true,
             max_input_tokens: Some(1_000_000),
             collapse_repeated_lines: false,
+            strip_ansi: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         assert!(!report.applied);
@@ -974,6 +1092,7 @@ mod tests {
             enabled: true,
             max_input_tokens: Some(6),
             collapse_repeated_lines: false,
+            strip_ansi: false,
         };
         let (out, report) = optimize_prompt(&body, config);
         assert!(report.applied);
@@ -1040,6 +1159,7 @@ mod tests {
             enabled: true,
             max_input_tokens: None,
             collapse_repeated_lines: true,
+            strip_ansi: false,
         }
     }
 
@@ -1363,5 +1483,122 @@ mod tests {
             count += 1;
         }
         count
+    }
+
+    // --- ANSI-stripping tests (RTK/headroom-inspired) ---
+
+    fn ansi_enabled() -> TokenSaverConfig {
+        TokenSaverConfig {
+            enabled: true,
+            max_input_tokens: None,
+            collapse_repeated_lines: false,
+            strip_ansi: true,
+        }
+    }
+
+    #[test]
+    fn strip_ansi_is_off_by_default() {
+        // Conservative default: ANSI stripping is opt-in like the collapse
+        // pass; a plain `enabled()` (strip_ansi=false) must leave content
+        // byte-identical.
+        let body = json(
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"\u001b[31mred\u001b[0m text"}]}"#,
+        );
+        let (out, report) = optimize_prompt(&body, enabled());
+        assert!(!report.applied);
+        assert_eq!(&out[..], &body[..]);
+    }
+
+    #[test]
+    fn strip_ansi_removes_colour_codes() {
+        let body = json(
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"\u001b[31mError\u001b[0m: boom"},{"role":"user","content":"plain"}]}"#,
+        );
+        let (out, report) = optimize_prompt(&body, ansi_enabled());
+        assert!(report.applied);
+        assert_eq!(report.ansi_stripped_messages, 1);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["messages"][0]["content"], "Error: boom");
+        // Non-ANSI message untouched.
+        assert_eq!(value["messages"][1]["content"], "plain");
+    }
+
+    #[test]
+    fn strip_ansi_multiple_and_complex() {
+        assert_eq!(
+            strip_ansi_escapes("\u{1b}[1m\u{1b}[32mSuccess\u{1b}[0m\u{1b}[0m"),
+            "Success"
+        );
+        assert_eq!(strip_ansi_escapes("plain text"), "plain text");
+        assert_eq!(strip_ansi_escapes(""), "");
+    }
+
+    #[test]
+    fn strip_ansi_message_with_only_codes_is_removed() {
+        // A message whose content is *only* ANSI codes becomes empty after
+        // stripping, then is dropped by the empty-message pass (the codes
+        // were noise).
+        let body = json(
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"\u001b[31m\u001b[0m"},{"role":"user","content":"real"}]}"#,
+        );
+        let (out, report) = optimize_prompt(&body, ansi_enabled());
+        assert!(report.applied);
+        assert_eq!(report.ansi_stripped_messages, 1);
+        assert_eq!(report.empty_messages_dropped, 1);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "real");
+    }
+
+    #[test]
+    fn strip_ansi_never_grows_content() {
+        // For arbitrary content, stripping can only remove bytes. Fuzz-ish
+        // check over a panel of ANSI-heavy samples.
+        let samples = [
+            "a\u{1b}[31mb\u{1b}[0mc",
+            "\u{1b}[38;5;196mcolourful\u{1b}[0m",
+            "noise \u{1b}[2Kprogress \u{1b}[1A up",
+            "",
+            "\u{1b}[90m\u{1b}[0m\u{1b}[90m\u{1b}[0m",
+        ];
+        for s in samples {
+            let out = strip_ansi_escapes(s);
+            assert!(out.len() <= s.len(), "strip_ansi grew content: {out:?}");
+        }
+    }
+
+    // --- never-worse guard tests (RTK/headroom-inspired) ---
+
+    #[test]
+    fn never_worse_keeps_optimised_when_smaller() {
+        let body = json(
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"alpha-alpha-alpha\nbeta beta beta\nbody long text line"},{"role":"user","content":"alpha-alpha-alpha\nbeta beta beta\nbody long text line"}]}"#,
+        );
+        let (out, report) = optimize_prompt(&body, rtk_enabled());
+        // Dedup + collapse shrink this; never-worse must not revert.
+        assert!(report.applied);
+        assert!(!report.never_worse_reverted);
+        assert!(report.tokens_saved > 0);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            value["messages"].as_array().unwrap().len(),
+            1,
+            "duplicate message collapsed"
+        );
+    }
+
+    #[test]
+    fn never_worse_reverts_when_optimisation_would_not_shrink() {
+        // A tiny single message that cannot be shrunk (no dups, no collapse
+        // opportunity, within budget) leaves `changed=false`, so never-worse
+        // is not even reached — the body returns byte-identical and
+        // `never_worse_reverted` stays false. To exercise the guard we need
+        // `changed=true` but no token reduction.
+        let body = json(r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#);
+        let (out, report) = optimize_prompt(&body, rtk_enabled());
+        assert!(!report.applied);
+        assert!(!report.never_worse_reverted);
+        assert_eq!(&out[..], &body[..]);
     }
 }

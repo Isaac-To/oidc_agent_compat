@@ -668,6 +668,8 @@ pub struct GroupPolicyResponse {
     pub max_input_tokens: Option<i64>,
     /// Whether the RTK-adapted repeated-line collapse pass is enabled.
     pub collapse_repeated_lines: bool,
+    /// Whether ANSI escape sequences are stripped from message content.
+    pub strip_ansi: bool,
 }
 
 impl From<crate::entity::group_policy::Model> for GroupPolicyResponse {
@@ -687,6 +689,7 @@ impl From<crate::entity::group_policy::Model> for GroupPolicyResponse {
             token_saver_enabled: m.token_saver_enabled,
             max_input_tokens: m.max_input_tokens,
             collapse_repeated_lines: m.collapse_repeated_lines,
+            strip_ansi: m.strip_ansi,
         }
     }
 }
@@ -749,6 +752,9 @@ pub struct UpsertPolicyRequest {
     /// Whether the RTK-adapted repeated-line collapse pass is enabled.
     #[serde(default)]
     pub collapse_repeated_lines: bool,
+    /// Whether ANSI escape sequences are stripped from message content.
+    #[serde(default)]
+    pub strip_ansi: bool,
 }
 
 async fn upsert_policy(
@@ -785,6 +791,7 @@ async fn upsert_policy(
             body.token_saver_enabled,
             body.max_input_tokens,
             body.collapse_repeated_lines,
+            body.strip_ansi,
         )
         .await
         .map_err(internal_error)?;
@@ -2310,12 +2317,23 @@ mod tests {
                 true,
                 Some(8000),
                 true,
+                false,
             )
             .await
             .expect("policy");
         state
             .policy_store
-            .upsert_policy_full("quiet-group", None, None, None, None, false, None, false)
+            .upsert_policy_full(
+                "quiet-group",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+            )
             .await
             .expect("policy");
 

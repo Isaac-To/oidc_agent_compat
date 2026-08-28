@@ -178,7 +178,40 @@ impl MigratorTrait for Migrator {
             Box::new(Migration0005Providers),
             Box::new(Migration0006TokenSaver),
             Box::new(Migration0007CollapseRepeatedLines),
+            Box::new(Migration0008StripAnsi),
         ]
+    }
+}
+
+/// Migration 0008: add the ANSI-stripping toggle to `group_policies`.
+///
+/// `strip_ansi` lets admins enable terminal control-code stripping from
+/// message content on top of the token saver. It defaults to `false` — this
+/// pass is an opt-in optimization.
+pub struct Migration0008StripAnsi;
+
+impl MigrationName for Migration0008StripAnsi {
+    fn name(&self) -> &str {
+        "m000008_strip_ansi"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0008StripAnsi {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE group_policies \
+                 ADD COLUMN strip_ansi BOOLEAN NOT NULL DEFAULT false;",
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let _ = manager;
+        Ok(())
     }
 }
 
@@ -902,6 +935,7 @@ mod tests {
                 "m000005_providers",
                 "m000006_token_saver",
                 "m000007_collapse_repeated_lines",
+                "m000008_strip_ansi",
             ],
             "migration order is part of the schema contract"
         );

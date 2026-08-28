@@ -294,6 +294,9 @@ async fn record_request_outcome(context: &AccountingContext, usage: TokenUsage, 
             if r.collapsed_lines > 0 {
                 reasons.push("rtk_collapse".to_string());
             }
+            if r.ansi_stripped_messages > 0 {
+                reasons.push("ansi_strip".to_string());
+            }
             serde_json::to_string(&reasons).unwrap_or_default()
         }),
     };

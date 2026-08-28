@@ -122,7 +122,8 @@ Create or update a policy.
   "daily_request_quota": 1000,
   "token_saver_enabled": false,
   "max_input_tokens": null,
-  "collapse_repeated_lines": false
+  "collapse_repeated_lines": false,
+  "strip_ansi": false
 }
 ```
 
@@ -130,7 +131,9 @@ All fields are optional (`null` means "all allowed" / "unlimited").
 `token_saver_enabled` defaults to `false`; `max_input_tokens` must be a
 positive integer when set. `collapse_repeated_lines` (default `false`)
 enables the RTK-adapted pass that folds consecutive exact-verbatim repeated
-lines inside a single message into `[×N]` markers.
+lines inside a single message into `[×N]` markers. `strip_ansi` (default
+`false`) enables removal of terminal ANSI colour/control codes from message
+content.
 
 **Response:** `200` — [`GroupPolicyResponse`](#grouppolicyresponse).
 
@@ -229,7 +232,8 @@ not made a request today, the groups are unknown and both quotas are `null`.
   "daily_request_quota": 1000,
   "token_saver_enabled": false,
   "max_input_tokens": null,
-  "collapse_repeated_lines": false
+  "collapse_repeated_lines": false,
+  "strip_ansi": false
 }
 ```
 
@@ -243,6 +247,7 @@ not made a request today, the groups are unknown and both quotas are `null`.
 | `token_saver_enabled` | `bool` | Whether the safe token saver is enabled |
 | `max_input_tokens` | `i64` or `null` | Per-request budget; `null` = no trimming |
 | `collapse_repeated_lines` | `bool` | RTK-adapted repeated-line collapse; `false` = off |
+| `strip_ansi` | `bool` | ANSI colour/control-code stripping; `false` = off |
 
 ### `UpsertPolicyRequest`
 
@@ -254,7 +259,8 @@ not made a request today, the groups are unknown and both quotas are `null`.
   "daily_request_quota": 1000,
   "token_saver_enabled": true,
   "max_input_tokens": 8000,
-  "collapse_repeated_lines": true
+  "collapse_repeated_lines": true,
+  "strip_ansi": true
 }
 ```
 

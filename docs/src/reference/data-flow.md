@@ -130,8 +130,11 @@ User-Agent: codex/1.0
      is set, drops the oldest whole turns (never truncates) to fit. If the
      policy enabled `collapse_repeated_lines`, consecutive exact-verbatim
      repeated lines inside a single message are folded into `[×N]` markers
-     (RTK-adapted); kept messages are otherwise never rewritten. Records
-     `OptimizationReport`.
+     (RTK-adapted). If the policy enabled `strip_ansi`, terminal ANSI
+     colour/control codes are removed from message content. Kept messages are
+     otherwise never rewritten, and a final "never-worse" guard reverts to
+     the original body if the optimizer would ever increase token usage.
+     Records `OptimizationReport`.
    - Sanitizes path.
   - Builds upstream URL: `{provider.base_url}{sanitized_path}`.
    - Builds forward headers (strips hop-by-hop + identity headers).

@@ -107,7 +107,8 @@ impl PolicyStore {
         let sql = format!(
             "SELECT group_name, allowed_models, allowed_endpoints, \
              daily_token_quota, daily_request_quota, \
-             token_saver_enabled, max_input_tokens, collapse_repeated_lines \
+             token_saver_enabled, max_input_tokens, collapse_repeated_lines, \
+             strip_ansi \
              FROM group_policies WHERE group_name IN ({placeholder_str})"
         );
 
@@ -142,6 +143,8 @@ impl PolicyStore {
         let mut max_input_tokens: Option<i64> = None;
         // RTK collapse: enabled if ANY group enables it (most permissive).
         let mut collapse_repeated_lines = false;
+        // ANSI stripping: enabled if ANY group enables it (most permissive).
+        let mut strip_ansi = false;
 
         for row in rows {
             let row_models: Option<String> = row.try_get("", "allowed_models").ok();
@@ -151,6 +154,7 @@ impl PolicyStore {
             let row_saver_enabled: Option<bool> = row.try_get("", "token_saver_enabled").ok();
             let row_max_input: Option<i64> = row.try_get("", "max_input_tokens").ok();
             let row_collapse: Option<bool> = row.try_get("", "collapse_repeated_lines").ok();
+            let row_strip_ansi: Option<bool> = row.try_get("", "strip_ansi").ok();
 
             // Models: union. None = all allowed.
             match (row_models, &mut allowed_models) {
@@ -201,6 +205,10 @@ impl PolicyStore {
             if row_collapse.unwrap_or(false) {
                 collapse_repeated_lines = true;
             }
+            // ANSI stripping: any group enabling it turns it on.
+            if row_strip_ansi.unwrap_or(false) {
+                strip_ansi = true;
+            }
             // If any group grants an unlimited budget, the merged result is
             // unlimited (None) — most permissive wins.
             if row_max_input.is_none() {
@@ -222,6 +230,7 @@ impl PolicyStore {
                 enabled: token_saver_enabled,
                 max_input_tokens: max_input_tokens.map(|v| v as u64),
                 collapse_repeated_lines,
+                strip_ansi,
             },
         })
     }
@@ -279,6 +288,7 @@ impl PolicyStore {
             false,
             None,
             false,
+            false,
         )
         .await
     }
@@ -300,6 +310,7 @@ impl PolicyStore {
         token_saver_enabled: bool,
         max_input_tokens: Option<i64>,
         collapse_repeated_lines: bool,
+        strip_ansi: bool,
     ) -> Result<group_policy::Model> {
         let existing = self.get_policy(group_name).await?;
         let now = time_util::now_utc();
@@ -322,6 +333,7 @@ impl PolicyStore {
             .map(|v| Value::BigInt(Some(v)))
             .unwrap_or(Value::BigInt(None));
         let collapse_val = Value::Bool(Some(collapse_repeated_lines));
+        let strip_ansi_val = Value::Bool(Some(strip_ansi));
 
         if let Some(model) = existing {
             // Update existing.
@@ -329,7 +341,7 @@ impl PolicyStore {
                  allowed_endpoints = $2, daily_token_quota = $3, \
                  daily_request_quota = $4, token_saver_enabled = $5, \
                  max_input_tokens = $6, collapse_repeated_lines = $7, \
-                 updated_at = $8 WHERE id = $9";
+                 strip_ansi = $8, updated_at = $9 WHERE id = $10";
             self.db
                 .execute(Statement::from_sql_and_values(
                     self.db.get_database_backend(),
@@ -342,6 +354,7 @@ impl PolicyStore {
                         saver_enabled_val,
                         max_input_val,
                         collapse_val,
+                        strip_ansi_val,
                         now_str.into(),
                         model.id.clone().into(),
                     ],
@@ -358,6 +371,7 @@ impl PolicyStore {
                 token_saver_enabled,
                 max_input_tokens,
                 collapse_repeated_lines,
+                strip_ansi,
                 created_at: model.created_at,
                 updated_at: now,
             })
@@ -368,8 +382,8 @@ impl PolicyStore {
                  (id, group_name, allowed_models, allowed_endpoints, \
                  daily_token_quota, daily_request_quota, \
                  token_saver_enabled, max_input_tokens, collapse_repeated_lines, \
-                 created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)";
+                 strip_ansi, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
             self.db
                 .execute(Statement::from_sql_and_values(
                     self.db.get_database_backend(),
@@ -384,6 +398,7 @@ impl PolicyStore {
                         saver_enabled_val,
                         max_input_val,
                         collapse_val,
+                        strip_ansi_val,
                         now_str.clone().into(),
                         now_str.into(),
                     ],
@@ -400,6 +415,7 @@ impl PolicyStore {
                 token_saver_enabled,
                 max_input_tokens,
                 collapse_repeated_lines,
+                strip_ansi,
                 created_at: now,
                 updated_at: now,
             })
@@ -635,6 +651,7 @@ mod tests {
                 true,
                 Some(8000),
                 false,
+                false,
             )
             .await
             .expect("upsert");
@@ -652,11 +669,31 @@ mod tests {
         // Group A enables with a small budget; Group B disables but has a
         // large budget.
         store
-            .upsert_policy_full("group-a", None, None, None, None, true, Some(2000), false)
+            .upsert_policy_full(
+                "group-a",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(2000),
+                false,
+                false,
+            )
             .await
             .expect("upsert a");
         store
-            .upsert_policy_full("group-b", None, None, None, None, false, Some(5000), false)
+            .upsert_policy_full(
+                "group-b",
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(5000),
+                false,
+                false,
+            )
             .await
             .expect("upsert b");
 
@@ -675,11 +712,21 @@ mod tests {
     async fn token_saver_all_disabled_stays_off() {
         let store = setup_test_db().await;
         store
-            .upsert_policy_full("group-a", None, None, None, None, false, Some(1000), false)
+            .upsert_policy_full(
+                "group-a",
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(1000),
+                false,
+                false,
+            )
             .await
             .expect("upsert a");
         store
-            .upsert_policy_full("group-b", None, None, None, None, false, None, false)
+            .upsert_policy_full("group-b", None, None, None, None, false, None, false, false)
             .await
             .expect("upsert b");
         let policy = store
@@ -695,11 +742,31 @@ mod tests {
         // Group A does NOT enable collapse; Group B does. The merge must
         // turn collapse on because any group enabling it wins.
         store
-            .upsert_policy_full("group-a", None, None, None, None, true, Some(1000), false)
+            .upsert_policy_full(
+                "group-a",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(1000),
+                false,
+                false,
+            )
             .await
             .expect("upsert a");
         store
-            .upsert_policy_full("group-b", None, None, None, None, true, Some(1000), true)
+            .upsert_policy_full(
+                "group-b",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(1000),
+                true,
+                false,
+            )
             .await
             .expect("upsert b");
 
@@ -714,11 +781,31 @@ mod tests {
     async fn collapse_repeated_lines_all_disabled_stays_off() {
         let store = setup_test_db().await;
         store
-            .upsert_policy_full("group-a", None, None, None, None, true, Some(1000), false)
+            .upsert_policy_full(
+                "group-a",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(1000),
+                false,
+                false,
+            )
             .await
             .expect("upsert a");
         store
-            .upsert_policy_full("group-b", None, None, None, None, true, Some(1000), false)
+            .upsert_policy_full(
+                "group-b",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(1000),
+                false,
+                false,
+            )
             .await
             .expect("upsert b");
 
@@ -729,5 +816,86 @@ mod tests {
         // No group opted into collapse, so it must remain off even though
         // the token saver itself is enabled.
         assert!(!policy.token_saver.collapse_repeated_lines);
+    }
+
+    #[tokio::test]
+    async fn strip_ansi_any_group_enables_wins() {
+        let store = setup_test_db().await;
+        // Group A does NOT enable ANSI stripping; Group B does. The merge
+        // must turn ANSI stripping on because any group enabling it wins.
+        store
+            .upsert_policy_full(
+                "group-a",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(1000),
+                false,
+                false,
+            )
+            .await
+            .expect("upsert a");
+        store
+            .upsert_policy_full(
+                "group-b",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(1000),
+                false,
+                true,
+            )
+            .await
+            .expect("upsert b");
+
+        let policy = store
+            .resolve_policy(&["group-a".into(), "group-b".into()])
+            .await
+            .expect("resolve");
+        assert!(policy.token_saver.strip_ansi);
+    }
+
+    #[tokio::test]
+    async fn strip_ansi_all_disabled_stays_off() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy_full(
+                "group-a",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(1000),
+                false,
+                false,
+            )
+            .await
+            .expect("upsert a");
+        store
+            .upsert_policy_full(
+                "group-b",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(1000),
+                false,
+                false,
+            )
+            .await
+            .expect("upsert b");
+
+        let policy = store
+            .resolve_policy(&["group-a".into(), "group-b".into()])
+            .await
+            .expect("resolve");
+        // No group opted into ANSI stripping, so it must remain off.
+        assert!(!policy.token_saver.strip_ansi);
     }
 }
