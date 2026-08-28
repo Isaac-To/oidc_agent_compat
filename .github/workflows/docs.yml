@@ -1,0 +1,68 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Build & deploy the mdBook documentation to GitHub Pages
+#
+# On every push to `master` (and on manual dispatch) this workflow builds
+# the mdBook site under `docs/` and publishes it to GitHub Pages.
+#
+# Setup (one-time, in the repo settings):
+#   Settings → Pages → Source: "GitHub Actions"
+#   (do NOT use the "Deploy from a branch" option; this workflow uses the
+#   official actions/deploy-pages action instead.)
+#
+# The site is served at:
+#   https://<owner>.github.io/oidc_agent_compat/
+# ─────────────────────────────────────────────────────────────────────────
+
+name: Docs
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Grant the workflow permission to deploy to Pages and read the repo.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one deployment at a time; cancel in-progress runs if a new push lands.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build mdBook
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install mdBook
+        run: |
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /usr/local/bin
+
+      - name: Build the book
+        run: mdbook build docs/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
