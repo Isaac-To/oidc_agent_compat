@@ -12,7 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-repository = "https://github.com/isaac-to/oidc-agent-compat"
+repository = "https://github.com/Isaac-To/oidc_agent_compat"
 license = "Apache-2.0"
 
 [workspace.lints.rust]

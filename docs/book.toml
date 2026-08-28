@@ -6,8 +6,8 @@ multilingual = false
 src = "src"
 
 [output.html]
-git-repository-url = "https://github.com/isaac-to/oidc-agent-compat"
-edit-url-template = "https://github.com/isaac-to/oidc-agent-compat/edit/main/docs/src/{path}"
+git-repository-url = "https://github.com/Isaac-To/oidc_agent_compat"
+edit-url-template = "https://github.com/Isaac-To/oidc_agent_compat/edit/master/docs/src/{path}"
 no-section-label = false
 
 [output.html.search]

@@ -5,7 +5,7 @@
 ### Rust toolchain
 
 - **Rust 1.85+** (stable). The toolchain is pinned via
-  [`rust-toolchain.toml`](https://github.com/isaac-to/oidc-agent-compat/blob/main/rust-toolchain.toml)
+  [`rust-toolchain.toml`](https://github.com/Isaac-To/oidc_agent_compat/blob/master/rust-toolchain.toml)
   at the repo root, so if you use rustup it will automatically select the
   right version with `rustfmt` and `clippy` components.
 
@@ -45,7 +45,7 @@ ship binaries for), you normally do **not** need the Rust toolchain at all.
 Every tagged release publishes prebuilt, binaries-only `.zip` archives to
 the project's **GitHub Releases** page:
 
-> **https://github.com/isaac-to/oidc-agent-compat/releases**
+> **https://github.com/Isaac-To/oidc_agent_compat/releases**
 
 ### Available platforms
 
@@ -72,7 +72,7 @@ a `SHA256SUMS` file so you can verify downloads.
 ```sh
 VERSION="0.1.0"
 curl -fsSL -o oac-relay.zip \
-  "https://github.com/isaac-to/oidc-agent-compat/releases/download/v${VERSION}/oac-${VERSION}-aarch64-apple-darwin.zip"
+  "https://github.com/Isaac-To/oidc_agent_compat/releases/download/v${VERSION}/oac-${VERSION}-aarch64-apple-darwin.zip"
 unzip oac-relay.zip
 mv oac-relay oac-central /usr/local/bin/
 ```
@@ -82,7 +82,7 @@ mv oac-relay oac-central /usr/local/bin/
 ```sh
 VERSION="0.1.0"
 curl -fsSL -o oac-linux.zip \
-  "https://github.com/isaac-to/oidc-agent-compat/releases/download/v${VERSION}/oac-${VERSION}-x86_64-unknown-linux-gnu.zip"
+  "https://github.com/Isaac-To/oidc_agent_compat/releases/download/v${VERSION}/oac-${VERSION}-x86_64-unknown-linux-gnu.zip"
 unzip oac-linux.zip
 sudo mv oac-relay oac-central /usr/local/bin/
 ```
@@ -106,7 +106,7 @@ Compute the SHA-256 of each downloaded archive and compare against the
 ```sh
 # macOS / Linux
 curl -fsSL \
-  "https://github.com/isaac-to/oidc-agent-compat/releases/download/v0.1.0/SHA256SUMS"
+  "https://github.com/Isaac-To/oidc_agent_compat/releases/download/v0.1.0/SHA256SUMS"
 shasum -c SHA256SUMS       # macOS
 # sha256sum -c SHA256SUMS  # Linux
 ```
