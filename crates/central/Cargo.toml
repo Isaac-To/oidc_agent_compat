@@ -20,6 +20,7 @@ workspace = true
 
 [dependencies]
 oidc-agent-common = { workspace = true, features = ["test-certs"] }
+oac-mcp = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 reqwest = { workspace = true }
