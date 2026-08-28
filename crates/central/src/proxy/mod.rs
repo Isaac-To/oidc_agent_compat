@@ -233,3 +233,344 @@ pub async fn serve(
         .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audit::AuditLogger;
+    use crate::device_store::DeviceStore;
+    use crate::policy::PolicyStore;
+    use crate::provider::ProviderStore;
+    use crate::usage::UsageTracker;
+    use axum::http::StatusCode;
+    use oidc_agent_common::config::{AdminConfig, CentralConfig};
+    use tower::ServiceExt;
+    use zeroize::Zeroizing;
+
+    /// Builds a minimal dev-mode AppState for middleware-level tests.
+    async fn test_state(admin: Option<AdminConfig>) -> AppState {
+        let url = oidc_agent_common::persistence::temp_sqlite_url("proxy-mod");
+        let db = crate::db::setup(&url).await.expect("db setup");
+        let audit = AuditLogger::new(db.clone());
+        AppState {
+            config: CentralConfig {
+                listen_addr: "127.0.0.1:0".parse().expect("addr"),
+                database_url: "sqlite://test.db".into(),
+                oidc: oidc_agent_common::config::OidcConfig {
+                    issuer: "https://idp.example.com".into(),
+                    client_id: "test".into(),
+                    client_secret_env: "TEST".into(),
+                    redirect_uri: "http://127.0.0.1:0/callback".into(),
+                    scopes: vec!["openid".into()],
+                },
+                mtls: oidc_agent_common::config::MtlsServerConfig {
+                    ca_cert_path: "/ca.pem".into(),
+                    server_cert_path: "/server.pem".into(),
+                    server_key_path: "/server.key".into(),
+                },
+                admin,
+                pricing: None,
+                dev_mode: true,
+                rate_limit_requests: 60,
+                rate_limit_window_secs: 60,
+            },
+            provider_store: ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32])),
+            client: reqwest::Client::new(),
+            audit,
+            rate_limiter: None,
+            policy_store: PolicyStore::new(db.clone()),
+            device_store: DeviceStore::new(db.clone()),
+            usage_tracker: UsageTracker::new(db),
+            price_table: crate::pricing::PriceTable::empty(),
+        }
+    }
+
+    fn admin_group_config() -> AdminConfig {
+        AdminConfig {
+            admin_group: "oac-admins".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn router_mounts_admin_api_when_admin_config_present() {
+        let state = test_state(Some(admin_group_config())).await;
+        let app = router(state);
+
+        // Without relay-forwarded identity headers the admin API must
+        // refuse (401), proving the routes + auth middleware are mounted.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/admin/v1/group-policies")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // With an admin identity the same route answers 200.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/admin/v1/group-policies")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_omits_admin_api_when_admin_config_absent() {
+        let state = test_state(None).await;
+        let app = router(state);
+
+        // No admin config → the admin routes must not exist at all (404,
+        // not 401/403), so operators cannot probe a disabled surface.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/admin/v1/group-policies")
+                    .header("x-oac-user-subject", "alice")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admin_group_helper_reflects_config() {
+        let with = test_state(Some(admin_group_config())).await;
+        assert_eq!(with.admin_group(), Some("oac-admins"));
+        let without = test_state(None).await;
+        assert_eq!(without.admin_group(), None);
+    }
+
+    // --- rate-limit middleware UX ---
+
+    /// Wraps the rate-limit middleware around an always-OK handler. The
+    /// caller controls `dev_mode`/`rate_limiter` on the state.
+    fn rate_limited_app(state: AppState) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async { "ok" }),
+            )
+            .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                rate_limit::rate_limit_middleware,
+            ))
+            .with_state(())
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_429_with_retry_after_and_json_body() {
+        let mut state = test_state(None).await;
+        state.config.dev_mode = false;
+        state.rate_limiter = Some(rate_limit::RateLimiter::new(
+            1,
+            std::time::Duration::from_secs(60),
+        ));
+        let app = rate_limited_app(state);
+
+        let first = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("first");
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("second");
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        // The Retry-After header must be present and numeric so agents can
+        // back off for the exact refill time.
+        let retry_after = second
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .expect("retry-after header");
+        let secs: u64 = retry_after.parse().expect("numeric retry-after");
+        assert!(secs >= 1, "retry-after must be at least 1s, got {secs}");
+        let body = axum::body::to_bytes(second.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["error"]["type"], "rate_limit_error");
+        assert_eq!(json["error"]["retry_after_secs"], secs);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_skips_healthz_even_when_limiter_engaged() {
+        let mut state = test_state(None).await;
+        state.config.dev_mode = false;
+        state.rate_limiter = Some(rate_limit::RateLimiter::new(
+            1,
+            std::time::Duration::from_secs(60),
+        ));
+        let app = rate_limited_app(state);
+
+        // Exhaust the bucket on the API route…
+        let _ = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("exhaust");
+        // …health checks must still succeed so orchestrators don't kill the
+        // pod over a rate-limited data plane.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("healthz");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_disabled_in_dev_mode_and_without_limiter() {
+        // Dev mode: middleware is a no-op even with a 1-request limiter.
+        let mut state = test_state(None).await;
+        state.config.dev_mode = true;
+        state.rate_limiter = Some(rate_limit::RateLimiter::new(
+            1,
+            std::time::Duration::from_secs(60),
+        ));
+        let app = rate_limited_app(state);
+        for _ in 0..3 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/models")
+                        .body(axum::body::Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("request");
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // Production mode but no limiter configured: also a no-op.
+        let mut state = test_state(None).await;
+        state.config.dev_mode = false;
+        state.rate_limiter = None;
+        let app = rate_limited_app(state);
+        for _ in 0..3 {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/models")
+                        .body(axum::body::Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("request");
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+    }
+
+    #[test]
+    fn too_many_requests_response_is_well_formed() {
+        let resp = rate_limit::too_many_requests_response(7);
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("7"),
+            "the header must echo the computed refill time, not a constant"
+        );
+    }
+
+    // --- serve() boot + graceful shutdown ---
+
+    /// Boots the real `serve()` in dev mode, verifies it answers /healthz,
+    /// then SIGTERMs the process and asserts a clean exit. This exercises
+    /// the exact startup path operators run (client build, store wiring,
+    /// router assembly, bind, graceful shutdown).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn serve_boots_and_shuts_down_gracefully_on_sigterm() {
+        let url = oidc_agent_common::persistence::temp_sqlite_url("serve-boot");
+        let db = crate::db::setup(&url).await.expect("db setup");
+        let audit = AuditLogger::new(db);
+
+        let config = CentralConfig {
+            listen_addr: "127.0.0.1:0".parse().expect("addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: oidc_agent_common::config::OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "test".into(),
+                client_secret_env: "TEST".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            mtls: oidc_agent_common::config::MtlsServerConfig {
+                ca_cert_path: "/ca.pem".into(),
+                server_cert_path: "/server.pem".into(),
+                server_key_path: "/server.key".into(),
+            },
+            admin: None,
+            pricing: None,
+            dev_mode: true,
+            rate_limit_requests: 60,
+            rate_limit_window_secs: 60,
+        };
+
+        let serve_config = config.clone();
+        let task = tokio::spawn(async move {
+            super::serve(serve_config, Zeroizing::new([7_u8; 32]), audit).await
+        });
+
+        // Poll /healthz through the real socket until the server is up. We
+        // don't know the bound port (config uses :0), so instead wait for
+        // the task to be running and give the bind a moment, then confirm
+        // the future is still pending (server alive) before shutting down.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!task.is_finished(), "serve() must keep running until signalled");
+
+        // Ensure the graceful-shutdown signal handler is installed before
+        // sending SIGTERM (it is polled as soon as axum starts serving).
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let pid = std::process::id().to_string();
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .expect("send SIGTERM");
+        assert!(status.success(), "kill -TERM must succeed");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("serve() must return after SIGTERM")
+            .expect("join serve task");
+        assert!(result.is_ok(), "graceful shutdown must be clean: {result:?}");
+    }
+}

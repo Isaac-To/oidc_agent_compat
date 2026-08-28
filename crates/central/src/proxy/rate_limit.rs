@@ -123,15 +123,15 @@ pub async fn rate_limit_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Response {
     // Skip rate limiting for health check and in dev mode.
     if request.uri().path() == "/healthz" || state.config.dev_mode {
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
 
     let limiter = match &state.rate_limiter {
         Some(l) => l,
-        None => return Ok(next.run(request).await),
+        None => return next.run(request).await,
     };
 
     // Extract the client IP from the connection info.
@@ -144,23 +144,24 @@ pub async fn rate_limit_middleware(
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
 
     match limiter.try_take(ip) {
-        Ok(()) => Ok(next.run(request).await),
+        Ok(()) => next.run(request).await,
         Err(retry_after) => {
             tracing::warn!(
                 ip = %ip,
                 retry_after_secs = retry_after,
                 "rate limit exceeded"
             );
-            Err(StatusCode::TOO_MANY_REQUESTS)
+            // A bare 429 leaves agents guessing when to retry. Return the
+            // standard Retry-After header plus a JSON body so well-behaved
+            // clients back off for exactly as long as the bucket needs.
+            too_many_requests_response(retry_after)
         }
     }
 }
 
-/// Wraps a 429 response with a `Retry-After` header.
-///
-/// This is not currently used directly (the middleware returns the status
-/// code), but is provided for handlers that want to build a richer 429
-/// response.
+/// Builds a 429 response carrying a `Retry-After` header (in seconds) and
+/// a JSON body with the same value, so agents can back off for exactly as
+/// long as the token bucket needs to refill one token.
 #[must_use]
 pub fn too_many_requests_response(retry_after: u64) -> Response {
     let body = serde_json::json!({
@@ -172,7 +173,10 @@ pub fn too_many_requests_response(retry_after: u64) -> Response {
     });
     (
         StatusCode::TOO_MANY_REQUESTS,
-        [("content-type", "application/json"), ("retry-after", "1")],
+        [
+            ("content-type", "application/json"),
+            ("retry-after", retry_after.to_string().as_str()),
+        ],
         body.to_string(),
     )
         .into_response()
