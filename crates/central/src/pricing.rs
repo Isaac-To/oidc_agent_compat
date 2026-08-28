@@ -735,6 +735,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_provider_price_refresh_populates_in_the_background() {
+        use crate::provider::{ProviderInput, ProviderStore};
+        use zeroize::Zeroizing;
+
+        // A mock backend serving one priced model.
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "data": [{
+                        "id": "bg-model",
+                        "pricing": {"prompt": "0.000001", "completion": "0.000002"}
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = oidc_agent_common::persistence::temp_sqlite_url("pricing-bg");
+        let db = crate::db::setup(&url).await.expect("db setup");
+        let store = ProviderStore::new(db, Zeroizing::new([9_u8; 32]));
+        store
+            .upsert_provider(&ProviderInput {
+                id: "bg".into(),
+                name: "bg".into(),
+                base_url: format!("http://{addr}"),
+                enabled: true,
+                is_default: true,
+                models: None,
+            })
+            .await
+            .expect("provider");
+
+        // Start the real background task with a long interval so exactly
+        // one refresh cycle runs during the test.
+        let table = PriceTable::empty();
+        table.spawn_provider_price_refresh(
+            store,
+            reqwest::Client::new(),
+            std::time::Duration::from_secs(3600),
+        );
+
+        // The first cycle runs immediately; poll until the price lands.
+        let mut populated = false;
+        for _ in 0..100 {
+            if table.len().await > 0 {
+                populated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(populated, "the background refresh must populate the table");
+
+        // The fetched price is usable immediately for cost accounting:
+        // per-token 0.000001 -> per-1k 0.001; 1000 in + 1000 out
+        // = 0.001 + 0.002 = 0.003.
+        let cost = table.compute_cost("bg-model", Some(1000), Some(1000)).await;
+        assert!(
+            (cost - 0.003).abs() < 0.0001,
+            "fetched price must be usable, cost was {cost}"
+        );
+        assert_eq!(
+            table.price_source("bg-model").await,
+            Some(PriceSource::Fetched)
+        );
+    }
+
+    #[tokio::test]
     async fn one_provider_refresh_cycle_fetches_enabled_only_and_keeps_overrides() {
         use crate::provider::{ProviderInput, ProviderStore};
         use std::sync::{Arc, Mutex};

@@ -2342,10 +2342,7 @@ mod tests {
 
         let groups = json["groups"].as_array().expect("groups array");
         // Clippy-clean lookup helper (test builds allow expect_used).
-        fn group_row<'a>(
-            groups: &'a [serde_json::Value],
-            name: &str,
-        ) -> &'a serde_json::Value {
+        fn group_row<'a>(groups: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
             groups
                 .iter()
                 .find(|g| g["group"] == name)
@@ -2498,6 +2495,106 @@ mod tests {
     }
 
     // --- Provider endpoint edge cases not covered by the integration file ---
+
+    #[test]
+    fn create_provider_request_defaults_enabled_to_true() {
+        // Omitting `enabled` must default to true (a provider that silently
+        // arrives disabled would look like a routing outage to users).
+        let body: CreateProviderRequest =
+            serde_json::from_str(r#"{"id":"p","name":"P","base_url":"https://p.example.com"}"#)
+                .expect("parse");
+        assert!(body.enabled, "enabled defaults to true");
+        assert!(!body.is_default, "is_default defaults to false");
+        assert_eq!(body.models, None, "models defaults to None (all models)");
+    }
+
+    #[tokio::test]
+    async fn get_key_returns_metadata_with_access_groups() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        state
+            .provider_store
+            .upsert_provider(&crate::provider::ProviderInput {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                base_url: "https://api.openai.com".into(),
+                enabled: true,
+                is_default: false,
+                models: None,
+            })
+            .await
+            .expect("provider");
+        let key = state
+            .provider_store
+            .add_key(
+                "openai",
+                "production",
+                "sk-get-key-test-secret",
+                3,
+                &["engineering".to_string()],
+            )
+            .await
+            .expect("key");
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri(format!("/admin/v1/providers/openai/keys/{}", key.id))
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["id"], key.id);
+        assert_eq!(json["label"], "production");
+        assert_eq!(json["priority"], 3);
+        assert_eq!(json["allowed_groups"], serde_json::json!(["engineering"]));
+        assert_eq!(
+            json["key_digest"].as_str().map(str::len),
+            Some(64),
+            "the digest is a sha256 hex string"
+        );
+        assert!(
+            !json.to_string().contains("sk-get-key-test-secret"),
+            "key material must never be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_key_on_missing_provider_names_the_provider() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        let app = router(state);
+
+        // The provider-existence check runs before the key lookup, so the
+        // 404 must name the PROVIDER (what the admin actually got wrong).
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::DELETE)
+                    .uri("/admin/v1/providers/ghost/keys/whatever")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let text = body_text(resp).await;
+        assert!(
+            text.contains("provider 'ghost' not found"),
+            "the 404 must name the provider: {text}"
+        );
+    }
 
     #[tokio::test]
     async fn update_provider_unknown_returns_404_and_list_keys_unknown_404() {

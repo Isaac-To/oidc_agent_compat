@@ -510,19 +510,23 @@ mod tests {
     }
 
     // --- serve() boot + graceful shutdown ---
+    //
+    // NOTE: exactly ONE test in this binary may send a signal to the test
+    // process - the handler is process-wide, so a SIGTERM resolves every
+    // concurrent shutdown_signal() future. Both serve modes are therefore
+    // exercised inside a single test.
 
-    /// Boots the real `serve()` in dev mode, verifies it answers /healthz,
-    /// then SIGTERMs the process and asserts a clean exit. This exercises
-    /// the exact startup path operators run (client build, store wiring,
-    /// router assembly, bind, graceful shutdown).
+    /// Boots the real `serve()` in BOTH modes (dev HTTP and production
+    /// mTLS), verifies the mTLS listener rejects certless clients, then
+    /// SIGTERMs the process and asserts both shut down cleanly.
     #[cfg(unix)]
     #[tokio::test]
-    async fn serve_boots_and_shuts_down_gracefully_on_sigterm() {
-        let url = oidc_agent_common::persistence::temp_sqlite_url("serve-boot");
-        let db = crate::db::setup(&url).await.expect("db setup");
-        let audit = AuditLogger::new(db);
+    async fn serve_boots_dev_and_mtls_then_shuts_down_gracefully() {
+        let dev_url = oidc_agent_common::persistence::temp_sqlite_url("serve-dev");
+        let dev_db = crate::db::setup(&dev_url).await.expect("db setup");
+        let dev_audit = AuditLogger::new(dev_db);
 
-        let config = CentralConfig {
+        let base_config = CentralConfig {
             listen_addr: "127.0.0.1:0".parse().expect("addr"),
             database_url: "sqlite://test.db".into(),
             oidc: oidc_agent_common::config::OidcConfig {
@@ -544,24 +548,101 @@ mod tests {
             rate_limit_window_secs: 60,
         };
 
-        let serve_config = config.clone();
-        let task = tokio::spawn(async move {
-            super::serve(serve_config, Zeroizing::new([7_u8; 32]), audit).await
+        // Dev-mode serve().
+        let dev_config = base_config.clone();
+        let dev_task = tokio::spawn(async move {
+            super::serve(dev_config, Zeroizing::new([7_u8; 32]), dev_audit).await
         });
 
-        // Poll /healthz through the real socket until the server is up. We
-        // don't know the bound port (config uses :0), so instead wait for
-        // the task to be running and give the bind a moment, then confirm
-        // the future is still pending (server alive) before shutting down.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Production mTLS serve().
+        use oidc_agent_common::test_certs::generate_test_certs;
+        let certs = generate_test_certs();
+        let dir = std::env::temp_dir().join(format!(
+            "oac-serve-mtls-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let ca = dir.join("ca.crt");
+        let server_cert = dir.join("server.crt");
+        let server_key = dir.join("server.key");
+        std::fs::write(&ca, &certs.ca_cert).expect("ca");
+        std::fs::write(&server_cert, &certs.server_cert).expect("cert");
+        std::fs::write(&server_key, &certs.server_key).expect("key");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&server_key, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod key");
+        }
+
+        let mtls_url = oidc_agent_common::persistence::temp_sqlite_url("serve-mtls");
+        let mtls_db = crate::db::setup(&mtls_url).await.expect("db setup");
+        let mtls_audit = AuditLogger::new(mtls_db);
+
+        // serve() does not return the bound address, so reserve a port,
+        // release it, and pin the config to it.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe bind");
+        let mtls_port = probe.local_addr().expect("addr").port();
+        drop(probe);
+
+        let mut mtls_config = base_config;
+        mtls_config.listen_addr = format!("127.0.0.1:{mtls_port}").parse().expect("addr");
+        mtls_config.mtls = oidc_agent_common::config::MtlsServerConfig {
+            ca_cert_path: ca.clone(),
+            server_cert_path: server_cert.clone(),
+            server_key_path: server_key.clone(),
+        };
+        mtls_config.dev_mode = false;
+
+        let mtls_task = tokio::spawn(async move {
+            super::serve(mtls_config, Zeroizing::new([7_u8; 32]), mtls_audit).await
+        });
+
+        // Wait for the mTLS listener to accept TCP connections.
+        let mut tls_up = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", mtls_port))
+                .await
+                .is_ok()
+            {
+                tls_up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(tls_up, "mTLS listener must come up");
+
+        // A plain HTTPS client WITHOUT a client certificate must fail the
+        // handshake - this is the mTLS guarantee serve() configures.
+        let certless = reqwest::Client::builder()
+            .use_rustls_tls()
+            .https_only(true)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("certless client");
+        let refused = certless
+            .get(format!("https://127.0.0.1:{mtls_port}/healthz"))
+            .send()
+            .await;
         assert!(
-            !task.is_finished(),
-            "serve() must keep running until signalled"
+            refused.is_err(),
+            "a certless client must not complete the TLS handshake"
         );
 
-        // Ensure the graceful-shutdown signal handler is installed before
-        // sending SIGTERM (it is polled as soon as axum starts serving).
+        // Both servers must still be running.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !dev_task.is_finished() && !mtls_task.is_finished(),
+            "both serve() tasks must run until signalled"
+        );
+
+        // One SIGTERM shuts both down gracefully (the handler is
+        // process-wide, matching real operator behaviour).
         let pid = std::process::id().to_string();
         let status = std::process::Command::new("kill")
             .args(["-TERM", &pid])
@@ -569,13 +650,22 @@ mod tests {
             .expect("send SIGTERM");
         assert!(status.success(), "kill -TERM must succeed");
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), task)
+        let dev_result = tokio::time::timeout(std::time::Duration::from_secs(10), dev_task)
             .await
-            .expect("serve() must return after SIGTERM")
-            .expect("join serve task");
+            .expect("dev serve() must return after SIGTERM")
+            .expect("join dev serve task");
         assert!(
-            result.is_ok(),
-            "graceful shutdown must be clean: {result:?}"
+            dev_result.is_ok(),
+            "dev shutdown must be clean: {dev_result:?}"
+        );
+
+        let mtls_result = tokio::time::timeout(std::time::Duration::from_secs(10), mtls_task)
+            .await
+            .expect("mTLS serve() must return after SIGTERM")
+            .expect("join mTLS serve task");
+        assert!(
+            mtls_result.is_ok(),
+            "mTLS shutdown must be clean: {mtls_result:?}"
         );
     }
 }

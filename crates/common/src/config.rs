@@ -566,10 +566,7 @@ server_key_path = "/server.key"
         let pricing = cfg.pricing.expect("pricing");
         assert_eq!(pricing.fetch_interval_secs, 0, "auto-fetch can be disabled");
         assert_eq!(pricing.models.len(), 1);
-        assert_eq!(
-            pricing.models.first().expect("one model").model,
-            "gpt-4o"
-        );
+        assert_eq!(pricing.models.first().expect("one model").model, "gpt-4o");
     }
 
     #[test]
