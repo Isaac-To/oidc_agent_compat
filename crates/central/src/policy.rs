@@ -436,6 +436,121 @@ impl PolicyStore {
             .map_err(|e| Error::Database(format!("delete group policy: {e}")))?;
         Ok(result.rows_affected > 0)
     }
+
+    /// Returns `true` if the given MCP tool is allowed for the caller's
+    /// groups, considered across all matching `mcp_server_policies`.
+    ///
+    /// Semantics:
+    /// - No matching policy → deny (tools are opt-in).
+    /// - A matching policy with `allowed_tools = NULL` → allow all tools on
+    ///   `server`.
+    /// - A matching policy whose `allowed_tools` contains `"server:tool"` →
+    ///   allow.
+    /// - Otherwise → deny.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on query failure.
+    pub async fn resolve_mcp_tool_allowed(
+        &self,
+        groups: &[String],
+        server: &str,
+        tool: &str,
+    ) -> Result<bool> {
+        let allowed = self.resolve_mcp_allowed_tools(groups).await?;
+        // `None` (from `resolve_mcp_allowed_tools`) means an allow-all policy
+        // was present → the tool is allowed. `Some(set)` is the union of
+        // explicit entries (empty = no tools allowed).
+        Ok(match allowed {
+            None => true,
+            Some(set) => set.contains(&format!("{server}:{tool}")),
+        })
+    }
+
+    /// Returns `true` if the caller's groups have at least one allowed tool
+    /// on `server` (used for non-`tools/call` methods such as `tools/list`,
+    /// `initialize`, etc., which cannot be per-tool enforced).
+    ///
+    /// A `None` policy (allow-all) always returns `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on query failure.
+    pub async fn resolve_mcp_has_any_tool(
+        &self,
+        groups: &[String],
+        server: &str,
+    ) -> Result<bool> {
+        let allowed = self.resolve_mcp_allowed_tools(groups).await?;
+        Ok(match allowed {
+            None => true,
+            Some(set) => set.iter().any(|entry| entry.starts_with(&format!("{server}:"))),
+        })
+    }
+
+    /// Loads the union of allowed `"server:tool"` entries across all of the
+    /// caller's groups.
+    ///
+    /// Returns:
+    /// - `Ok(None)` if any matching group policy has `allowed_tools = NULL`
+    ///   (allow-all), or if there are no matching policies (deny-all unless
+    ///   an allow-all is present — for tools, no-policy means no tools).
+    /// - `Ok(Some(set))` with the union of explicit entries otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on query failure.
+    async fn resolve_mcp_allowed_tools(
+        &self,
+        groups: &[String],
+    ) -> Result<Option<HashSet<String>>> {
+        if groups.is_empty() {
+            return Ok(None);
+        }
+        let placeholders: Vec<String> = groups
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${}", i + 1))
+            .collect();
+        let placeholder_str = placeholders.join(", ");
+        let sql = format!(
+            "SELECT allowed_tools FROM mcp_server_policies \
+             WHERE group_name IN ({placeholder_str})"
+        );
+        let params: Vec<Value> = groups
+            .iter()
+            .map(|g| Value::String(Some(Box::new(g.clone()))))
+            .collect();
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                &sql,
+                params,
+            ))
+            .await
+            .map_err(|e| Error::Database(format!("query mcp server policies: {e}")))?;
+
+        if rows.is_empty() {
+            // No policy → deny-all for tools.
+            return Ok(Some(HashSet::new()));
+        }
+
+        let mut union: Option<HashSet<String>> = None;
+        for row in rows {
+            let row_tools: Option<String> = row.try_get("", "allowed_tools").ok();
+            match (row_tools, &mut union) {
+                (None, _) => return Ok(None), // allow-all policy wins
+                (Some(json), Some(acc)) => {
+                    if let Ok(entries) = parse_json_array(&json) {
+                        acc.extend(entries);
+                    }
+                }
+                (Some(_), None) => return Ok(None),
+            }
+        }
+        Ok(union)
+    }
 }
 
 /// Parses a JSON array string into a `Vec<String>`.

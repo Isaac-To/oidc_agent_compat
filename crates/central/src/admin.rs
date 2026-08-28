@@ -1574,6 +1574,10 @@ mod tests {
                     tokens_saved: None,
                     messages_dropped: None,
                     saver_reasons: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    mcp_method: None,
+                    mcp_args_preview: None,
                 })
                 .await
                 .expect("record audit entry");
@@ -2123,6 +2127,10 @@ mod tests {
                     tokens_saved: None,
                     messages_dropped: None,
                     saver_reasons: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    mcp_method: None,
+                    mcp_args_preview: None,
                 })
                 .await
                 .expect("record");
@@ -2212,6 +2220,10 @@ mod tests {
                     tokens_saved: Some(saved),
                     messages_dropped: Some(dropped),
                     saver_reasons: Some(r#"["dedup"]"#.into()),
+                    mcp_server: None,
+                    mcp_tool: None,
+                    mcp_method: None,
+                    mcp_args_preview: None,
                 })
                 .await
                 .expect("record");
@@ -2242,6 +2254,10 @@ mod tests {
                 tokens_saved: Some(10),
                 messages_dropped: Some(0),
                 saver_reasons: None,
+                mcp_server: None,
+                mcp_tool: None,
+                mcp_method: None,
+                mcp_args_preview: None,
             })
             .await
             .expect("record");
@@ -2271,6 +2287,10 @@ mod tests {
                 tokens_saved: Some(5),
                 messages_dropped: Some(0),
                 saver_reasons: None,
+                mcp_server: None,
+                mcp_tool: None,
+                mcp_method: None,
+                mcp_args_preview: None,
             })
             .await
             .expect("record");
@@ -2300,6 +2320,10 @@ mod tests {
                 tokens_saved: Some(0),
                 messages_dropped: Some(0),
                 saver_reasons: None,
+                mcp_server: None,
+                mcp_tool: None,
+                mcp_method: None,
+                mcp_args_preview: None,
             })
             .await
             .expect("record");
