@@ -802,4 +802,213 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("access_denied"), "{err}");
     }
+
+    // --- Callback failure UX: every way a login can go wrong must produce
+    // an actionable error, never a hang or a panic. ---
+
+    #[tokio::test]
+    async fn wait_for_callback_times_out_with_guidance() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+
+        // Nobody connects; the short timeout must fire with a message that
+        // tells the user what to do (open the URL / check the redirect URI).
+        let err = wait_for_callback(listener, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timed out") && msg.contains("browser"),
+            "the timeout error must guide the user: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_callback_rejects_missing_state() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            use tokio::io::AsyncWriteExt;
+            let req =
+                "GET /callback?code=abc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(req.as_bytes()).await;
+            let _ = stream.flush().await;
+            let mut buf = [0u8; 256];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+        });
+
+        let err = wait_for_callback(listener, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("missing 'state'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_callback_rejects_empty_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Connect and immediately close the write side: the server reads
+        // zero bytes (a scanner or a half-open browser tab).
+        tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.shutdown().await;
+        });
+
+        let err = wait_for_callback(listener, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("empty callback request")
+                || err.to_string().contains("malformed"),
+            "a connection with no request must fail cleanly: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_callback_rejects_malformed_request_line() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            use tokio::io::AsyncWriteExt;
+            let req = "GARBAGE-NO-SPACES-NO-PATH\r\n\r\n";
+            let _ = stream.write_all(req.as_bytes()).await;
+            let _ = stream.flush().await;
+            let mut buf = [0u8; 256];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+        });
+
+        let err = wait_for_callback(listener, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("malformed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_callback_writes_a_friendly_html_response() {
+        // The browser tab the user lands on must show a completion page,
+        // not a blank/error screen.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let req = "GET /callback?code=c&state=s HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(req.as_bytes()).await;
+            let _ = stream.flush().await;
+            let mut buf = vec![0u8; 4096];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            buf.truncate(n);
+            let _ = tx.send(buf);
+        });
+
+        let (code, state) = wait_for_callback(listener, Duration::from_secs(5))
+            .await
+            .expect("callback");
+        assert_eq!(code.secret(), "c");
+        assert_eq!(state.secret(), "s");
+
+        let response = rx
+            .await
+            .expect("server must write a response before returning");
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.starts_with("HTTP/1.1 200 OK"),
+            "the callback must answer 200: {text}"
+        );
+        assert!(
+            text.contains("Login complete"),
+            "the user's browser tab must confirm success: {text}"
+        );
+        assert!(
+            text.contains("text/html"),
+            "content-type must be text/html: {text}"
+        );
+    }
+
+    // --- ID-token claim extraction fallbacks ---
+
+    #[test]
+    fn claims_from_id_token_falls_back_to_preferred_username() {
+        let json = r#"{
+            "iss": "https://idp.example.com",
+            "sub": "user-pref",
+            "aud": "test",
+            "exp": 9999999999,
+            "iat": 1000000000,
+            "preferred_username": "alice"
+        }"#;
+        let claims: CustomIdTokenClaims = serde_json::from_str(json).expect("parse claims");
+        let (_subject, _email, display, _groups) = claims_from_id_token(&claims);
+        assert_eq!(
+            display.as_deref(),
+            Some("alice"),
+            "preferred_username must back the display name"
+        );
+    }
+
+    #[test]
+    fn claims_from_id_token_extracts_name_and_email() {
+        let json = r#"{
+            "iss": "https://idp.example.com",
+            "sub": "user-name",
+            "aud": "test",
+            "exp": 9999999999,
+            "iat": 1000000000,
+            "email": "user@example.com",
+            "name": "Alice Doe"
+        }"#;
+        let claims: CustomIdTokenClaims = serde_json::from_str(json).expect("parse claims");
+        let (subject, email, display, _groups) = claims_from_id_token(&claims);
+        assert_eq!(subject, "user-name");
+        assert_eq!(email.as_deref(), Some("user@example.com"));
+        assert_eq!(
+            display.as_deref(),
+            Some("Alice Doe"),
+            "the name claim must be preferred when present"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_login_persists_display_name() {
+        let store = setup_test_db().await;
+        let config = test_config();
+        let _ = complete_login(
+            &store,
+            &config,
+            "https://idp.example.com",
+            "user-display",
+            None,
+            Some("Alice Doe"),
+            None,
+        )
+        .await
+        .expect("login");
+
+        use crate::entity::identity;
+        use sea_orm::EntityTrait;
+        let identities = identity::Entity::find().all(&store.db).await.expect("load");
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            identities[0].display_name.as_deref(),
+            Some("Alice Doe"),
+            "display name must survive login so admins see real names"
+        );
+    }
 }

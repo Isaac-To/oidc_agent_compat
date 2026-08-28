@@ -1333,6 +1333,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_getters_yield_usable_connections() {
+        // The admin endpoints share one DB; the getters are the seam the
+        // handlers use, so pin that they return working connections.
+        let url = oidc_agent_common::persistence::temp_sqlite_url("admin-getters");
+        let db = crate::db::setup(&url).await.expect("db setup");
+        let usage_tracker = UsageTracker::new(db.clone());
+        let device_store = DeviceStore::new(db.clone());
+        let policy_store = PolicyStore::new(db);
+
+        use sea_orm::{ConnectionTrait, Statement};
+        for conn in [usage_tracker.db(), device_store.db(), policy_store.db()] {
+            let row = conn
+                .query_one(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT 1 AS one".to_string(),
+                ))
+                .await
+                .expect("getter connection must be usable")
+                .expect("row");
+            assert_eq!(row.try_get::<i64>("", "one").unwrap_or(0), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn admin_audit_records_caller_identity_via_middleware() {
         use sea_orm::EntityTrait;
         use tower::ServiceExt;
@@ -1638,6 +1662,993 @@ mod tests {
             response.status(),
             axum::http::StatusCode::BAD_REQUEST,
             "negative budget must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_rejects_zero_token_saver_budget() {
+        use tower::ServiceExt;
+        let state = setup_test_state().await;
+        let app = router(state);
+
+        // Zero would expire/trim everything immediately — reject with a
+        // message an admin can act on.
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::PUT)
+            .uri("/admin/v1/group-policies/engineering")
+            .header("content-type", "application/json")
+            .header("x-oac-user-subject", "alice")
+            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .body(axum::body::Body::from(
+                r#"{"token_saver_enabled": true, "max_input_tokens": 0}"#.to_string(),
+            ))
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("max_input_tokens must be a positive integer"),
+            "the error must tell the admin exactly what to fix: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_middleware_rejects_malformed_groups_header() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        let app = router(state);
+
+        // A groups header that is not a JSON array must fail closed (403),
+        // never be interpreted as membership.
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/admin/v1/group-policies")
+            .header("x-oac-user-subject", "mallory")
+            .header("x-oac-user-groups", "not-json")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "malformed groups must deny, not default-open"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_middleware_rejects_empty_subject() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        let app = router(state);
+
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/admin/v1/group-policies")
+            .header("x-oac-user-subject", "")
+            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = app.oneshot(request).await.expect("router run");
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Group policy CRUD via the router ---
+
+    /// Builds an admin-authenticated JSON request with a body.
+    fn admin_json(method: &str, uri: &str, body: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("x-oac-user-subject", "alice")
+            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("build request")
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn policy_crud_round_trip_via_router() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        let app = router(state.clone());
+
+        // Empty list first — an admin should see [] not an error.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/group-policies")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json.as_array().expect("array").len(),
+            0,
+            "a fresh deployment must list zero policies, not error"
+        );
+
+        // Upsert with every field set; the response must echo them all.
+        let resp = app
+            .clone()
+            .oneshot(admin_json(
+                "PUT",
+                "/admin/v1/group-policies/engineering",
+                r#"{"allowed_models": ["gpt-4o"], "allowed_endpoints": ["/v1/chat/completions"], "daily_token_quota": 5000, "daily_request_quota": 100, "token_saver_enabled": true, "max_input_tokens": 8000, "collapse_repeated_lines": true}"#,
+            ))
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["group_name"], "engineering");
+        assert_eq!(json["allowed_models"], serde_json::json!(["gpt-4o"]));
+        assert_eq!(
+            json["allowed_endpoints"],
+            serde_json::json!(["/v1/chat/completions"])
+        );
+        assert_eq!(json["daily_token_quota"], 5000);
+        assert_eq!(json["daily_request_quota"], 100);
+        assert_eq!(json["token_saver_enabled"], true);
+        assert_eq!(json["max_input_tokens"], 8000);
+        assert_eq!(json["collapse_repeated_lines"], true);
+
+        // GET the single policy back.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/group-policies/engineering")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["group_name"], "engineering");
+
+        // List now contains it.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/group-policies")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        let json = body_json(resp).await;
+        assert_eq!(json.as_array().expect("array").len(), 1);
+
+        // The admin audit entry for the upsert carries the payload so the
+        // change is reviewable after the fact.
+        use sea_orm::EntityTrait;
+        let entries = crate::entity::admin_audit_log::Entity::find()
+            .all(state.audit.db())
+            .await
+            .expect("audit");
+        let upsert = entries
+            .iter()
+            .find(|e| e.action == "upsert_policy")
+            .expect("upsert audit entry");
+        let payload = upsert.payload.as_deref().expect("payload recorded");
+        assert!(payload.contains("allowed_models"), "payload: {payload}");
+
+        // DELETE removes it.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::DELETE)
+                    .uri("/admin/v1/group-policies/engineering")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+
+        // GET after delete → 404 with the group name in the message.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/group-policies/engineering")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let text = body_text(resp).await;
+        assert!(
+            text.contains("engineering"),
+            "404 must name the missing policy: {text}"
+        );
+
+        // DELETE again → 404 (idempotence is for the success path only).
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::DELETE)
+                    .uri("/admin/v1/group-policies/engineering")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+        // The delete was audited too.
+        let entries = crate::entity::admin_audit_log::Entity::find()
+            .all(state.audit.db())
+            .await
+            .expect("audit");
+        assert!(
+            entries.iter().any(|e| e.action == "delete_policy"),
+            "delete must be audited"
+        );
+    }
+
+    // --- Device admin endpoints ---
+
+    #[tokio::test]
+    async fn device_admin_flow_list_revoke_reinstate() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        state
+            .device_store
+            .upsert_device("fp-admin-1", "laptop-alice", Some("alice@example.com"))
+            .await
+            .expect("register device");
+        let app = router(state.clone());
+
+        // List shows the device with its fields.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/devices")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        let devices = json.as_array().expect("array");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0]["cert_fingerprint"], "fp-admin-1");
+        assert_eq!(devices[0]["user_subject"], "laptop-alice");
+        assert_eq!(devices[0]["user_email"], "alice@example.com");
+        assert_eq!(devices[0]["revoked"], false);
+
+        // Revoke → 204, and the store reflects it.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/admin/v1/devices/fp-admin-1/revoke")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            state
+                .device_store
+                .is_revoked("fp-admin-1")
+                .await
+                .expect("check"),
+            Some(true)
+        );
+
+        // Revoking an already-revoked device is idempotent (204) — an admin
+        // re-running a playbook must not see a spurious error.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/admin/v1/devices/fp-admin-1/revoke")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+
+        // Revoking an UNKNOWN fingerprint → 404 naming the device.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/admin/v1/devices/fp-ghost/revoke")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let text = body_text(resp).await;
+        assert!(
+            text.contains("fp-ghost"),
+            "404 must name the device: {text}"
+        );
+
+        // Reinstate → 204 and active again.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/admin/v1/devices/fp-admin-1/reinstate")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NO_CONTENT);
+        assert_eq!(
+            state
+                .device_store
+                .is_revoked("fp-admin-1")
+                .await
+                .expect("check"),
+            Some(false)
+        );
+
+        // Reinstate an unknown fingerprint → 404.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/admin/v1/devices/fp-ghost/reinstate")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+        // Both mutations were attributed to the calling admin.
+        use sea_orm::EntityTrait;
+        let entries = crate::entity::admin_audit_log::Entity::find()
+            .all(state.audit.db())
+            .await
+            .expect("audit");
+        let revoke = entries
+            .iter()
+            .find(|e| e.action == "revoke_device")
+            .expect("revoke audit");
+        assert_eq!(revoke.admin_subject, "alice");
+        assert!(entries.iter().any(|e| e.action == "reinstate_device"));
+    }
+
+    // --- Audit query endpoint ---
+
+    #[tokio::test]
+    async fn audit_query_filters_by_subject_via_router() {
+        use crate::audit::AuditEntry;
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        for subject in ["u-a", "u-b"] {
+            state
+                .audit
+                .record(&AuditEntry {
+                    device_id: "dev".into(),
+                    user_subject: subject.into(),
+                    model: Some("gpt-4o".into()),
+                    backend: "mock".into(),
+                    status: 200,
+                    latency_ms: 3,
+                    stream: false,
+                    prompt_tokens: Some(10),
+                    completion_tokens: Some(5),
+                    total_tokens: Some(15),
+                    identity_id: None,
+                    email: Some("u@example.com".into()),
+                    groups: Some(r#"["engineering"]"#.into()),
+                    endpoint: Some("/v1/chat/completions".into()),
+                    request_id: Some("req-1".into()),
+                    permission_decision: Some("allowed".into()),
+                    denial_reason: None,
+                    cost_usd: Some(0.01),
+                    token_saver_applied: None,
+                    tokens_saved: None,
+                    messages_dropped: None,
+                    saver_reasons: None,
+                })
+                .await
+                .expect("record");
+        }
+        let app = router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/audit?subject=u-a")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), 1, "subject filter must narrow the result");
+        assert_eq!(rows[0]["user_subject"], "u-a");
+        assert_eq!(rows[0]["model"], "gpt-4o");
+        assert_eq!(rows[0]["status"], 200);
+        assert_eq!(rows[0]["total_tokens"], 15);
+        assert_eq!(rows[0]["request_id"], "req-1");
+        // created_at serializes as a non-empty timestamp string.
+        assert!(
+            rows[0]["created_at"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "created_at must be present: {}",
+            rows[0]["created_at"]
+        );
+
+        // No filter → both rows, newest first.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/audit")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        let json = body_json(resp).await;
+        assert_eq!(json.as_array().expect("array").len(), 2);
+    }
+
+    // --- Token-saver summary endpoint ---
+
+    #[tokio::test]
+    async fn token_saver_summary_aggregates_and_overlays_config() {
+        use crate::audit::AuditEntry;
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        // engineering: two optimised requests.
+        for (saved, dropped) in [(100_i64, 2_i64), (50, 1)] {
+            state
+                .audit
+                .record(&AuditEntry {
+                    device_id: "dev".into(),
+                    user_subject: "eng-user".into(),
+                    model: None,
+                    backend: "mock".into(),
+                    status: 200,
+                    latency_ms: 1,
+                    stream: false,
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    total_tokens: None,
+                    identity_id: None,
+                    email: None,
+                    groups: Some(r#"["engineering"]"#.into()),
+                    endpoint: Some("/v1/chat/completions".into()),
+                    request_id: None,
+                    permission_decision: Some("allowed".into()),
+                    denial_reason: None,
+                    cost_usd: None,
+                    token_saver_applied: Some(true),
+                    tokens_saved: Some(saved),
+                    messages_dropped: Some(dropped),
+                    saver_reasons: Some(r#"["dedup"]"#.into()),
+                })
+                .await
+                .expect("record");
+        }
+        // sales: optimised traffic but no policy row (e.g. policy deleted).
+        state
+            .audit
+            .record(&AuditEntry {
+                device_id: "dev".into(),
+                user_subject: "sales-user".into(),
+                model: None,
+                backend: "mock".into(),
+                status: 200,
+                latency_ms: 1,
+                stream: false,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                identity_id: None,
+                email: None,
+                groups: Some(r#"["sales"]"#.into()),
+                endpoint: Some("/v1/chat/completions".into()),
+                request_id: None,
+                permission_decision: Some("allowed".into()),
+                denial_reason: None,
+                cost_usd: None,
+                token_saver_applied: Some(true),
+                tokens_saved: Some(10),
+                messages_dropped: Some(0),
+                saver_reasons: None,
+            })
+            .await
+            .expect("record");
+        // An optimised row with NO groups at all → bucketed as "unknown".
+        state
+            .audit
+            .record(&AuditEntry {
+                device_id: "dev".into(),
+                user_subject: "groupless".into(),
+                model: None,
+                backend: "mock".into(),
+                status: 200,
+                latency_ms: 1,
+                stream: false,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                identity_id: None,
+                email: None,
+                groups: None,
+                endpoint: None,
+                request_id: None,
+                permission_decision: None,
+                denial_reason: None,
+                cost_usd: None,
+                token_saver_applied: Some(true),
+                tokens_saved: Some(5),
+                messages_dropped: Some(0),
+                saver_reasons: None,
+            })
+            .await
+            .expect("record");
+        // A non-optimised row must be excluded from the summary entirely.
+        state
+            .audit
+            .record(&AuditEntry {
+                device_id: "dev".into(),
+                user_subject: "plain-user".into(),
+                model: None,
+                backend: "mock".into(),
+                status: 200,
+                latency_ms: 1,
+                stream: false,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
+                identity_id: None,
+                email: None,
+                groups: Some(r#"["engineering"]"#.into()),
+                endpoint: None,
+                request_id: None,
+                permission_decision: None,
+                denial_reason: None,
+                cost_usd: None,
+                token_saver_applied: Some(false),
+                tokens_saved: Some(0),
+                messages_dropped: Some(0),
+                saver_reasons: None,
+            })
+            .await
+            .expect("record");
+
+        // Policies: engineering configured; quiet-group has a policy but no
+        // traffic (must still appear with zeros so admins see the config).
+        state
+            .policy_store
+            .upsert_policy_full(
+                "engineering",
+                None,
+                None,
+                None,
+                None,
+                true,
+                Some(8000),
+                true,
+            )
+            .await
+            .expect("policy");
+        state
+            .policy_store
+            .upsert_policy_full("quiet-group", None, None, None, None, false, None, false)
+            .await
+            .expect("policy");
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/token-saver")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+
+        // Totals: 100+50+10+5 = 165 saved; 3 dropped; 4 optimised requests.
+        assert_eq!(json["total_requests_optimized"], 4);
+        assert_eq!(json["total_tokens_saved"], 165);
+        assert_eq!(json["total_messages_dropped"], 3);
+
+        let groups = json["groups"].as_array().expect("groups array");
+        // Clippy-clean lookup helper (test builds allow expect_used).
+        fn group_row<'a>(groups: &'a [serde_json::Value], name: &str) -> &'a serde_json::Value {
+            groups
+                .iter()
+                .find(|g| g["group"] == name)
+                .unwrap_or_else(|| {
+                    let names: Vec<String> = groups
+                        .iter()
+                        .filter_map(|g| g["group"].as_str().map(str::to_string))
+                        .collect();
+                    unreachable!("group {name} missing; have {names:?}")
+                })
+        }
+
+        let eng = group_row(groups, "engineering");
+        assert_eq!(eng["enabled"], true, "config overlay must show enabled");
+        assert_eq!(eng["max_input_tokens"], 8000);
+        assert_eq!(eng["requests_optimized"], 2);
+        assert_eq!(eng["tokens_saved"], 150);
+        assert_eq!(eng["messages_dropped"], 3);
+
+        let sales = group_row(groups, "sales");
+        assert_eq!(sales["requests_optimized"], 1);
+        assert_eq!(sales["tokens_saved"], 10);
+        assert_eq!(
+            sales["enabled"], false,
+            "traffic without a policy must report disabled"
+        );
+
+        let unknown = group_row(groups, "unknown");
+        assert_eq!(unknown["requests_optimized"], 1);
+        assert_eq!(unknown["tokens_saved"], 5);
+
+        let quiet = group_row(groups, "quiet-group");
+        assert_eq!(quiet["requests_optimized"], 0, "policy-only group row");
+        assert_eq!(quiet["tokens_saved"], 0);
+        assert_eq!(quiet["enabled"], false);
+
+        // Groups are sorted by name for stable admin reading.
+        let names: Vec<&str> = groups.iter().filter_map(|g| g["group"].as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "groups must be sorted: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn token_saver_summary_empty_state_is_clean() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/token-saver")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["total_requests_optimized"], 0);
+        assert_eq!(json["total_tokens_saved"], 0);
+        assert_eq!(json["total_messages_dropped"], 0);
+        assert_eq!(
+            json["groups"].as_array().expect("array").len(),
+            0,
+            "no policies + no traffic → empty groups list"
+        );
+    }
+
+    // --- Usage endpoint ---
+
+    #[tokio::test]
+    async fn usage_endpoint_reports_per_subject_and_all() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        state
+            .usage_tracker
+            .increment("usage-a", Some(r#"["engineering"]"#), 2, 200, 0.5)
+            .await
+            .expect("usage a");
+        state
+            .usage_tracker
+            .increment("usage-b", None, 1, 50, 0.25)
+            .await
+            .expect("usage b");
+
+        let app = router(state.clone());
+
+        // Filtered by subject.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/usage?subject=usage-a")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        let rows = json.as_array().expect("array");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["user_subject"], "usage-a");
+        assert_eq!(rows[0]["request_count"], 2);
+        assert_eq!(rows[0]["token_count"], 200);
+
+        // Unknown subject → empty array, not 404 (an admin polling for a
+        // user with no traffic today should get a clean empty answer).
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/usage?subject=nobody")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json.as_array().expect("array").len(), 0);
+
+        // Unfiltered → all users.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/usage")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        let json = body_json(resp).await;
+        assert_eq!(json.as_array().expect("array").len(), 2);
+    }
+
+    // --- Provider endpoint edge cases not covered by the integration file ---
+
+    #[test]
+    fn create_provider_request_defaults_enabled_to_true() {
+        // Omitting `enabled` must default to true (a provider that silently
+        // arrives disabled would look like a routing outage to users).
+        let body: CreateProviderRequest =
+            serde_json::from_str(r#"{"id":"p","name":"P","base_url":"https://p.example.com"}"#)
+                .expect("parse");
+        assert!(body.enabled, "enabled defaults to true");
+        assert!(!body.is_default, "is_default defaults to false");
+        assert_eq!(body.models, None, "models defaults to None (all models)");
+    }
+
+    #[tokio::test]
+    async fn get_key_returns_metadata_with_access_groups() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        state
+            .provider_store
+            .upsert_provider(&crate::provider::ProviderInput {
+                id: "openai".into(),
+                name: "OpenAI".into(),
+                base_url: "https://api.openai.com".into(),
+                enabled: true,
+                is_default: false,
+                models: None,
+            })
+            .await
+            .expect("provider");
+        let key = state
+            .provider_store
+            .add_key(
+                "openai",
+                "production",
+                "sk-get-key-test-secret",
+                3,
+                &["engineering".to_string()],
+            )
+            .await
+            .expect("key");
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri(format!("/admin/v1/providers/openai/keys/{}", key.id))
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["id"], key.id);
+        assert_eq!(json["label"], "production");
+        assert_eq!(json["priority"], 3);
+        assert_eq!(json["allowed_groups"], serde_json::json!(["engineering"]));
+        assert_eq!(
+            json["key_digest"].as_str().map(str::len),
+            Some(64),
+            "the digest is a sha256 hex string"
+        );
+        assert!(
+            !json.to_string().contains("sk-get-key-test-secret"),
+            "key material must never be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_key_on_missing_provider_names_the_provider() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        let app = router(state);
+
+        // The provider-existence check runs before the key lookup, so the
+        // 404 must name the PROVIDER (what the admin actually got wrong).
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::DELETE)
+                    .uri("/admin/v1/providers/ghost/keys/whatever")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let text = body_text(resp).await;
+        assert!(
+            text.contains("provider 'ghost' not found"),
+            "the 404 must name the provider: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_unknown_returns_404_and_list_keys_unknown_404() {
+        use tower::ServiceExt;
+
+        let state = setup_test_state().await;
+        let app = router(state);
+
+        // PUT on a provider that does not exist → 404 (never creates via PUT).
+        let resp = app
+            .clone()
+            .oneshot(admin_json(
+                "PUT",
+                "/admin/v1/providers/ghost",
+                r#"{"name": "Ghost", "base_url": "https://ghost.example.com", "enabled": true, "is_default": false, "models": null}"#,
+            ))
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+        // Listing keys of an unknown provider → 404.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/admin/v1/providers/ghost/keys")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+
+        // set-default on an unknown provider → 500 from the store error
+        // (the store rejects defaulting a provider that does not exist).
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/admin/v1/providers/ghost/default")
+                    .header("x-oac-user-subject", "alice")
+                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .body(axum::body::Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "defaulting a missing provider must not silently succeed"
         );
     }
 }

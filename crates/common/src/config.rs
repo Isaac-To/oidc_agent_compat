@@ -524,4 +524,54 @@ server_key_path = "/server.key"
         let err = RelayConfig::from_toml("not valid toml {{{").unwrap_err();
         assert!(err.to_string().contains("toml parse"), "{err}");
     }
+
+    #[test]
+    fn relay_rejects_empty_central_url() {
+        let toml = valid_relay_toml().replace("https://central.example.com", "");
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("central.url"), "{err}");
+    }
+
+    #[test]
+    fn relay_rejects_empty_client_secret_env() {
+        let toml = valid_relay_toml()
+            .replace("client_secret_env = \"SECRET\"", "client_secret_env = \"\"");
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("client_secret_env"), "{err}");
+    }
+
+    #[test]
+    fn central_config_parses_admin_and_pricing_defaults() {
+        let toml = format!(
+            "{}\n[admin]\nadmin_group = \"oac-admins\"\n\n[pricing]\nmodels = []\n",
+            valid_central_toml()
+        );
+        let cfg = CentralConfig::from_toml(&toml).expect("parse");
+        let admin = cfg.admin.expect("admin parsed");
+        assert_eq!(admin.admin_group, "oac-admins");
+        let pricing = cfg.pricing.expect("pricing parsed");
+        assert!(pricing.models.is_empty());
+        // The auto-fetch interval defaults to 1 hour.
+        assert_eq!(pricing.fetch_interval_secs, 3600);
+    }
+
+    #[test]
+    fn central_pricing_with_manual_models_parses() {
+        let toml = format!(
+            "{}\n[pricing]\nfetch_interval_secs = 0\n[[pricing.models]]\nmodel = \"gpt-4o\"\ninput_per_1k_usd = 0.0025\noutput_per_1k_usd = 0.01\n",
+            valid_central_toml()
+        );
+        let cfg = CentralConfig::from_toml(&toml).expect("parse");
+        cfg.validate().expect("validate");
+        let pricing = cfg.pricing.expect("pricing");
+        assert_eq!(pricing.fetch_interval_secs, 0, "auto-fetch can be disabled");
+        assert_eq!(pricing.models.len(), 1);
+        assert_eq!(pricing.models.first().expect("one model").model, "gpt-4o");
+    }
+
+    #[test]
+    fn central_malformed_toml_returns_config_error() {
+        let err = CentralConfig::from_toml("]]not toml[[[").unwrap_err();
+        assert!(err.to_string().contains("toml parse"), "{err}");
+    }
 }

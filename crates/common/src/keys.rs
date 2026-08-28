@@ -265,6 +265,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_string_round_trips_without_reencoding() {
+        // The dev-mode seeding path must preserve the exact plaintext so
+        // containerized agents can use the documented well-known key.
+        let key = LocalKey::from_string("oac_test_key_alice".to_string());
+        assert_eq!(key.as_str(), "oac_test_key_alice");
+        assert_eq!(key.to_string(), "oac_test_key_alice");
+    }
+
+    #[test]
+    fn hash_of_from_string_key_matches_hash_of_literal() {
+        let via_wrapper = KeyHash::from_plaintext(LocalKey::from_string("oac_x".into()).as_str());
+        let via_literal = KeyHash::from_plaintext("oac_x");
+        assert!(via_wrapper.matches(&via_literal));
+    }
+
+    #[test]
     fn generated_key_has_correct_prefix_and_length() {
         let key = LocalKey::generate();
         let s = key.to_string();

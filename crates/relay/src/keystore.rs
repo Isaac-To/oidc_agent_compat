@@ -667,4 +667,59 @@ mod tests {
         let deleted = store.revoke_key("nonexistent-uuid").await.expect("revoke");
         assert!(!deleted, "nonexistent key must return false");
     }
+
+    #[tokio::test]
+    async fn schema_rejects_keys_with_dangling_identity() {
+        let store = setup_test_db().await;
+        // The `api_keys.identity_id` foreign key is the first line of
+        // defence against the corrupted state `verify_key` guards against:
+        // the database itself must refuse an orphaned key row.
+        let plaintext = "oac_orphan_key";
+        let hash = KeyHash::from_plaintext(plaintext);
+        use sea_orm::ConnectionTrait;
+        let result = store
+            .db
+            .execute(sea_orm::Statement::from_sql_and_values(
+                store.db.get_database_backend(),
+                "INSERT INTO api_keys (id, identity_id, key_hash, label, created_at) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                vec![
+                    "orphan-key-id".into(),
+                    "no-such-identity".into(),
+                    sea_orm::Value::Bytes(Some(Box::new(hash.as_bytes().to_vec()))),
+                    "orphan".into(),
+                    "2026-01-01 00:00:00".into(),
+                ],
+            ))
+            .await;
+
+        let err = result.expect_err("the FK constraint must reject the orphan");
+        assert!(
+            err.to_string().contains("FOREIGN KEY"),
+            "the failure must be the FK constraint: {err}"
+        );
+
+        // And the orphan key (which was never stored) cannot verify.
+        let result = store.verify_key(plaintext).await.expect("verify");
+        assert!(
+            matches!(result, KeyVerification::Invalid),
+            "a key that was never stored must not verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn db_getter_is_usable() {
+        let store = setup_test_db().await;
+        use sea_orm::{ConnectionTrait, Statement};
+        let row = store
+            .db
+            .query_one(Statement::from_string(
+                store.db.get_database_backend(),
+                "SELECT 1 AS one".to_string(),
+            ))
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(row.try_get::<i64>("", "one").unwrap_or(0), 1);
+    }
 }

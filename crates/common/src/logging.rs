@@ -366,4 +366,218 @@ mod tests {
         assert!(output.contains(r#""authorization":"[REDACTED]""#));
         assert!(!output.contains("secret"));
     }
+
+    // --- Writer machinery: the actual path production log lines take ---
+
+    #[test]
+    fn redacting_writer_flushes_redacted_lines_to_inner() {
+        let mut inner = Vec::new();
+        {
+            let make = RedactingMakeWriter::new(&mut inner);
+            let mut writer = make.make_writer();
+            writer
+                .write_all(
+                    br#"{"timestamp":"...","authorization":"Bearer sk-live-123","model":"gpt-4"}"#,
+                )
+                .expect("write");
+            writer.write_all(b"\n").expect("newline");
+            writer.flush().expect("flush");
+        }
+        let out = String::from_utf8(inner).expect("utf8");
+        assert!(
+            out.contains(r#""authorization":"[REDACTED]""#),
+            "the writer must redact on flush: {out}"
+        );
+        assert!(!out.contains("sk-live-123"), "secret reached stdout: {out}");
+        assert!(out.contains("gpt-4"), "non-secrets must survive: {out}");
+    }
+
+    #[test]
+    fn redacting_writer_flush_on_empty_buffer_is_noop() {
+        let mut inner = Vec::new();
+        {
+            let make = RedactingMakeWriter::new(&mut inner);
+            let mut writer = make.make_writer();
+            // Flush without any buffered bytes: must succeed and write nothing.
+            writer.flush().expect("flush empty");
+        }
+        assert!(inner.is_empty(), "nothing should be written: {inner:?}");
+    }
+
+    #[test]
+    fn redacting_writer_flushes_on_drop() {
+        let mut inner = Vec::new();
+        {
+            let make = RedactingMakeWriter::new(&mut inner);
+            let mut writer = make.make_writer();
+            writer
+                .write_all(br#"{"api_key":"sk-on-drop"}"#)
+                .expect("write");
+            // No explicit flush — Drop must flush (the path every real log
+            // line takes when tracing drops the writer).
+        }
+        let out = String::from_utf8(inner).expect("utf8");
+        assert!(out.contains("[REDACTED]"), "drop must flush: {out}");
+        assert!(!out.contains("sk-on-drop"), "secret reached stdout: {out}");
+    }
+
+    #[test]
+    fn redacting_writer_partial_writes_are_buffered_until_flush() {
+        // tracing may write a single JSON line in several slices; nothing
+        // may reach stdout before the line is complete and redacted.
+        use std::sync::{Arc, Mutex};
+        let inner = Arc::new(Mutex::new(Vec::new()));
+        let probe = inner.clone();
+        {
+            let make = RedactingMakeWriter::new(SharedVec(inner.clone()));
+            let mut writer = make.make_writer();
+            writer.write_all(br#"{"model":"gpt-4""#).expect("part 1");
+            assert!(
+                probe.lock().expect("probe").is_empty(),
+                "bytes must not hit stdout before flush"
+            );
+            writer
+                .write_all(br#","password":"hunter2"}"#)
+                .expect("part 2");
+            writer.flush().expect("flush");
+        }
+        let out = String::from_utf8(probe.lock().expect("probe").clone()).expect("utf8");
+        assert!(out.contains(r#""password":"[REDACTED]""#), "out: {out}");
+        assert!(!out.contains("hunter2"), "secret reached stdout: {out}");
+    }
+
+    /// A writer that fronts a shared Vec so tests can peek at what has been
+    /// emitted so far.
+    struct SharedVec(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedVec {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|e| io::Error::other(e.to_string()))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn make_writer_clones_share_the_inner_writer() {
+        // Clone-ability is what lets the JSON layer fan out; both clones
+        // must write through to the same destination.
+        let mut inner = Vec::new();
+        {
+            let make = RedactingMakeWriter::new(&mut inner);
+            let a = make.make_writer();
+            let b = make.make_writer();
+            let mut a = a;
+            let mut b = b;
+            a.write_all(br#"{"token":"sk-a"}"#).expect("a");
+            b.write_all(br#"{"token":"sk-b"}"#).expect("b");
+            a.flush().expect("flush a");
+            b.flush().expect("flush b");
+        }
+        let out = String::from_utf8(inner).expect("utf8");
+        assert_eq!(out.matches("[REDACTED]").count(), 2, "out: {out}");
+    }
+
+    // --- Redaction edge cases over JSON value shapes ---
+
+    #[test]
+    fn redact_json_fields_redacts_object_and_array_values() {
+        let input = r#"{"token":{"sub":"x"},"key":[1,2],"model":"gpt-4"}"#;
+        let output = redact_json_fields(input);
+        assert!(
+            output.contains(r#""token":"[REDACTED]""#),
+            "object values must be replaced wholesale: {output}"
+        );
+        assert!(
+            output.contains(r#""key":"[REDACTED]""#),
+            "array values must be replaced wholesale: {output}"
+        );
+        assert!(output.contains("gpt-4"), "safe fields survive: {output}");
+    }
+
+    #[test]
+    fn redact_json_fields_redacts_bool_and_null_values() {
+        let input = r#"{"secret":false,"password":null,"model":"gpt-4"}"#;
+        let output = redact_json_fields(input);
+        assert!(output.contains(r#""secret":"[REDACTED]""#), "{output}");
+        assert!(output.contains(r#""password":"[REDACTED]""#), "{output}");
+    }
+
+    #[test]
+    fn redact_json_fields_tolerates_unterminated_strings() {
+        // A truncated line (crash mid-write) must not panic or loop; the
+        // bytes pass through and any complete sensitive field is redacted.
+        let input = r#"{"model":"gpt-4","authorization":"Bearer sk-half"#;
+        let output = redact_json_fields(input);
+        // The complete field before the truncation is intact.
+        assert!(output.contains("gpt-4"), "{output}");
+        // The unterminated sensitive value never had a value-end, so the
+        // safest behaviour is to leave the fragment — but never panic.
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn redact_json_fields_handles_sensitive_field_without_value() {
+        let input = r#"{"token""#;
+        let output = redact_json_fields(input);
+        // No colon/value follows; must not panic or emit a broken line.
+        assert!(
+            !output.contains("[REDACTED]\"\""),
+            "no phantom redaction: {output}"
+        );
+    }
+
+    #[test]
+    fn redact_json_fields_ignores_non_sensitive_quoted_keys() {
+        // A key that merely CONTAINS a sensitive substring must not be
+        // redacted (exact, case-insensitive field match only).
+        let input = r#"{"token_count":15,"model":"gpt-4"}"#;
+        let output = redact_json_fields(input);
+        assert_eq!(
+            output, input,
+            "token_count is not the token field and must pass through"
+        );
+    }
+
+    #[test]
+    fn sensitive_field_list_covers_the_documented_secrets() {
+        for field in [
+            "authorization",
+            "api_key",
+            "apikey",
+            "client_secret",
+            "refresh_token",
+            "id_token",
+            "access_token",
+            "token",
+            "secret",
+            "password",
+            "master_key",
+            "key",
+            "bearer",
+        ] {
+            assert!(
+                SENSITIVE_FIELDS.contains(&field),
+                "{field} must stay in SENSITIVE_FIELDS"
+            );
+        }
+    }
+
+    #[test]
+    fn init_is_idempotent_per_process() {
+        // A second init must report an error rather than panic or silently
+        // double-register (the first call may legitimately fail if another
+        // test already claimed the global default subscriber).
+        let _ = init();
+        let second = init();
+        assert!(
+            second.is_err(),
+            "re-initializing the subscriber must be a visible error"
+        );
+    }
 }

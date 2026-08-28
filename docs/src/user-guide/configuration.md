@@ -87,6 +87,11 @@ client_key_path = "/etc/oac/client.key"
 | `rate_limit_requests` | `u32` | no | `60` | Maximum requests per client IP per rate-limit window; must be greater than zero |
 | `rate_limit_window_secs` | `u64` | no | `60` | Token-bucket window in seconds; must be greater than zero |
 
+When the limit is exceeded, central returns `429 Too Many Requests` with a
+`Retry-After` header (seconds until one token refills) and a JSON body
+(`error.type = "rate_limit_error"`, `error.retry_after_secs`) so agents can
+back off for exactly the right duration instead of retrying in a tight loop.
+
 ### OIDC
 
 Same shape as the relay's OIDC config:

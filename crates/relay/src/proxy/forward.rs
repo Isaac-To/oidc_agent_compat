@@ -270,3 +270,73 @@ async fn forward_request(
         Ok((resp, model))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    /// `v1_routes` is the mountable surface an embedder composes into a
+    /// larger router; pin that all four OpenAI-compatible endpoints exist.
+    #[tokio::test]
+    async fn v1_routes_registers_all_four_endpoints() {
+        use crate::proxy::AppState;
+
+        let url = oidc_agent_common::persistence::temp_sqlite_url("fwd-routes");
+        let db = crate::db::setup(&url).await.expect("db");
+        let key_store = crate::keystore::KeyStore::new(db.clone());
+        let config = RelayConfig {
+            listen_addr: "127.0.0.1:0".parse().expect("addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: oidc_agent_common::config::OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "t".into(),
+                client_secret_env: "T".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            central: oidc_agent_common::config::CentralConnectionConfig {
+                url: "http://127.0.0.1:1".into(),
+                ca_cert_path: "/ca.pem".into(),
+                client_cert_path: "/c.pem".into(),
+                client_key_path: "/c.key".into(),
+            },
+            dev_mode: true,
+            session_ttl_hours: None,
+        };
+        let state = AppState {
+            key_store,
+            config: config.clone(),
+            client: build_client(&config).expect("client"),
+            listen_addr: "127.0.0.1:8787".parse().expect("addr"),
+            activity: crate::activity::ActivityLogger::new(db),
+        };
+        let app = v1_routes().with_state(state);
+
+        // All four routes must resolve (405 vs 404 distinguishes "wrong
+        // method" from "route missing").
+        for (method, path) in [
+            (axum::http::Method::POST, "/chat/completions"),
+            (axum::http::Method::POST, "/responses"),
+            (axum::http::Method::GET, "/models"),
+            (axum::http::Method::POST, "/embeddings"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method.clone())
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("router");
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{method} {path} must be registered"
+            );
+        }
+    }
+}

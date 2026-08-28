@@ -507,6 +507,90 @@ mod tests {
     }
 
     #[test]
+    fn read_codex_invalid_json_returns_parse_error() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-codex-badjson-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&tmp, "this is not json").expect("write");
+        let err = read_codex(&tmp).unwrap_err();
+        assert!(err.to_string().contains("parse"), "{err}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_codex_missing_base_url_returns_guidance() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-codex-nobase-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&tmp, r#"{"api_key": "oac_x"}"#).expect("write");
+        let err = read_codex(&tmp).unwrap_err();
+        // The error must tell the user to run `oac-relay login` first.
+        assert!(err.to_string().contains("api_base_url"), "{err}");
+        assert!(err.to_string().contains("oac-relay login"), "{err}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_generic_env_missing_file_returns_error() {
+        let err = read_generic_env(Path::new("/nonexistent/agent-env.sh")).unwrap_err();
+        assert!(err.to_string().contains("read"), "{err}");
+    }
+
+    #[test]
+    fn read_generic_env_missing_vars_return_guidance() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-env-missing-{}-{}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        // File exists but has neither var.
+        std::fs::write(&tmp, "# empty\nexport OTHER=1\n").expect("write");
+        let err = read_generic_env(&tmp).unwrap_err();
+        assert!(err.to_string().contains("OPENAI_API_BASE"), "{err}");
+        assert!(err.to_string().contains("oac-relay login"), "{err}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn read_generic_env_missing_api_key_returns_guidance() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-env-nokey-{}-{}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&tmp, "export OPENAI_API_BASE='http://127.0.0.1:8787/v1'\n").expect("write");
+        let err = read_generic_env(&tmp).unwrap_err();
+        assert!(err.to_string().contains("OPENAI_API_KEY"), "{err}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn extract_env_var_unquoted_value_is_returned_verbatim() {
+        // Hand-written (non-injected) env files may omit quotes.
+        let contents = "export OPENAI_API_KEY=oac_bare_value\n";
+        assert_eq!(
+            extract_env_var(contents, "OPENAI_API_KEY"),
+            Some("oac_bare_value".into())
+        );
+    }
+
+    #[test]
     fn read_codex_missing_api_key_returns_error() {
         let tmp = std::env::temp_dir().join(format!(
             "oac-read-codex-missing-{}-{}.json",

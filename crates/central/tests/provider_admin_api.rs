@@ -563,3 +563,65 @@ async fn admin_mutations_are_recorded_in_the_admin_audit_log() {
         entries.iter().map(|e| e.action.clone()).collect::<Vec<_>>()
     );
 }
+
+#[tokio::test]
+async fn blank_group_entries_are_rejected_with_a_clear_error() {
+    let (router, _store) = setup_router().await;
+    router
+        .clone()
+        .oneshot(admin_request(
+            "POST",
+            "/admin/v1/providers",
+            Some(provider_body()),
+        ))
+        .await
+        .unwrap();
+
+    // A blank/whitespace group name must be REJECTED (not silently stored
+    // as a row that could never match a real group) with a message an
+    // admin can act on.
+    for bad_groups in [
+        serde_json::json!([""]),
+        serde_json::json!(["   "]),
+        serde_json::json!(["engineering", ""]),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(admin_request(
+                "POST",
+                "/admin/v1/providers/openai/keys",
+                Some(serde_json::json!({
+                    "key": TEST_KEY_PLAINTEXT,
+                    "label": "primary",
+                    "allowed_groups": bad_groups,
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "blank groups must not be accepted: {bad_groups}"
+        );
+        let body = body_string(resp).await;
+        assert!(
+            body.contains("provider key access groups must not be empty"),
+            "the error must say exactly what is wrong: {body}"
+        );
+    }
+
+    // A well-formed group list is still accepted.
+    let resp = router
+        .oneshot(admin_request(
+            "POST",
+            "/admin/v1/providers/openai/keys",
+            Some(serde_json::json!({
+                "key": TEST_KEY_PLAINTEXT,
+                "label": "primary",
+                "allowed_groups": ["engineering"],
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

@@ -166,6 +166,35 @@ mod tests {
     }
 
     #[test]
+    fn remaining_constructors_produce_correct_variants() {
+        assert!(matches!(Error::forbidden("x"), Error::Forbidden(_)));
+        assert!(matches!(Error::database("ctx: err"), Error::Database(_)));
+        assert!(matches!(Error::http("ctx: err"), Error::Http(_)));
+        // Context helpers keep their prefix so logs stay greppable.
+        assert_eq!(
+            Error::database("query users: boom").to_string(),
+            "database error: query users: boom"
+        );
+        assert_eq!(
+            Error::http("forward: boom").to_string(),
+            "http error: forward: boom"
+        );
+        assert_eq!(
+            Error::forbidden("model not allowed").to_string(),
+            "forbidden: model not allowed"
+        );
+    }
+
+    #[test]
+    fn db_error_conversion_preserves_source() {
+        let db_err = sea_orm::DbErr::RecordNotFound("no such row".into());
+        let err: Error = db_err.into();
+        assert!(matches!(err, Error::Db(_)));
+        // The source chain must survive for error reporting.
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
     fn io_error_conversion() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
         let err: Error = io_err.into();
