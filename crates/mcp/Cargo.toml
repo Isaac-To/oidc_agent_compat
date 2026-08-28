@@ -1,0 +1,17 @@
+[package]
+name = "oac-mcp"
+description = "Model Context Protocol (MCP) shared types, JSON-RPC framing, and tool-call parsing for the OIDC agent compatibility server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

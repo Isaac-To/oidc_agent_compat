@@ -1779,6 +1779,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oac-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "oac-relay"
 version = "0.1.0"
 dependencies = [

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/common",
+    "crates/mcp",
     "crates/relay",
     "crates/central",
     "tests/e2e",
@@ -86,6 +87,9 @@ time = "0.3"
 
 # Internal
 oidc-agent-common = { path = "crates/common" }
+
+# MCP protocol types and parsing (internal)
+oac-mcp = { path = "crates/mcp" }
 
 # Test cert generation (dev-dependency)
 rcgen = "0.13"
