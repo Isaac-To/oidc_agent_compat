@@ -1710,3 +1710,292 @@ async fn rtk_collapse_repeated_lines_end_to_end() {
         "collapse-disabled group must keep content verbatim"
     );
 }
+
+// ─── Quota fairness: reservation released when upstream fails ─────────────
+//
+// A user whose request dies at the provider (dead upstream, network
+// partition) must NOT have their daily request quota consumed by the
+// failure. This test pins that behaviour end-to-end through the real
+// router, middlewares, and forwarder.
+#[tokio::test]
+async fn upstream_failure_releases_request_quota_reservation() {
+    use oac_central::usage::UsageTracker;
+
+    // A provider pointing at a dead port: connection refused on send.
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-quota-release-{}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let url = format!("sqlite://{}?mode=rwc", tmp.display());
+    let db = oac_central::db::setup(&url).await.expect("db setup");
+    let audit = AuditLogger::new(db.clone());
+    let policy_store = oac_central::policy::PolicyStore::new(db.clone());
+    // One request per day for this group — every failure counts.
+    policy_store
+        .upsert_policy("engineering", None, None, None, Some(1))
+        .await
+        .expect("policy");
+
+    let provider_store = ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&ProviderInput {
+            id: "dead".into(),
+            name: "dead".into(),
+            // Port 1 is reserved and nothing listens there.
+            base_url: "http://127.0.0.1:1".into(),
+            enabled: true,
+            is_default: true,
+            models: None,
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key("dead", "test-key", "sk-dead-upstream-key", 0, &[])
+        .await
+        .expect("provider key");
+
+    let usage_tracker = UsageTracker::new(db.clone());
+    let state = proxy::AppState {
+        config: oidc_agent_common::config::CentralConfig {
+            listen_addr: "127.0.0.1:0".parse().expect("addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: oidc_agent_common::config::OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "test".into(),
+                client_secret_env: "TEST".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            mtls: oidc_agent_common::config::MtlsServerConfig {
+                ca_cert_path: "/ca.pem".into(),
+                server_cert_path: "/server.pem".into(),
+                server_key_path: "/server.key".into(),
+            },
+            admin: None,
+            pricing: None,
+            dev_mode: true,
+            rate_limit_requests: 60,
+            rate_limit_window_secs: 60,
+        },
+        provider_store,
+        client: proxy::forward::build_client().expect("client"),
+        audit: audit.clone(),
+        rate_limiter: None,
+        policy_store: policy_store.clone(),
+        device_store: oac_central::device_store::DeviceStore::new(db.clone()),
+        usage_tracker: usage_tracker.clone(),
+        price_table: oac_central::pricing::PriceTable::empty(),
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind central");
+    let addr = listener.local_addr().expect("central addr");
+    tokio::spawn(async {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let http = reqwest::Client::new();
+    let endpoint = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let body = serde_json::json!({
+        "model": "any-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+
+    // First request: the forward fails (dead upstream) → 502 with a JSON
+    // body that never leaks the provider key.
+    let resp = http
+        .post(&endpoint)
+        .header("content-type", "application/json")
+        .header("X-OAC-User-Subject", "quota-fairness-user")
+        .header("X-OAC-User-Groups", r#"["engineering"]"#)
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    let text = resp.text().await.expect("body");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("json error body");
+    assert_eq!(
+        json["error"]["type"], "central_proxy_error",
+        "users get a typed error, not a stack trace: {json}"
+    );
+    assert!(
+        !text.contains("sk-dead-upstream-key"),
+        "provider key must never leak in error responses"
+    );
+
+    // The failed request must NOT consume the daily quota: the reservation
+    // is released (reserved 1 → released 0), so a retry once the upstream
+    // recovers still works.
+    let usage = usage_tracker
+        .get_usage("quota-fairness-user")
+        .await
+        .expect("usage");
+    assert_eq!(
+        usage.map(|u| u.request_count),
+        Some(0),
+        "a failed forward must not permanently consume the request quota"
+    );
+
+    // And the next request is still admitted by the permissions middleware
+    // (it fails at the forwarder again, but with 502 — NOT quota 429).
+    let resp = http
+        .post(&endpoint)
+        .header("content-type", "application/json")
+        .header("X-OAC-User-Subject", "quota-fairness-user")
+        .header("X-OAC-User-Groups", r#"["engineering"]"#)
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_GATEWAY,
+        "the retry must fail as an upstream error, not as quota exhaustion"
+    );
+}
+
+// ─── Rate limiting through the real router (production mode) ──────────────
+
+#[tokio::test]
+async fn rate_limit_429_through_router_carries_retry_after() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
+
+    // Mock backend so allowed requests succeed.
+    let mock_backend = Router::new().route(
+        "/v1/models",
+        axum::routing::get(|| async { r#"{"data": [{"id": "gpt-4"}]}"# }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let mock_addr = mock_listener.local_addr().expect("mock addr");
+    tokio::spawn(async {
+        let _ = axum::serve(mock_listener, mock_backend).await;
+    });
+
+    let tmp = std::env::temp_dir().join(format!(
+        "oac-ratelimit-router-{}-{counter}-{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let url = format!("sqlite://{}?mode=rwc", tmp.display());
+    let db = oac_central::db::setup(&url).await.expect("db setup");
+    let audit = AuditLogger::new(db.clone());
+    let provider_store = ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32]));
+    provider_store
+        .upsert_provider(&ProviderInput {
+            id: "mock".into(),
+            name: "mock".into(),
+            base_url: format!("http://{mock_addr}"),
+            enabled: true,
+            is_default: true,
+            models: Some(vec!["gpt-4".into()]),
+        })
+        .await
+        .expect("provider");
+    provider_store
+        .add_key("mock", "test-key", "sk-ratelimit-test-key", 0, &[])
+        .await
+        .expect("provider key");
+
+    let state = proxy::AppState {
+        // Production mode so the rate limiter engages (dev mode skips it).
+        config: oidc_agent_common::config::CentralConfig {
+            listen_addr: "127.0.0.1:0".parse().expect("addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: oidc_agent_common::config::OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "test".into(),
+                client_secret_env: "TEST".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            mtls: oidc_agent_common::config::MtlsServerConfig {
+                ca_cert_path: "/ca.pem".into(),
+                server_cert_path: "/server.pem".into(),
+                server_key_path: "/server.key".into(),
+            },
+            admin: None,
+            pricing: None,
+            dev_mode: false,
+            rate_limit_requests: 1,
+            rate_limit_window_secs: 60,
+        },
+        provider_store,
+        client: proxy::forward::build_client().expect("client"),
+        audit,
+        rate_limiter: Some(proxy::rate_limit::RateLimiter::new(
+            1,
+            std::time::Duration::from_secs(60),
+        )),
+        policy_store: oac_central::policy::PolicyStore::new(db.clone()),
+        device_store: oac_central::device_store::DeviceStore::new(db.clone()),
+        usage_tracker: oac_central::usage::UsageTracker::new(db.clone()),
+        price_table: oac_central::pricing::PriceTable::empty(),
+    };
+    let app = proxy::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind central");
+    let addr = listener.local_addr().expect("central addr");
+    tokio::spawn(async {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let http = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
+
+    // First request passes (prod mode requires the identity header).
+    let resp = http
+        .get(&url)
+        .header("X-OAC-User-Subject", "rate-user")
+        .send()
+        .await
+        .expect("first");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // Second request is rate limited with Retry-After + JSON body so agents
+    // can back off instead of hammering.
+    let resp = http
+        .get(&url)
+        .header("X-OAC-User-Subject", "rate-user")
+        .send()
+        .await
+        .expect("second");
+    assert_eq!(resp.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .expect("Retry-After header on 429")
+        .to_string();
+    assert!(
+        retry_after.parse::<u64>().is_ok_and(|s| s >= 1),
+        "Retry-After must be a positive number of seconds: {retry_after}"
+    );
+    let json: serde_json::Value = resp.json().await.expect("json body");
+    assert_eq!(json["error"]["type"], "rate_limit_error");
+    assert_eq!(
+        json["error"]["retry_after_secs"].as_u64(),
+        retry_after.parse().ok()
+    );
+
+    // Health checks stay available even while rate limited.
+    let resp = http
+        .get(format!("http://127.0.0.1:{}/healthz", addr.port()))
+        .send()
+        .await
+        .expect("healthz");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+}

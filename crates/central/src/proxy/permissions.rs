@@ -771,4 +771,255 @@ mod tests {
             "a revoked device must be denied"
         );
     }
+
+    // --- Endpoint / model allowlist denials (user-facing UX) ---
+
+    #[tokio::test]
+    async fn endpoint_not_allowed_denies_with_reason_and_audit() {
+        use sea_orm::EntityTrait;
+
+        let state = test_state().await;
+        // Only chat completions is permitted for this group.
+        state
+            .policy_store
+            .upsert_policy(
+                "restricted",
+                None,
+                Some(r#"["/v1/chat/completions"]"#),
+                None,
+                None,
+            )
+            .await
+            .expect("policy");
+
+        // /v1/embeddings is not on the allowlist → 403 with a JSON body that
+        // names the reason so agents surface something actionable.
+        let response = test_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/embeddings")
+                    .header("content-type", "application/json")
+                    .header(identity::HEADER_USER_SUBJECT, "endpoint-user")
+                    .header(identity::HEADER_USER_GROUPS, r#"["restricted"]"#)
+                    .body(Body::from(
+                        r#"{"model":"gpt-4","messages":[]}"#.to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["error"]["type"], "permission_denied");
+        assert_eq!(
+            json["error"]["message"], "access denied: endpoint_not_allowed",
+            "the denial reason must be machine-readable: {json}"
+        );
+
+        // The denial is audited with the reason, for admin review.
+        let audits = crate::entity::audit_log::Entity::find()
+            .all(state.audit.db())
+            .await
+            .expect("audit rows");
+        let denial = audits.last().expect("denial row");
+        assert_eq!(denial.permission_decision.as_deref(), Some("denied"));
+        assert_eq!(
+            denial.denial_reason.as_deref(),
+            Some("endpoint_not_allowed")
+        );
+        assert_eq!(denial.user_subject, "endpoint-user");
+        assert_eq!(denial.endpoint.as_deref(), Some("/v1/embeddings"));
+    }
+
+    #[tokio::test]
+    async fn allowed_endpoint_passes_and_gets_have_no_model_check() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy(
+                "restricted",
+                None,
+                Some(r#"["/v1/models"]"#),
+                None,
+                None,
+            )
+            .await
+            .expect("policy");
+
+        // A router with both routes so GET /v1/models resolves.
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async { "ok" }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { "ok" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(());
+
+        // GET /v1/models is allowlisted → passes (and has no body/model to
+        // check, exercising the non-POST path).
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::GET)
+                    .uri("/v1/models")
+                    .header(identity::HEADER_USER_SUBJECT, "list-models-user")
+                    .header(identity::HEADER_USER_GROUPS, r#"["restricted"]"#)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // POST to an endpoint not on the list → denied.
+        let response = app
+            .oneshot(chat_request("list-models-user", r#"["restricted"]"#))
+            .await
+            .expect("middleware run");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn model_not_allowed_denies_with_reason_and_audit() {
+        use sea_orm::EntityTrait;
+
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy(
+                "restricted",
+                Some(r#"["gpt-4o"]"#),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("policy");
+
+        // Request a model outside the allowlist.
+        let response = test_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header(identity::HEADER_USER_SUBJECT, "model-user")
+                    .header(identity::HEADER_USER_GROUPS, r#"["restricted"]"#)
+                    .body(Body::from(
+                        r#"{"model":"o1-preview","messages":[]}"#.to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            json["error"]["message"], "access denied: model_not_allowed",
+            "the denial reason must be machine-readable: {json}"
+        );
+
+        // The audit row records WHICH model was requested.
+        let audits = crate::entity::audit_log::Entity::find()
+            .all(state.audit.db())
+            .await
+            .expect("audit rows");
+        let denial = audits.last().expect("denial row");
+        assert_eq!(denial.denial_reason.as_deref(), Some("model_not_allowed"));
+        assert_eq!(
+            denial.model.as_deref(),
+            Some("o1-preview"),
+            "the audit row must name the denied model"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_without_identity_passes_permissions_to_auth() {
+        // No VerifiedRelayIdentity in extensions (e.g. dev mode without
+        // headers): permissions must defer to auth rather than 500.
+        let state = test_state().await;
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { "ok" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                permissions_middleware,
+            ))
+            .with_state(());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"model":"gpt-4","messages":[]}"#.to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "permissions must pass identity-less requests through to auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthz_bypasses_permissions() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy(
+                "restricted",
+                None,
+                Some(r#"[]"#), // nothing allowed
+                None,
+                None,
+            )
+            .await
+            .expect("policy");
+
+        let app = Router::new()
+            .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                permissions_middleware,
+            ))
+            .with_state(());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
