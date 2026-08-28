@@ -1,0 +1,191 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Release build & publish
+#
+# On a version tag (v0.1.0, v1.2.3, ...) this workflow builds the release
+# binaries for the supported platforms, packages each one into a
+# binaries-only .zip, and attaches them to a GitHub Release created from
+# the tag.
+#
+# Triggers:
+#   - manual dispatch (workflow_dispatch): build + upload to a draft
+#     release without requiring a tag first (useful for pre-release testing)
+#   - push of a tag matching v*.*.*: create/publish the release
+#
+# The tag version is the source of truth for the release version. A version
+# can be passed manually via workflow_dispatch for pre-release dry-runs.
+#
+# Secrets required: GH_TOKEN is provided automatically by GitHub; no custom
+# secrets are needed to publish a release.
+# ─────────────────────────────────────────────────────────────────────────
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (used to name the release when run manually)."
+        required: false
+        default: "dev"
+      draft:
+        description: "Create the release as a draft when run manually."
+        type: boolean
+        required: false
+        default: true
+
+env:
+  # Keep output terse and colour-coded in logs.
+  CARGO_TERM_COLOR: always
+
+permissions:
+  # Needed to create/update the GitHub Release and upload assets.
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # target -> runner used to build it.
+        include:
+          # macOS Apple Silicon (the common laptop-relay platform).
+          - target: aarch64-apple-darwin
+            os: macos-14
+          # Linux on x86_64 servers / CI images.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          # Linux on ARM servers (e.g. AWS Graviton).
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          # Windows x86_64 laptops running the relay.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # The `aarch64-unknown-linux-gnu` runner has no native ARM toolchain;
+      # install the cross-compiler so `cargo build` links correctly.
+      - name: Install ARM64 Linux toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          # rustc name-mangles the aarch64 cross linker this way so cargo
+          # picks it up as a C `cc` for the target triple.
+          printf '[target.aarch64-unknown-linux-gnu]\nlinker = "aarch64-linux-gnu-gcc"\n' | tee -a "$CARGO_HOME"/config.toml
+
+      # Shared build cache across the matrix and jobs.
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+
+      # Vendor / cargo home: the workspace depends on a vendored source in
+      # vendor/rtk (not a workspace member), plus network crates.io. Pin
+      # crates.io as the registry. This is a real release build, so we do
+      # NOT pass --offline; a fresh runner will fetch from crates.io.
+      - name: Build release binaries
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p oac-relay -p oac-central
+
+      # Locate the freshly built binaries and stage them in an archive dir.
+      # Cargo's default out-dir is target/<triple>/release; handle the
+      # Windows .exe suffix.
+      - name: Stage binaries
+        shell: bash
+        run: |
+          set -euxo pipefail
+          out_dir="target/${{ matrix.target }}/release"
+          exe_suffix=""
+          if [ "${{ runner.os }}" = "Windows" ]; then exe_suffix=".exe"; fi
+          mkdir -p dist
+          cp "$out_dir/oac-relay$exe_suffix" dist/
+          cp "$out_dir/oac-central$exe_suffix" dist/
+          ls -la dist
+
+      # Package binaries-only into a universal .zip named after the tag
+      # version and target. Use the same archive name shape on every OS so
+      # download links in the docs stay predictable.
+      - name: Create archive
+        id: archive
+        shell: bash
+        run: |
+          set -euxo pipefail
+          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}"
+          # Normalize a leading 'v' (v1.2.3 -> 1.2.3) for nicer filenames.
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          out="oac-${VERSION}-${{ matrix.target }}.zip"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # PowerShell: flatten the Directory into a zip at dist/oac-...zip
+            cd dist
+            powershell -NoProfile -Command "Compress-Archive -Path '*' -DestinationPath '../$out'"
+            cd ..
+          else
+            # cd into dist so the archive contains binaries at the top level
+            # (no leading folder) for a clean `unzip; ./oac-relay` flow.
+            (cd dist && zip -r "$OLDPWD/$out" .)
+          fi
+          echo "asset=$out" >> "$GITHUB_OUTPUT"
+          ls -la
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: oac-${{ matrix.target }}
+          path: ${{ steps.archive.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd artifacts
+          sha256sum *.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload archives to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euxo pipefail
+          VERSION="${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}"
+          VERSION="${VERSION#v}"
+          cd artifacts
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual run: create/overwrite a draft release for testing.
+            echo "Creating draft release for $VERSION"
+            gh release create "v${VERSION}" \
+              --draft \
+              --title "oac v${VERSION}" \
+              --generate-notes || true
+            gh release upload "v${VERSION}" *.zip SHA256SUMS --clobber || true
+            echo "Draft release created: v${VERSION}"
+          else
+            # Tag push: the release is auto-created from the tag; attach assets.
+            echo "Uploading assets to tag release v${VERSION}"
+            gh release upload "${GITHUB_REF_NAME}" *.zip SHA256SUMS --clobber
+          fi
