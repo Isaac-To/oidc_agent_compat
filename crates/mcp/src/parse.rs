@@ -10,8 +10,10 @@
 use serde_json::Value;
 
 use crate::errors::{McpError, Result};
-use crate::jsonrpc::{JsonRpcRequest, parse_request_body};
+use crate::jsonrpc::JsonRpcRequest;
 use crate::protocol::{METHOD_TOOLS_CALL, ToolCall, ToolCallParams};
+
+pub use crate::jsonrpc::parse_request_body;
 
 /// Length cap for the redacted argument preview stored in audit logs.
 pub const ARGS_PREVIEW_MAX_CHARS: usize = 512;

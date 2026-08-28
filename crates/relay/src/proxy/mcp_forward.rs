@@ -34,6 +34,28 @@ pub async fn mcp_handler(
     axum::extract::Path(server): axum::extract::Path<String>,
     request: axum::extract::Request,
 ) -> Response<Body> {
+    run_handler(state, &server, request).await
+}
+
+/// The relay MCP forward handler for `POST /mcp` — the combined hub endpoint.
+///
+/// This is the single endpoint a user points their agent at. The relay
+/// tunnels the JSON-RPC bytes to central `/mcp`; central fans out, enforces
+/// per-tool policy, and aggregates. The relay only records activity metadata.
+pub async fn mcp_hub_handler(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Response<Body> {
+    run_handler(state, "hub", request).await
+}
+
+/// Shared relay MCP tunnel: reads the body, records activity metadata, and
+/// forwards to central with the verified identity headers.
+async fn run_handler(
+    state: AppState,
+    server_label: &str,
+    request: axum::extract::Request,
+) -> Response<Body> {
     let start = std::time::Instant::now();
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = request.method().to_string();
@@ -60,7 +82,7 @@ pub async fn mcp_handler(
         }
     };
 
-    let (mcp_tool, mcp_method) = parse_mcp_meta(&body_bytes, &server);
+    let (mcp_tool, mcp_method) = parse_mcp_meta(&body_bytes, server_label);
 
     let result = forward_request(&state, &parts, body_bytes, identity.as_ref(), &request_id).await;
 
@@ -79,7 +101,7 @@ pub async fn mcp_handler(
             central_status,
             latency_ms,
             request_id: Some(request_id.clone()),
-            mcp_server: Some(server.clone()),
+            mcp_server: Some(server_label.to_string()),
             mcp_tool,
             mcp_method,
         };

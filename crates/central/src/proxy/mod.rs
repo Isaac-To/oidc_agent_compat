@@ -19,6 +19,7 @@ use std::sync::Arc;
 pub mod auth;
 pub mod forward;
 pub mod mcp_forward;
+pub mod mcp_hub;
 pub mod mcp_permissions;
 pub mod permissions;
 pub mod rate_limit;
@@ -109,14 +110,16 @@ pub fn router(state: AppState) -> Router {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .with_state(state.clone());
 
-    // MCP routes: a Streamable-HTTP endpoint per configured server. These
-    // use their own per-tool permissions middleware but the same auth
-    // middleware (validating relay-forwarded identity) and body limit.
+    // MCP routes: a Streamable-HTTP endpoint per configured server, plus the
+    // combined /mcp hub endpoint. Both use the same auth middleware and body
+    // limit. Per-tool enforcement runs on the per-server route via the mcp
+    // permissions middleware, and inline in the hub handler.
     let mcp_router = Router::new()
         .route(
             "/mcp/{server}",
             axum::routing::any(mcp_forward::mcp_handler),
         )
+        .route("/mcp", axum::routing::post(mcp_hub::mcp_hub_handler))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             mcp_permissions::mcp_permissions_middleware,

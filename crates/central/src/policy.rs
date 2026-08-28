@@ -527,7 +527,7 @@ impl PolicyStore {
     /// # Errors
     ///
     /// Returns [`Error::Database`] on query failure.
-    async fn resolve_mcp_allowed_tools(
+    pub async fn resolve_mcp_allowed_tools(
         &self,
         groups: &[String],
     ) -> Result<Option<HashSet<String>>> {

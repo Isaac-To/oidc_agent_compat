@@ -282,9 +282,12 @@ async fn is_method_allowed(
     }
 }
 
-/// Records an MCP audit entry for a denial (and reuse for allow in handler
-/// where convenient; the forward handler records the authoritative entry).
-async fn record_mcp_audit(
+/// Records an MCP audit entry from an [`McpGrant`].
+///
+/// Reused by the per-server middleware and the combined `/mcp` hub so every
+/// MCP request — allowed or denied — is logged with the same field mapping
+/// (`mcp_server`, `mcp_tool`, `mcp_method`, redacted args preview).
+pub(crate) async fn record_mcp_audit(
     state: &AppState,
     identity: &super::auth::VerifiedRelayIdentity,
     grant: &McpGrant,
