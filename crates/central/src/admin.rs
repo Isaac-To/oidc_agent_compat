@@ -35,6 +35,7 @@ use oidc_agent_common::error::{Error, Result};
 
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
+use crate::mcp::McpManager;
 use crate::policy::PolicyStore;
 use crate::provider::{ProviderKeyInfo, ProviderKeyUpdate, ProviderStore};
 use crate::usage::UsageTracker;
@@ -52,6 +53,8 @@ pub struct AdminState {
     pub audit: AuditLogger,
     /// The usage tracker (for querying usage and quotas).
     pub usage_tracker: UsageTracker,
+    /// The runtime MCP server registry.
+    pub mcp_manager: McpManager,
     /// The admin group name (from config). Users in this group may call
     /// the admin API.
     pub admin_group: String,
@@ -99,6 +102,22 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/admin/v1/providers/{id}/keys/{key_id}",
             get(get_key).put(update_key).delete(delete_key),
+        )
+        .route(
+            "/admin/v1/mcp/servers",
+            get(list_mcp_servers).post(upsert_mcp_server),
+        )
+        .route(
+            "/admin/v1/mcp/servers/{id}",
+            get(get_mcp_server)
+                .put(upsert_mcp_server)
+                .delete(delete_mcp_server),
+        )
+        .route(
+            "/admin/v1/mcp/policies/{group}",
+            get(get_mcp_policy)
+                .put(set_mcp_policy)
+                .delete(delete_mcp_policy),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -1273,6 +1292,233 @@ async fn record_admin_audit(
     }
 }
 
+/// Request body for creating/updating an MCP server.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct McpServerRequest {
+    /// Stable server identifier (required on create; `{id}` path on update).
+    #[serde(default)]
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Base URL of the MCP Streamable HTTP endpoint.
+    pub base_url: String,
+    /// Whether the server accepts traffic.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional `Header: value` pair to attach on every forwarded request
+    /// (e.g. `Authorization: Bearer <token>`). Stored encrypted at rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+}
+
+/// Response body for an MCP server (metadata only; never the auth header).
+#[derive(Debug, Serialize)]
+pub struct McpServerResponse {
+    /// Stable server identifier.
+    pub id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Base URL of the MCP Streamable HTTP endpoint.
+    pub base_url: String,
+    /// Whether the server accepts traffic.
+    pub enabled: bool,
+    /// Whether an auth header is configured for this server.
+    pub has_auth: bool,
+}
+
+impl From<crate::mcp::McpServerInfo> for McpServerResponse {
+    fn from(info: crate::mcp::McpServerInfo) -> Self {
+        Self {
+            id: info.id,
+            name: info.name,
+            base_url: info.base_url,
+            enabled: info.enabled,
+            has_auth: info.has_auth,
+        }
+    }
+}
+
+/// Request body for setting a group's MCP policy.
+#[derive(Debug, Deserialize, Serialize, Default)]
+pub struct McpPolicyRequest {
+    /// JSON array of allowed `"server:tool"` entries. `None` (omit) means all
+    /// tools are allowed; an empty array means no tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+/// Response body for a group's MCP policy.
+#[derive(Debug, Serialize)]
+pub struct McpPolicyResponse {
+    /// The group name.
+    pub group_name: String,
+    /// JSON array of allowed `"server:tool"` entries; `None` = all allowed.
+    pub allowed_tools: Option<Vec<String>>,
+}
+
+async fn list_mcp_servers(
+    State(state): State<AdminState>,
+) -> HandlerResult<axum::Json<Vec<McpServerResponse>>> {
+    let servers = state
+        .mcp_manager
+        .list_servers()
+        .await
+        .map_err(internal_error)?;
+    Ok(axum::Json(
+        servers.into_iter().map(McpServerResponse::from).collect(),
+    ))
+}
+
+async fn upsert_mcp_server(
+    State(state): State<AdminState>,
+    admin: AdminIdentity,
+    Path(id): Path<String>,
+    axum::Json(body): axum::Json<McpServerRequest>,
+) -> HandlerResult<axum::Json<McpServerResponse>> {
+    let actual_id = if body.id.is_empty() {
+        id
+    } else {
+        body.id.clone()
+    };
+    let input = crate::mcp::McpServerInput {
+        id: actual_id.clone(),
+        name: body.name,
+        base_url: body.base_url,
+        enabled: body.enabled,
+        auth_header: body.auth_header,
+    };
+    let server = state
+        .mcp_manager
+        .upsert_server(&input)
+        .await
+        .map_err(map_mcp_err)?;
+    record_admin_audit(
+        state.audit.db(),
+        &admin.subject,
+        "upsert_mcp_server",
+        &actual_id,
+        None,
+    )
+    .await;
+    Ok(axum::Json(McpServerResponse::from(server)))
+}
+
+async fn get_mcp_server(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> HandlerResult<axum::Json<McpServerResponse>> {
+    let server = state
+        .mcp_manager
+        .get_server(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("MCP server '{id}' not found"),
+            )
+        })?;
+    Ok(axum::Json(McpServerResponse::from(server)))
+}
+
+async fn delete_mcp_server(
+    State(state): State<AdminState>,
+    admin: AdminIdentity,
+    Path(id): Path<String>,
+) -> HandlerResult<axum::Json<serde_json::Value>> {
+    let deleted = state
+        .mcp_manager
+        .delete_server(&id)
+        .await
+        .map_err(internal_error)?;
+    record_admin_audit(
+        state.audit.db(),
+        &admin.subject,
+        "delete_mcp_server",
+        &id,
+        None,
+    )
+    .await;
+    Ok(axum::Json(serde_json::json!({ "deleted": deleted })))
+}
+
+async fn get_mcp_policy(
+    State(state): State<AdminState>,
+    Path(group): Path<String>,
+) -> HandlerResult<axum::Json<McpPolicyResponse>> {
+    let policy = state
+        .policy_store
+        .get_mcp_policy(&group)
+        .await
+        .map_err(internal_error)?;
+    // Preserve the allow-all (None) vs deny-all (empty `"[]"`) distinction
+    // when serializing back to the caller.
+    let allowed_tools = policy
+        .and_then(|p| p.allowed_tools)
+        .map(|s| serde_json::from_str::<Vec<String>>(s.as_str()).unwrap_or_default());
+    Ok(axum::Json(McpPolicyResponse {
+        group_name: group,
+        allowed_tools,
+    }))
+}
+
+async fn set_mcp_policy(
+    State(state): State<AdminState>,
+    admin: AdminIdentity,
+    Path(group): Path<String>,
+    axum::Json(body): axum::Json<McpPolicyRequest>,
+) -> HandlerResult<axum::Json<McpPolicyResponse>> {
+    state
+        .policy_store
+        .upsert_mcp_policy(&group, body.allowed_tools.as_deref())
+        .await
+        .map_err(internal_error)?;
+    record_admin_audit(
+        state.audit.db(),
+        &admin.subject,
+        "upsert_mcp_policy",
+        &group,
+        body.allowed_tools
+            .as_ref()
+            .map(|t| serde_json::to_string(t).unwrap_or_default())
+            .as_deref(),
+    )
+    .await;
+    Ok(axum::Json(McpPolicyResponse {
+        group_name: group,
+        allowed_tools: body.allowed_tools,
+    }))
+}
+
+async fn delete_mcp_policy(
+    State(state): State<AdminState>,
+    admin: AdminIdentity,
+    Path(group): Path<String>,
+) -> HandlerResult<axum::Json<serde_json::Value>> {
+    let deleted = state
+        .policy_store
+        .delete_mcp_policy(&group)
+        .await
+        .map_err(internal_error)?;
+    record_admin_audit(
+        state.audit.db(),
+        &admin.subject,
+        "delete_mcp_policy",
+        &group,
+        None,
+    )
+    .await;
+    Ok(axum::Json(serde_json::json!({ "deleted": deleted })))
+}
+
+/// Maps MCP config/database errors to the appropriate admin HTTP status.
+fn map_mcp_err(e: oidc_agent_common::error::Error) -> (StatusCode, String) {
+    match &e {
+        oidc_agent_common::error::Error::Config(msg) => (StatusCode::BAD_REQUEST, msg.to_string()),
+        _ => internal_error(e),
+    }
+}
+
 /// Validates the admin config at startup. Currently a no-op since the
 /// config is simple (just a group name), but reserved for future
 /// validation logic.
@@ -1295,12 +1541,14 @@ mod tests {
     async fn setup_test_state() -> AdminState {
         let url = oidc_agent_common::persistence::temp_sqlite_url("admin");
         let db = crate::db::setup(&url).await.expect("db setup");
+        let mcp_db = db.clone();
         AdminState {
             policy_store: PolicyStore::new(db.clone()),
             provider_store: ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32])),
             device_store: DeviceStore::new(db.clone()),
             audit: AuditLogger::new(db.clone()),
             usage_tracker: UsageTracker::new(db),
+            mcp_manager: McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
             admin_group: "oac-admins".into(),
         }
     }
@@ -1574,6 +1822,10 @@ mod tests {
                     tokens_saved: None,
                     messages_dropped: None,
                     saver_reasons: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    mcp_method: None,
+                    mcp_args_preview: None,
                 })
                 .await
                 .expect("record audit entry");
@@ -2123,6 +2375,10 @@ mod tests {
                     tokens_saved: None,
                     messages_dropped: None,
                     saver_reasons: None,
+                    mcp_server: None,
+                    mcp_tool: None,
+                    mcp_method: None,
+                    mcp_args_preview: None,
                 })
                 .await
                 .expect("record");
@@ -2212,6 +2468,10 @@ mod tests {
                     tokens_saved: Some(saved),
                     messages_dropped: Some(dropped),
                     saver_reasons: Some(r#"["dedup"]"#.into()),
+                    mcp_server: None,
+                    mcp_tool: None,
+                    mcp_method: None,
+                    mcp_args_preview: None,
                 })
                 .await
                 .expect("record");
@@ -2242,6 +2502,10 @@ mod tests {
                 tokens_saved: Some(10),
                 messages_dropped: Some(0),
                 saver_reasons: None,
+                mcp_server: None,
+                mcp_tool: None,
+                mcp_method: None,
+                mcp_args_preview: None,
             })
             .await
             .expect("record");
@@ -2271,6 +2535,10 @@ mod tests {
                 tokens_saved: Some(5),
                 messages_dropped: Some(0),
                 saver_reasons: None,
+                mcp_server: None,
+                mcp_tool: None,
+                mcp_method: None,
+                mcp_args_preview: None,
             })
             .await
             .expect("record");
@@ -2300,6 +2568,10 @@ mod tests {
                 tokens_saved: Some(0),
                 messages_dropped: Some(0),
                 saver_reasons: None,
+                mcp_server: None,
+                mcp_tool: None,
+                mcp_method: None,
+                mcp_args_preview: None,
             })
             .await
             .expect("record");

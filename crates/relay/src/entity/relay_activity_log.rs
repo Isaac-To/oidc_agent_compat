@@ -26,6 +26,12 @@ pub struct Model {
     pub latency_ms: i64,
     /// The request ID for end-to-end correlation with the central audit log.
     pub request_id: Option<String>,
+    /// The MCP server id (for MCP traffic).
+    pub mcp_server: Option<String>,
+    /// The MCP tool name (for `tools/call`; otherwise empty).
+    pub mcp_tool: Option<String>,
+    /// The MCP JSON-RPC method (e.g. `tools/call`, `initialize`).
+    pub mcp_method: Option<String>,
     /// When the request was made.
     pub created_at: TimeDateTime,
 }

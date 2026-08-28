@@ -123,6 +123,9 @@ pub async fn proxy_handler(
             central_status,
             latency_ms,
             request_id: Some(request_id.clone()),
+            mcp_server: None,
+            mcp_tool: None,
+            mcp_method: None,
         };
         if let Err(e) = state.activity.record(&entry).await {
             tracing::error!(error = %e, request_id = %request_id, "failed to write relay activity log");

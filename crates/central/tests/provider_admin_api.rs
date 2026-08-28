@@ -26,12 +26,14 @@ async fn setup_router() -> (axum::Router, ProviderStore) {
     let db = oac_central::db::setup(&url).await.expect("db setup");
     let audit = AuditLogger::new(db.clone());
     let provider_store = ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32]));
+    let mcp_db = db.clone();
     let state = AdminState {
         policy_store: PolicyStore::new(db.clone()),
         provider_store: provider_store.clone(),
         device_store: DeviceStore::new(db.clone()),
         audit,
         usage_tracker: UsageTracker::new(db),
+        mcp_manager: oac_central::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
         admin_group: "oac-admins".into(),
     };
     (admin::router(state), provider_store)

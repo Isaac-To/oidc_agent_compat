@@ -57,6 +57,14 @@ pub struct Model {
     pub messages_dropped: Option<i64>,
     /// Human-readable reason tags for what the saver did, as JSON.
     pub saver_reasons: Option<String>,
+    /// The MCP server id (for MCP traffic).
+    pub mcp_server: Option<String>,
+    /// The MCP tool name (for `tools/call`; otherwise empty).
+    pub mcp_tool: Option<String>,
+    /// The MCP JSON-RPC method (e.g. `tools/call`, `initialize`).
+    pub mcp_method: Option<String>,
+    /// A redacted, length-capped preview of the MCP tool arguments.
+    pub mcp_args_preview: Option<String>,
 }
 
 /// Relations (none for v1).

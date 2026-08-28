@@ -18,11 +18,12 @@ Agent (Codex, Goose, etc.)
 
 | Component | Where it runs | Role |
 |---|---|---|
-| Agent | Employee laptop | Sends OpenAI-compatible API requests to `127.0.0.1:8787/v1` |
-| Relay (`oac-relay`) | Employee laptop | Authenticates employee via OIDC, mints local key, forwards over mTLS |
-| Central proxy (`oac-central`) | Company-hosted server | Manages encrypted provider keys, enforces policies and quotas, forwards to backend |
+| Agent | Employee laptop | Sends OpenAI-compatible API requests to `127.0.0.1:8787/v1` or MCP JSON-RPC to `127.0.0.1:8787/mcp/{server}` |
+| Relay (`oac-relay`) | Employee laptop | Authenticates employee via OIDC, mints local key, forwards over mTLS (OpenAI and MCP traffic) |
+| Central proxy (`oac-central`) | Company-hosted server | Manages encrypted provider keys, enforces policies and quotas, forwards to backend; enforces per-tool MCP policies and forwards MCP JSON-RPC to centrally-hosted MCP servers |
 | IdP | Company infrastructure | Authenticates employees via OIDC auth-code + PKCE |
 | Backend | External | OpenAI-compatible API called with a selected provider key |
+| MCP servers | Company/centrally-hosted | Exposed tools called by agents through central (per-server, per-tool policy) |
 
 ## Trust boundaries
 
@@ -30,6 +31,8 @@ Agent (Codex, Goose, etc.)
 2. **Relay → central proxy** (mTLS over network — medium trust).
 3. **Central proxy → backend** (HTTPS — external, low trust).
 4. **Relay/central → IdP** (OIDC — external, low trust).
+5. **Central proxy → MCP servers** (HTTPS — external, medium trust) — policy
+   enforcement happens on central before this hop.
 
 ## Assets
 

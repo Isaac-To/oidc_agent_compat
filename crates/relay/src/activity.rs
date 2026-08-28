@@ -40,6 +40,12 @@ pub struct RelayActivityEntry {
     pub latency_ms: i64,
     /// The request ID for end-to-end correlation.
     pub request_id: Option<String>,
+    /// The MCP server id (for MCP traffic).
+    pub mcp_server: Option<String>,
+    /// The MCP tool name (for `tools/call`; otherwise empty).
+    pub mcp_tool: Option<String>,
+    /// The MCP JSON-RPC method (e.g. `tools/call`, `initialize`).
+    pub mcp_method: Option<String>,
 }
 
 /// The relay activity logger, backed by the relay's database.
@@ -84,11 +90,26 @@ impl ActivityLogger {
             .as_ref()
             .map(|v| Value::String(Some(Box::new(v.clone()))))
             .unwrap_or(Value::String(None));
+        let mcp_server_value = entry
+            .mcp_server
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let mcp_tool_value = entry
+            .mcp_tool
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let mcp_method_value = entry
+            .mcp_method
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
 
         let sql = "INSERT INTO relay_activity_log \
              (id, identity_id, key_id, method, endpoint, model, central_status, \
-             latency_ms, request_id, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+             latency_ms, request_id, mcp_server, mcp_tool, mcp_method, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)";
 
         self.db
             .execute(Statement::from_sql_and_values(
@@ -104,6 +125,9 @@ impl ActivityLogger {
                     central_status_value,
                     Value::BigInt(Some(entry.latency_ms)),
                     request_id_value,
+                    mcp_server_value,
+                    mcp_tool_value,
+                    mcp_method_value,
                     now_str.into(),
                 ],
             ))
@@ -157,6 +181,9 @@ mod tests {
             central_status: Some(200),
             latency_ms: 150,
             request_id: Some("req-789".into()),
+            mcp_server: Some("github".into()),
+            mcp_tool: Some("list_files".into()),
+            mcp_method: Some("tools/call".into()),
         };
         logger.record(&entry).await.expect("record");
 
@@ -189,6 +216,9 @@ mod tests {
             central_status: None,
             latency_ms: 0,
             request_id: None,
+            mcp_server: None,
+            mcp_tool: None,
+            mcp_method: None,
         };
         logger.record(&entry).await.expect("record");
 
@@ -216,6 +246,9 @@ mod tests {
             central_status: Some(200),
             latency_ms: 10,
             request_id: Some("req'; --".into()),
+            mcp_server: None,
+            mcp_tool: None,
+            mcp_method: None,
         };
         logger.record(&entry).await.expect("record");
 

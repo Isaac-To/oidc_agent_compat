@@ -1737,6 +1737,7 @@ dependencies = [
  "clap",
  "futures",
  "hkdf",
+ "oac-mcp",
  "oidc-agent-common",
  "openidconnect",
  "rand 0.8.7",
@@ -1779,6 +1780,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "oac-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "oac-relay"
 version = "0.1.0"
 dependencies = [
@@ -1789,6 +1800,7 @@ dependencies = [
  "bytes",
  "clap",
  "keyring",
+ "oac-mcp",
  "oidc-agent-common",
  "openidconnect",
  "rand 0.8.7",

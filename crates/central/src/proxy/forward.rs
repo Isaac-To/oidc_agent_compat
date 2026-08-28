@@ -299,6 +299,11 @@ async fn record_request_outcome(context: &AccountingContext, usage: TokenUsage, 
             }
             serde_json::to_string(&reasons).unwrap_or_default()
         }),
+        // MCP fields are not populated on the OpenAI path.
+        mcp_server: None,
+        mcp_tool: None,
+        mcp_method: None,
+        mcp_args_preview: None,
     };
     if let Err(e) = context.state.audit.record(&entry).await {
         tracing::error!(error = %e, "failed to write audit log");

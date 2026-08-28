@@ -179,6 +179,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migration0006TokenSaver),
             Box::new(Migration0007CollapseRepeatedLines),
             Box::new(Migration0008StripAnsi),
+            Box::new(Migration0009Mcp),
         ]
     }
 }
@@ -215,7 +216,174 @@ impl MigrationTrait for Migration0008StripAnsi {
     }
 }
 
-/// Migration 0002: enrich the `audit_log` table with identity, groups,
+/// Migration 0009: MCP relay support.
+///
+/// Creates:
+/// - `mcp_servers`: centrally-configured MCP server endpoints. Optional
+///   auth headers are stored as AES-256-GCM `ciphertext`/`nonce` (encrypted
+///   at rest with the MEK), never as plaintext.
+/// - `mcp_server_policies`: per-group, per-server, per-tool allowlists.
+///   `allowed_tools` is a JSON array of `"server:tool"` entries; `NULL`
+///   means all tools are allowed.
+///
+/// Enriches `audit_log` with MCP-specific columns (all nullable, so existing
+/// rows remain valid):
+/// - `mcp_server`: the MCP server endpoint id.
+/// - `mcp_tool`: the tool name (or the MCP method for non-`tools/call`
+///   requests).
+/// - `mcp_method`: the JSON-RPC method.
+/// - `mcp_args_preview`: a redacted, length-capped preview of tool arguments.
+pub struct Migration0009Mcp;
+
+impl MigrationName for Migration0009Mcp {
+    fn name(&self) -> &str {
+        "m000009_mcp"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0009Mcp {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_table(
+                Table::create()
+                    .table(McpServer::Table)
+                    .col(
+                        ColumnDef::new(McpServer::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(McpServer::Name).string().not_null())
+                    .col(ColumnDef::new(McpServer::BaseUrl).string().not_null())
+                    .col(
+                        ColumnDef::new(McpServer::Enabled)
+                            .boolean()
+                            .not_null()
+                            .default(true),
+                    )
+                    .col(ColumnDef::new(McpServer::AuthCiphertext).blob().not_null())
+                    .col(ColumnDef::new(McpServer::AuthNonce).blob().not_null())
+                    .col(
+                        ColumnDef::new(McpServer::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(McpServer::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        manager
+            .create_table(
+                Table::create()
+                    .table(McpServerPolicy::Table)
+                    .col(
+                        ColumnDef::new(McpServerPolicy::Id)
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(McpServerPolicy::GroupName)
+                            .string()
+                            .not_null()
+                            .unique_key(),
+                    )
+                    .col(
+                        ColumnDef::new(McpServerPolicy::AllowedTools)
+                            .string()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(McpServerPolicy::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(McpServerPolicy::UpdatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+
+        // Enrich audit_log with MCP-specific columns.
+        for (col, ty) in [
+            ("mcp_server", "TEXT"),
+            ("mcp_tool", "TEXT"),
+            ("mcp_method", "TEXT"),
+            ("mcp_args_preview", "TEXT"),
+        ] {
+            manager
+                .get_connection()
+                .execute_unprepared(&format!("ALTER TABLE audit_log ADD COLUMN {col} {ty};"))
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(McpServerPolicy::Table).to_owned())
+            .await?;
+        manager
+            .drop_table(Table::drop().table(McpServer::Table).to_owned())
+            .await?;
+        // Audit-log columns are ALTERed and not dropped on down (SQLite
+        // limitation, consistent with migrations 0002/0006); the tables are
+        // dropped on down so the schema round-trips.
+        Ok(())
+    }
+}
+
+/// Iden for the `mcp_servers` table.
+#[derive(Iden)]
+pub enum McpServer {
+    /// The table.
+    #[iden = "mcp_servers"]
+    Table,
+    /// Primary key (short stable id).
+    Id,
+    /// Human-readable name.
+    Name,
+    /// Base URL of the Streamable HTTP endpoint.
+    BaseUrl,
+    /// Whether the server accepts traffic.
+    Enabled,
+    /// AES-256-GCM ciphertext of the optional auth header.
+    AuthCiphertext,
+    /// 12-byte GCM nonce.
+    AuthNonce,
+    /// Creation timestamp.
+    CreatedAt,
+    /// Last-update timestamp.
+    UpdatedAt,
+}
+
+/// Iden for the `mcp_server_policies` table.
+#[derive(Iden)]
+pub enum McpServerPolicy {
+    /// The table.
+    #[iden = "mcp_server_policies"]
+    Table,
+    /// Primary key (UUID).
+    Id,
+    /// The group name (unique).
+    GroupName,
+    /// JSON array of allowed `"server:tool"` entries (NULL = all allowed).
+    AllowedTools,
+    /// Creation timestamp.
+    CreatedAt,
+    /// Last-update timestamp.
+    UpdatedAt,
+}
 /// endpoint, request-id, permission-decision, and cost columns.
 ///
 /// These columns support the permissions and user-activity-logging feature.
@@ -936,6 +1104,7 @@ mod tests {
                 "m000006_token_saver",
                 "m000007_collapse_repeated_lines",
                 "m000008_strip_ansi",
+                "m000009_mcp",
             ],
             "migration order is part of the schema contract"
         );

@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod forward;
 pub mod host_guard;
+pub mod mcp_forward;
 
 use std::net::SocketAddr;
 
@@ -68,6 +69,14 @@ pub fn router(state: AppState) -> Router {
             "/v1/embeddings",
             axum::routing::post(forward::proxy_handler),
         )
+        // MCP Streamable-HTTP endpoint(s). /mcp/{server} tunnels to a single
+        // configured server; /mcp is the combined hub endpoint. Any method
+        // is accepted and tunnelled to central, which routes/aggregates.
+        .route(
+            "/mcp/{server}",
+            axum::routing::any(mcp_forward::mcp_handler),
+        )
+        .route("/mcp", axum::routing::any(mcp_forward::mcp_hub_handler))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,

@@ -219,6 +219,80 @@ not made a request today, the groups are unknown and both quotas are `null`.
 
 ---
 
+### MCP servers
+
+MCP (Model Context Protocol) servers are runtime-managed, like providers.
+No MCP server URL or auth header is stored in the central TOML configuration.
+
+#### `GET /admin/v1/mcp/servers`
+
+List configured MCP servers. Response bodies contain metadata only — never
+any auth header.
+
+#### `POST /admin/v1/mcp/servers`
+
+Create or update an MCP server.
+
+```json
+{
+  "id": "github",
+  "name": "GitHub",
+  "base_url": "https://mcp.example.com/mcp",
+  "enabled": true,
+  "auth_header": "Authorization: Bearer <token>"
+}
+```
+
+`auth_header` is optional. When present it is attached to every request that
+central forwards to this server and is **encrypted at rest** (AES-256-GCM)
+with the master encryption key. It is never returned by any API and never
+logged.
+
+> **Naming constraint:** a server `id` must not contain `__` (double
+> underscore). The hub reserves `__` as the separator between a server id
+> and a tool name (`github__list_files`).
+
+#### `GET|PUT|DELETE /admin/v1/mcp/servers/{id}`
+
+Get, update, or delete an MCP server. `PUT` matches the `POST` body except
+`id` is taken from the path. Deleting a server removes it from the registry;
+existing per-group policies that reference it become inert.
+
+### MCP policies
+
+MCP policies grant a group permission to call specific tools on specific
+MCP servers. Policy entries are written as **`"server:tool"`** (colon form).
+When a user's agent uses the combined `/mcp` hub, the same tool is exposed
+with a **`server__tool`** prefix; an admin's policy key and the agent's tool
+name refer to the same pair.
+
+#### `GET /admin/v1/mcp/policies/{group}`
+
+Get a group's MCP policy.
+
+**Response body:**
+```json
+{ "group_name": "engineering", "allowed_tools": ["github:list_files"] }
+```
+
+`allowed_tools: null` means **all tools allowed** on all configured servers.
+`allowed_tools: []` means **no tools allowed**.
+
+#### `PUT /admin/v1/mcp/policies/{group}`
+
+Set (replace) a group's MCP policy.
+
+```json
+{ "allowed_tools": ["fs:read_file"] }
+```
+
+#### `DELETE /admin/v1/mcp/policies/{group}`
+
+Delete the group's policy. A group with no policy and no allow-all policy on
+a relevant group **cannot call any tools** (tools are deny-by-default).
+
+---
+
 ## Response shapes
 
 ### `GroupPolicyResponse`

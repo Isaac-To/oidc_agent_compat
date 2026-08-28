@@ -63,6 +63,14 @@ pub struct AuditEntry {
     pub messages_dropped: Option<i64>,
     /// Human-readable reason tags for what the saver did, as JSON.
     pub saver_reasons: Option<String>,
+    /// The MCP server id (for MCP traffic).
+    pub mcp_server: Option<String>,
+    /// The MCP tool name (for `tools/call`; otherwise empty).
+    pub mcp_tool: Option<String>,
+    /// The MCP JSON-RPC method (e.g. `tools/call`, `initialize`).
+    pub mcp_method: Option<String>,
+    /// A redacted, length-capped preview of the MCP tool arguments.
+    pub mcp_args_preview: Option<String>,
 }
 
 /// The audit logger, backed by the central proxy's database.
@@ -166,15 +174,37 @@ impl AuditLogger {
             .as_ref()
             .map(|v| Value::String(Some(Box::new(v.clone()))))
             .unwrap_or(Value::String(None));
+        let mcp_server_value = entry
+            .mcp_server
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let mcp_tool_value = entry
+            .mcp_tool
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let mcp_method_value = entry
+            .mcp_method
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
+        let mcp_args_preview_value = entry
+            .mcp_args_preview
+            .as_ref()
+            .map(|v| Value::String(Some(Box::new(v.clone()))))
+            .unwrap_or(Value::String(None));
 
         let sql = "INSERT INTO audit_log \
              (id, device_id, user_subject, model, backend, status, latency_ms, stream, \
              prompt_tokens, completion_tokens, total_tokens, created_at, \
              identity_id, email, groups, endpoint, request_id, \
              permission_decision, denial_reason, cost_usd, \
-             token_saver_applied, tokens_saved, messages_dropped, saver_reasons) \
+             token_saver_applied, tokens_saved, messages_dropped, saver_reasons, \
+             mcp_server, mcp_tool, mcp_method, mcp_args_preview) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-             $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)";
+             $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, \
+             $25, $26, $27, $28)";
 
         self.db
             .execute(Statement::from_sql_and_values(
@@ -205,6 +235,10 @@ impl AuditLogger {
                     tokens_saved_value,
                     messages_dropped_value,
                     saver_reasons_value,
+                    mcp_server_value,
+                    mcp_tool_value,
+                    mcp_method_value,
+                    mcp_args_preview_value,
                 ],
             ))
             .await
@@ -250,6 +284,10 @@ mod tests {
             tokens_saved: Some(42),
             messages_dropped: Some(3),
             saver_reasons: Some(r#"["dedup"]"#.into()),
+            mcp_server: Some("github".into()),
+            mcp_tool: Some("list_files".into()),
+            mcp_method: Some("tools/call".into()),
+            mcp_args_preview: Some(r#"{"path":"/x"}"#.into()),
         };
         logger.record(&entry).await.expect("record");
 
@@ -302,6 +340,10 @@ mod tests {
             tokens_saved: None,
             messages_dropped: None,
             saver_reasons: None,
+            mcp_server: None,
+            mcp_tool: None,
+            mcp_method: None,
+            mcp_args_preview: None,
         };
         logger.record(&entry).await.expect("record");
 
@@ -343,6 +385,10 @@ mod tests {
             tokens_saved: None,
             messages_dropped: None,
             saver_reasons: None,
+            mcp_server: None,
+            mcp_tool: None,
+            mcp_method: None,
+            mcp_args_preview: None,
         };
         logger.record(&entry).await.expect("record");
 

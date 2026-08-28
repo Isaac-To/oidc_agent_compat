@@ -18,6 +18,9 @@ use std::sync::Arc;
 
 pub mod auth;
 pub mod forward;
+pub mod mcp_forward;
+pub mod mcp_hub;
+pub mod mcp_permissions;
 pub mod permissions;
 pub mod rate_limit;
 
@@ -53,6 +56,8 @@ pub struct AppState {
     pub usage_tracker: UsageTracker,
     /// The pricing table (for cost tracking; empty if no pricing configured).
     pub price_table: PriceTable,
+    /// The runtime MCP server registry.
+    pub mcp_manager: crate::mcp::McpManager,
 }
 
 impl AppState {
@@ -105,6 +110,28 @@ pub fn router(state: AppState) -> Router {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .with_state(state.clone());
 
+    // MCP routes: a Streamable-HTTP endpoint per configured server, plus the
+    // combined /mcp hub endpoint. Both use the same auth middleware and body
+    // limit. Per-tool enforcement runs on the per-server route via the mcp
+    // permissions middleware, and inline in the hub handler.
+    let mcp_router = Router::new()
+        .route(
+            "/mcp/{server}",
+            axum::routing::any(mcp_forward::mcp_handler),
+        )
+        .route("/mcp", axum::routing::post(mcp_hub::mcp_hub_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            mcp_permissions::mcp_permissions_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .with_state(state.clone());
+    proxy_router = proxy_router.merge(mcp_router);
+
     // Merge the admin API router if an admin config is present.
     if let Some(admin_group) = state.admin_group() {
         let admin_state = crate::admin::AdminState {
@@ -113,6 +140,7 @@ pub fn router(state: AppState) -> Router {
             device_store: state.device_store.clone(),
             audit: state.audit.clone(),
             usage_tracker: state.usage_tracker.clone(),
+            mcp_manager: state.mcp_manager.clone(),
             admin_group: admin_group.to_string(),
         };
         proxy_router = proxy_router.merge(crate::admin::router(admin_state));
@@ -149,7 +177,8 @@ pub async fn serve(
     };
     let policy_store = PolicyStore::new(audit.db().clone());
     let device_store = DeviceStore::new(audit.db().clone());
-    let provider_store = ProviderStore::new(audit.db().clone(), encryption_key);
+    let provider_store = ProviderStore::new(audit.db().clone(), encryption_key.clone());
+    let mcp_manager = crate::mcp::McpManager::new(audit.db().clone(), encryption_key);
     let usage_tracker = UsageTracker::new(audit.db().clone());
     let price_table = config
         .pricing
@@ -189,6 +218,7 @@ pub async fn serve(
         device_store,
         usage_tracker,
         price_table,
+        mcp_manager,
     };
     let app = router(state);
 
@@ -252,6 +282,7 @@ mod tests {
         let url = oidc_agent_common::persistence::temp_sqlite_url("proxy-mod");
         let db = crate::db::setup(&url).await.expect("db setup");
         let audit = AuditLogger::new(db.clone());
+        let mcp_db = db.clone();
         AppState {
             config: CentralConfig {
                 listen_addr: "127.0.0.1:0".parse().expect("addr"),
@@ -282,6 +313,7 @@ mod tests {
             device_store: DeviceStore::new(db.clone()),
             usage_tracker: UsageTracker::new(db),
             price_table: crate::pricing::PriceTable::empty(),
+            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
         }
     }
 

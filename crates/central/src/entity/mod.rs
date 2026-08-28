@@ -4,6 +4,8 @@ pub mod admin_audit_log;
 pub mod audit_log;
 pub mod device;
 pub mod group_policy;
+pub mod mcp_server;
+pub mod mcp_server_policy;
 pub mod provider;
 pub mod provider_key;
 pub mod provider_key_access;

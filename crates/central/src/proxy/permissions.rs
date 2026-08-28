@@ -311,6 +311,10 @@ async fn deny(
         tokens_saved: None,
         messages_dropped: None,
         saver_reasons: None,
+        mcp_server: None,
+        mcp_tool: None,
+        mcp_method: None,
+        mcp_args_preview: None,
     };
     if let Err(e) = state.audit.record(&entry).await {
         tracing::error!(error = %e, "failed to write denied audit entry");
@@ -347,6 +351,7 @@ mod tests {
         let url = oidc_agent_common::persistence::temp_sqlite_url("perms");
         let db = crate::db::setup(&url).await.expect("db setup");
         let audit = crate::audit::AuditLogger::new(db.clone());
+        let mcp_db = db.clone();
         AppState {
             config: oidc_agent_common::config::CentralConfig {
                 listen_addr: "127.0.0.1:0".parse().expect("addr"),
@@ -377,6 +382,7 @@ mod tests {
             device_store: crate::device_store::DeviceStore::new(db.clone()),
             usage_tracker: UsageTracker::new(db),
             price_table: crate::pricing::PriceTable::empty(),
+            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
         }
     }
 
