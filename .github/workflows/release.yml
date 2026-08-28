@@ -154,7 +154,17 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    # gh release needs a git work tree to resolve the repo (and full history
+    # for --generate-notes). Checkout with fetch-depth: 0 for that.
+    defaults:
+      run:
+        shell: bash
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download all archives
         uses: actions/download-artifact@v4
         with:
@@ -162,7 +172,6 @@ jobs:
           merge-multiple: true
 
       - name: Generate SHA256 checksums
-        shell: bash
         run: |
           set -euxo pipefail
           cd artifacts
@@ -184,8 +193,8 @@ jobs:
             gh release create "v${VERSION}" \
               --draft \
               --title "oac v${VERSION}" \
-              --generate-notes || true
-            gh release upload "v${VERSION}" *.zip SHA256SUMS --clobber || true
+              --generate-notes
+            gh release upload "v${VERSION}" *.zip SHA256SUMS --clobber
             echo "Draft release created: v${VERSION}"
           else
             # Tag push: the release is auto-created from the tag; attach assets.
