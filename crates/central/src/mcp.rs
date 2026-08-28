@@ -470,7 +470,10 @@ mod tests {
             enabled: true,
             auth_header: None,
         };
-        assert!(input.validate().is_err(), "'__' collides with the hub separator");
+        assert!(
+            input.validate().is_err(),
+            "'__' collides with the hub separator"
+        );
     }
 
     #[tokio::test]

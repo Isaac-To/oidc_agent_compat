@@ -76,10 +76,7 @@ pub fn router(state: AppState) -> Router {
             "/mcp/{server}",
             axum::routing::any(mcp_forward::mcp_handler),
         )
-        .route(
-            "/mcp",
-            axum::routing::any(mcp_forward::mcp_hub_handler),
-        )
+        .route("/mcp", axum::routing::any(mcp_forward::mcp_hub_handler))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,

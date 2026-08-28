@@ -1208,7 +1208,10 @@ mod tests {
     async fn mcp_allowed_servers_derives_from_entries() {
         let store = setup_test_db().await;
         store
-            .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string(), "gh:list".to_string()]))
+            .upsert_mcp_policy(
+                "eng",
+                Some(&["fs:read_file".to_string(), "gh:list".to_string()]),
+            )
             .await
             .expect("policy");
         let servers = store
@@ -1224,10 +1227,7 @@ mod tests {
     #[tokio::test]
     async fn mcp_allowed_servers_none_when_allow_all() {
         let store = setup_test_db().await;
-        store
-            .upsert_mcp_policy("eng", None)
-            .await
-            .expect("policy");
+        store.upsert_mcp_policy("eng", None).await.expect("policy");
         assert!(
             store
                 .resolve_mcp_allowed_servers(&["eng".into()])
