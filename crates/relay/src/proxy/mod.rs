@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod forward;
 pub mod host_guard;
+pub mod mcp_forward;
 
 use std::net::SocketAddr;
 
@@ -67,6 +68,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/embeddings",
             axum::routing::post(forward::proxy_handler),
+        )
+        // MCP Streamable-HTTP endpoint. Any method is accepted and tunnelled
+        // to central, which routes by server id. The relay does not inspect
+        // the JSON-RPC beyond best-effort activity metadata.
+        .route(
+            "/mcp/{server}",
+            axum::routing::any(mcp_forward::mcp_handler),
         )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

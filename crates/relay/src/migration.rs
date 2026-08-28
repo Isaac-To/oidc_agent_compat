@@ -138,6 +138,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migration),
             Box::new(Migration0002RelayActivityLog),
             Box::new(Migration0003ApiKeyExpiry),
+            Box::new(Migration0004McpActivity),
         ]
     }
 }
@@ -302,6 +303,42 @@ pub enum RelayActivityLog {
     CreatedAt,
 }
 
+/// Migration 0004: add MCP activity columns to `relay_activity_log`.
+///
+/// MCP requests are log-stamped on the relay with the MCP server, method,
+/// and tool so relay-side activity correlates with central MCP audit rows.
+/// All new columns are nullable so existing rows remain valid.
+pub struct Migration0004McpActivity;
+
+impl MigrationName for Migration0004McpActivity {
+    fn name(&self) -> &str {
+        "m000004_mcp_activity"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0004McpActivity {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (col, ty) in [
+            ("mcp_server", "TEXT"),
+            ("mcp_tool", "TEXT"),
+            ("mcp_method", "TEXT"),
+        ] {
+            manager
+                .get_connection()
+                .execute_unprepared(&format!("ALTER TABLE relay_activity_log ADD COLUMN {col} {ty};"))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // SQLite ALTERed columns are not dropped; forward-only in practice.
+        let _ = manager;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +414,7 @@ mod tests {
                 "m000001_initial_schema",
                 "m000002_relay_activity_log",
                 "m000003_api_key_expiry",
+                "m000004_mcp_activity",
             ],
             "migration order is part of the schema contract"
         );

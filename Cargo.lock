@@ -1800,6 +1800,7 @@ dependencies = [
  "bytes",
  "clap",
  "keyring",
+ "oac-mcp",
  "oidc-agent-common",
  "openidconnect",
  "rand 0.8.7",
