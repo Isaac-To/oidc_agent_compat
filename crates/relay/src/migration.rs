@@ -301,3 +301,84 @@ pub enum RelayActivityLog {
     /// Creation timestamp.
     CreatedAt,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm_migration::MigratorTrait;
+
+    /// The relay schema must survive a full down → up cycle (operators
+    /// resetting a laptop database rely on this), and every `down`
+    /// implementation is exercised here.
+    #[tokio::test]
+    async fn migrations_round_trip_down_then_up() {
+        let url = oidc_agent_common::persistence::temp_sqlite_url("relay-mig");
+        let db = sea_orm::Database::connect(&url).await.expect("connect");
+
+        Migrator::up(&db, None).await.expect("up");
+
+        // The schema accepts writes (including the 0003 expires_at column).
+        {
+            use sea_orm::ConnectionTrait;
+            db.execute_unprepared(
+                "INSERT INTO identities (id, issuer, subject, created_at) \
+                 VALUES ('i1', 'https://idp', 'u', '2026-01-01 00:00:00')",
+            )
+            .await
+            .expect("insert identity");
+            db.execute_unprepared(
+                "INSERT INTO api_keys (id, identity_id, key_hash, label, created_at, expires_at) \
+                 VALUES ('k1', 'i1', x'00', 'test', '2026-01-01 00:00:00', NULL)",
+            )
+            .await
+            .expect("insert key with expires_at");
+        }
+
+        Migrator::down(&db, None).await.expect("down");
+        {
+            use sea_orm::ConnectionTrait;
+            let tables: Vec<String> = db
+                .query_all(sea_orm::Statement::from_string(
+                    db.get_database_backend(),
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%seaql%'"
+                        .to_string(),
+                ))
+                .await
+                .expect("list tables")
+                .iter()
+                .map(|row| row.try_get("", "name").unwrap_or_default())
+                .collect();
+            assert!(
+                tables.is_empty(),
+                "down must drop all tables, still present: {tables:?}"
+            );
+        }
+
+        Migrator::up(&db, None).await.expect("up again");
+        {
+            use sea_orm::ConnectionTrait;
+            db.execute_unprepared(
+                "INSERT INTO identities (id, issuer, subject, created_at) \
+                 VALUES ('i2', 'https://idp', 'u2', '2026-01-02 00:00:00')",
+            )
+            .await
+            .expect("insert after round trip");
+        }
+    }
+
+    /// The migrator must register every migration exactly once, in order.
+    #[test]
+    fn migrator_lists_all_migrations_in_order() {
+        let migrations = Migrator::migrations();
+        let names: Vec<String> = migrations.iter().map(|m| m.name().to_string()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "m000001_initial_schema",
+                "m000002_relay_activity_log",
+                "m000003_api_key_expiry",
+            ],
+            "migration order is part of the schema contract"
+        );
+    }
+}

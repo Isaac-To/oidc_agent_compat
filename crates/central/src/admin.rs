@@ -1333,6 +1333,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_getters_yield_usable_connections() {
+        // The admin endpoints share one DB; the getters are the seam the
+        // handlers use, so pin that they return working connections.
+        let url = oidc_agent_common::persistence::temp_sqlite_url("admin-getters");
+        let db = crate::db::setup(&url).await.expect("db setup");
+        let usage_tracker = UsageTracker::new(db.clone());
+        let device_store = DeviceStore::new(db.clone());
+        let policy_store = PolicyStore::new(db);
+
+        use sea_orm::{ConnectionTrait, Statement};
+        for conn in [usage_tracker.db(), device_store.db(), policy_store.db()] {
+            let row = conn
+                .query_one(Statement::from_string(
+                    conn.get_database_backend(),
+                    "SELECT 1 AS one".to_string(),
+                ))
+                .await
+                .expect("getter connection must be usable")
+                .expect("row");
+            assert_eq!(row.try_get::<i64>("", "one").unwrap_or(0), 1);
+        }
+    }
+
+    #[tokio::test]
     async fn admin_audit_records_caller_identity_via_middleware() {
         use sea_orm::EntityTrait;
         use tower::ServiceExt;
@@ -2122,7 +2146,9 @@ mod tests {
         assert_eq!(rows[0]["request_id"], "req-1");
         // created_at serializes as a non-empty timestamp string.
         assert!(
-            rows[0]["created_at"].as_str().is_some_and(|s| !s.is_empty()),
+            rows[0]["created_at"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
             "created_at must be present: {}",
             rows[0]["created_at"]
         );
@@ -2315,22 +2341,31 @@ mod tests {
         assert_eq!(json["total_messages_dropped"], 3);
 
         let groups = json["groups"].as_array().expect("groups array");
-        let by_name = |n: &str| {
+        // Clippy-clean lookup helper (test builds allow expect_used).
+        fn group_row<'a>(
+            groups: &'a [serde_json::Value],
+            name: &str,
+        ) -> &'a serde_json::Value {
             groups
                 .iter()
-                .find(|g| g["group"] == n)
-                .unwrap_or_else(|| panic!("group {n} missing: {json}"))
-                .clone()
-        };
+                .find(|g| g["group"] == name)
+                .unwrap_or_else(|| {
+                    let names: Vec<String> = groups
+                        .iter()
+                        .filter_map(|g| g["group"].as_str().map(str::to_string))
+                        .collect();
+                    unreachable!("group {name} missing; have {names:?}")
+                })
+        }
 
-        let eng = by_name("engineering");
+        let eng = group_row(groups, "engineering");
         assert_eq!(eng["enabled"], true, "config overlay must show enabled");
         assert_eq!(eng["max_input_tokens"], 8000);
         assert_eq!(eng["requests_optimized"], 2);
         assert_eq!(eng["tokens_saved"], 150);
         assert_eq!(eng["messages_dropped"], 3);
 
-        let sales = by_name("sales");
+        let sales = group_row(groups, "sales");
         assert_eq!(sales["requests_optimized"], 1);
         assert_eq!(sales["tokens_saved"], 10);
         assert_eq!(
@@ -2338,20 +2373,17 @@ mod tests {
             "traffic without a policy must report disabled"
         );
 
-        let unknown = by_name("unknown");
+        let unknown = group_row(groups, "unknown");
         assert_eq!(unknown["requests_optimized"], 1);
         assert_eq!(unknown["tokens_saved"], 5);
 
-        let quiet = by_name("quiet-group");
+        let quiet = group_row(groups, "quiet-group");
         assert_eq!(quiet["requests_optimized"], 0, "policy-only group row");
         assert_eq!(quiet["tokens_saved"], 0);
         assert_eq!(quiet["enabled"], false);
 
         // Groups are sorted by name for stable admin reading.
-        let names: Vec<&str> = groups
-            .iter()
-            .filter_map(|g| g["group"].as_str())
-            .collect();
+        let names: Vec<&str> = groups.iter().filter_map(|g| g["group"].as_str()).collect();
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted, "groups must be sorted: {names:?}");

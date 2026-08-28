@@ -606,6 +606,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn len_and_emptiness_reflect_the_table() {
+        let empty = PriceTable::empty();
+        assert!(empty.is_empty().await);
+        assert_eq!(empty.len().await, 0);
+
+        let configured = PriceTable::from_config(&test_config());
+        assert!(!configured.is_empty().await);
+        assert_eq!(configured.len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn price_source_is_none_for_unknown_model() {
+        let table = PriceTable::from_config(&test_config());
+        assert_eq!(table.price_source("nope").await, None);
+        assert_eq!(
+            table.price_source("gpt-4o").await,
+            Some(PriceSource::Override)
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_from_backend_non_success_status_is_an_error() {
+        // A backend answering 500 must surface a descriptive error (not a
+        // silent zero-price table that would understate costs).
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "backend exploded",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let table = PriceTable::empty();
+        let err = table
+            .fetch_from_backend(&reqwest::Client::new(), &format!("http://{addr}"), None)
+            .await
+            .expect_err("non-2xx must error");
+        assert!(err.to_string().contains("500"), "{err}");
+        assert!(table.is_empty().await, "nothing must be merged on failure");
+    }
+
+    #[tokio::test]
+    async fn fetch_from_backend_invalid_json_is_an_error() {
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async { "this is not json" }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let table = PriceTable::empty();
+        let err = table
+            .fetch_from_backend(&reqwest::Client::new(), &format!("http://{addr}"), None)
+            .await
+            .expect_err("bad JSON must error");
+        assert!(err.to_string().contains("parse"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn parse_models_response_skips_entries_without_id_or_pricing() {
+        let json = serde_json::json!({
+            "data": [
+                {"pricing": {"prompt": "0.0000025", "completion": "0.00001"}},   // no id
+                {"id": "no-pricing"},                                              // no pricing
+                {"id": "bad-pricing", "pricing": {"prompt": "oops"}},              // unparseable
+                {"id": "good", "pricing": {"prompt": "0.0000025", "completion": "0.00001"}}
+            ]
+        });
+        let prices = parse_models_response(&json);
+        assert_eq!(prices.len(), 1, "only the well-formed entry survives");
+        assert!(prices.contains_key("good"));
+    }
+
+    #[tokio::test]
+    async fn refresh_cycle_tolerates_unreachable_providers() {
+        use crate::provider::{ProviderInput, ProviderStore};
+        use zeroize::Zeroizing;
+
+        // One enabled provider on a dead port + an override that must
+        // survive the failed refresh.
+        let url = oidc_agent_common::persistence::temp_sqlite_url("pricing-dead");
+        let db = crate::db::setup(&url).await.expect("db setup");
+        let store = ProviderStore::new(db, Zeroizing::new([9_u8; 32]));
+        store
+            .upsert_provider(&ProviderInput {
+                id: "dead".into(),
+                name: "dead".into(),
+                base_url: "http://127.0.0.1:1".into(),
+                enabled: true,
+                is_default: true,
+                models: None,
+            })
+            .await
+            .expect("provider");
+
+        let table = PriceTable::from_config(&PricingConfig {
+            models: vec![oidc_agent_common::config::ModelPriceConfig {
+                model: "kept-model".into(),
+                input_per_1k_usd: 0.5,
+                output_per_1k_usd: 0.5,
+            }],
+            fetch_interval_secs: 60,
+        });
+        // Must not panic or drop the override when the provider is down.
+        table
+            .refresh_provider_prices_once(&store, &reqwest::Client::new())
+            .await;
+        assert_eq!(table.len().await, 1, "override must survive");
+        assert_eq!(
+            table.price_source("kept-model").await,
+            Some(PriceSource::Override)
+        );
+    }
+
+    #[tokio::test]
     async fn one_provider_refresh_cycle_fetches_enabled_only_and_keeps_overrides() {
         use crate::provider::{ProviderInput, ProviderStore};
         use std::sync::{Arc, Mutex};

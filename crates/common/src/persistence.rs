@@ -175,4 +175,43 @@ mod tests {
     fn shellexpand_passes_through_absolute_paths() {
         assert_eq!(shellexpand("/absolute/path"), "/absolute/path");
     }
+
+    #[test]
+    fn sqlite_path_expands_home_tilde() {
+        // Config files use `~/...` paths; they must resolve against HOME.
+        let path = sqlite_path("sqlite://~/library/relay.db").expect("path");
+        let home = std::env::var("HOME").expect("HOME set in test env");
+        assert_eq!(
+            path,
+            PathBuf::from(format!("{home}/library/relay.db")),
+            "tilde must expand to $HOME"
+        );
+    }
+
+    #[test]
+    fn enforce_db_perms_tightens_mode_and_tolerates_missing_file() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = std::env::temp_dir().join(format!(
+                "oac-perms-{}-{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0),
+            ));
+            std::fs::write(&tmp, b"x").expect("write");
+            // World-readable first.
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))
+                .expect("chmod 644");
+            enforce_db_perms(&tmp).expect("enforce");
+            let mode = std::fs::metadata(&tmp).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "db must be owner-only: {mode:o}");
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        // A missing file must not error (fresh installs haven't created it).
+        enforce_db_perms(Path::new("/nonexistent/oac-missing.db")).expect("missing is ok");
+    }
 }

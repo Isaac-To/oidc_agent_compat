@@ -371,7 +371,9 @@ async fn forwards_verified_identity_and_request_id_headers() {
         Some("alice@example.com")
     );
     assert_eq!(
-        headers.get("x-oac-user-groups").and_then(|v| v.to_str().ok()),
+        headers
+            .get("x-oac-user-groups")
+            .and_then(|v| v.to_str().ok()),
         Some(r#"["engineering","ai-users"]"#)
     );
     assert_eq!(
@@ -638,8 +640,7 @@ async fn build_client_uses_mtls_in_production_mode() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600))
-            .expect("chmod key");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("chmod key");
     }
 
     let config = oidc_agent_common::config::RelayConfig {
@@ -665,7 +666,10 @@ async fn build_client_uses_mtls_in_production_mode() {
     let client = proxy::forward::build_client(&config).expect("mTLS client builds");
     // The builder enforces https-only in prod mode; a plain-http target
     // must be refused by the client itself.
-    let refused = client.get("http://central.example.com/healthz").send().await;
+    let refused = client
+        .get("http://central.example.com/healthz")
+        .send()
+        .await;
     assert!(
         refused.is_err(),
         "an https-only mTLS client must refuse plain http"
@@ -709,8 +713,7 @@ async fn serve_boots_and_shuts_down_gracefully_on_sigterm() {
         session_ttl_hours: None,
     };
 
-    let task =
-        tokio::spawn(async move { proxy::serve(config, key_store).await });
+    let task = tokio::spawn(async move { proxy::serve(config, key_store).await });
 
     // Let the server bind and install the graceful-shutdown signal handler.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

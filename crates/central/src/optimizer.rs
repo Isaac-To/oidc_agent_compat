@@ -465,6 +465,65 @@ mod tests {
         assert!(!report.applied);
     }
 
+    #[test]
+    fn all_empty_messages_returns_original_body_unchanged() {
+        // Safety guard: if every message is structurally empty, dropping
+        // them would produce `"messages":[]` — an invalid chat request
+        // that loses the user's turn entirely. The optimiser must leave
+        // the body byte-identical instead.
+        let body = json(r#"{"model":"gpt-4","messages":[{"role":"user","content":""}]}"#);
+        let (out, report) = optimize_prompt(&body, enabled());
+        assert_eq!(
+            &out[..],
+            &body[..],
+            "never emit an empty messages array — hand back the original"
+        );
+        assert!(!report.applied, "nothing was applied");
+        assert_eq!(report.dup_messages_dropped, 0);
+        assert_eq!(report.empty_messages_dropped, 0);
+    }
+
+    #[test]
+    fn budget_never_strips_the_last_user_turn() {
+        // Even with an absurdly small budget, the newest non-system turn
+        // must survive (a request with only a system prompt is useless).
+        let body = json(
+            r#"{"model":"gpt-4","messages":[
+                {"role":"system","content":"You are helpful."},
+                {"role":"user","content":"a"},
+                {"role":"user","content":"b"},
+                {"role":"user","content":"final question"}
+            ]}"#,
+        );
+        let config = TokenSaverConfig {
+            enabled: true,
+            max_input_tokens: Some(1),
+            collapse_repeated_lines: false,
+        };
+        let (out, report) = optimize_prompt(&body, config);
+        let value: serde_json::Value = serde_json::from_slice(&out).expect("valid json");
+        let messages = value["messages"].as_array().expect("messages");
+        assert!(
+            !messages.is_empty(),
+            "budget trimming must never empty the conversation"
+        );
+        let roles: Vec<&str> = messages.iter().filter_map(|m| m["role"].as_str()).collect();
+        assert!(roles.contains(&"system"), "system prompt always kept");
+        // The newest turn must be the (or among the) survivors.
+        let contents: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert!(
+            contents.contains(&"final question"),
+            "the most recent turn must survive: {contents:?}"
+        );
+        assert!(
+            report.applied,
+            "turns were dropped, so applied must be true"
+        );
+    }
+
     fn enabled() -> TokenSaverConfig {
         TokenSaverConfig {
             enabled: true,

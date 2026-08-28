@@ -359,10 +359,7 @@ mod tests {
     /// caller controls `dev_mode`/`rate_limiter` on the state.
     fn rate_limited_app(state: AppState) -> axum::Router {
         axum::Router::new()
-            .route(
-                "/v1/models",
-                axum::routing::get(|| async { "ok" }),
-            )
+            .route("/v1/models", axum::routing::get(|| async { "ok" }))
             .route("/healthz", axum::routing::get(|| async { "ok" }))
             .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
@@ -504,7 +501,9 @@ mod tests {
         let resp = rate_limit::too_many_requests_response(7);
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
-            resp.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
             Some("7"),
             "the header must echo the computed refill time, not a constant"
         );
@@ -555,7 +554,10 @@ mod tests {
         // the task to be running and give the bind a moment, then confirm
         // the future is still pending (server alive) before shutting down.
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(!task.is_finished(), "serve() must keep running until signalled");
+        assert!(
+            !task.is_finished(),
+            "serve() must keep running until signalled"
+        );
 
         // Ensure the graceful-shutdown signal handler is installed before
         // sending SIGTERM (it is polled as soon as axum starts serving).
@@ -571,6 +573,9 @@ mod tests {
             .await
             .expect("serve() must return after SIGTERM")
             .expect("join serve task");
-        assert!(result.is_ok(), "graceful shutdown must be clean: {result:?}");
+        assert!(
+            result.is_ok(),
+            "graceful shutdown must be clean: {result:?}"
+        );
     }
 }

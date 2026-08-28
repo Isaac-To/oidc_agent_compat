@@ -823,3 +823,87 @@ impl MigrationTrait for Migration0007CollapseRepeatedLines {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm_migration::MigratorTrait;
+
+    /// The full migration chain must be reversible and re-runnable: an
+    /// operator resetting a database relies on `down` then `up` leaving a
+    /// working schema. This also exercises every `down` implementation.
+    #[tokio::test]
+    async fn migrations_round_trip_down_then_up() {
+        let url = oidc_agent_common::persistence::temp_sqlite_url("central-mig");
+        let db = sea_orm::Database::connect(&url).await.expect("connect");
+
+        // Up: fresh schema.
+        Migrator::up(&db, None).await.expect("up");
+
+        // The core tables exist and accept writes.
+        {
+            use sea_orm::ConnectionTrait;
+            db.execute_unprepared(
+                "INSERT INTO devices (id, cert_fingerprint, user_subject, revoked, created_at) \
+                 VALUES ('d1', 'fp', 'u', 0, '2026-01-01 00:00:00')",
+            )
+            .await
+            .expect("insert device");
+        }
+
+        // Down: everything is removed.
+        Migrator::down(&db, None).await.expect("down");
+        {
+            use sea_orm::ConnectionTrait;
+            let tables: Vec<String> = db
+                .query_all(
+                    sea_orm::Statement::from_string(
+                        db.get_database_backend(),
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%seaql%'"
+                        .to_string(),
+                ),
+                )
+                .await
+                .expect("list tables")
+                .iter()
+                .map(|row| row.try_get("", "name").unwrap_or_default())
+                .collect();
+            assert!(
+                tables.is_empty(),
+                "down must drop all tables, still present: {tables:?}"
+            );
+        }
+
+        // Up again: the schema is rebuilt and usable.
+        Migrator::up(&db, None).await.expect("up again");
+        {
+            use sea_orm::ConnectionTrait;
+            db.execute_unprepared(
+                "INSERT INTO devices (id, cert_fingerprint, user_subject, revoked, created_at) \
+                 VALUES ('d2', 'fp2', 'u2', 0, '2026-01-02 00:00:00')",
+            )
+            .await
+            .expect("insert after round trip");
+        }
+    }
+
+    /// The migrator must register every migration exactly once, in order.
+    #[test]
+    fn migrator_lists_all_migrations_in_order() {
+        let migrations = Migrator::migrations();
+        let names: Vec<String> = migrations.iter().map(|m| m.name().to_string()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "m000001_initial_schema",
+                "m000002_audit_enrichment",
+                "m000003_group_policies",
+                "m000004_usage_counters",
+                "m000005_providers",
+                "m000006_token_saver",
+                "m000007_collapse_repeated_lines",
+            ],
+            "migration order is part of the schema contract"
+        );
+    }
+}

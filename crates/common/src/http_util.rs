@@ -198,6 +198,40 @@ mod tests {
     }
 
     #[test]
+    fn extract_model_non_string_field_returns_none() {
+        // `model: 42` is present but not a string — activity logs must not
+        // record a bogus model name.
+        let body = br#"{"model": 42, "messages": []}"#;
+        assert_eq!(extract_model(body), None);
+    }
+
+    #[test]
+    fn build_forward_headers_only_forwards_the_allowlist() {
+        // Anything outside FORWARDABLE_HEADERS must be dropped — including
+        // identity-ish and auth headers a client might try to smuggle.
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("accept", "application/json".parse().unwrap());
+        headers.insert("authorization", "Bearer oac_secret".parse().unwrap());
+        headers.insert("x-oac-user-subject", "spoofed".parse().unwrap());
+        headers.insert("cookie", "session=abc".parse().unwrap());
+
+        let forwarded = build_forward_headers(&headers);
+        let names: Vec<&str> = forwarded.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"content-type"));
+        assert!(names.contains(&"accept"));
+        assert!(
+            !names.contains(&"authorization"),
+            "credentials must not be forwarded"
+        );
+        assert!(
+            !names.contains(&"x-oac-user-subject"),
+            "identity headers are set by the proxies, never forwarded from clients"
+        );
+        assert!(!names.contains(&"cookie"), "cookies must not be forwarded");
+    }
+
+    #[test]
     fn build_forward_headers_strips_hop_by_hop() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());

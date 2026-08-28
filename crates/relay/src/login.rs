@@ -834,7 +834,8 @@ mod tests {
         tokio::spawn(async move {
             let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
             use tokio::io::AsyncWriteExt;
-            let req = "GET /callback?code=abc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+            let req =
+                "GET /callback?code=abc HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(req.as_bytes()).await;
             let _ = stream.flush().await;
             let mut buf = [0u8; 256];

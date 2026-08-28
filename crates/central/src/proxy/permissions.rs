@@ -802,9 +802,7 @@ mod tests {
                     .header("content-type", "application/json")
                     .header(identity::HEADER_USER_SUBJECT, "endpoint-user")
                     .header(identity::HEADER_USER_GROUPS, r#"["restricted"]"#)
-                    .body(Body::from(
-                        r#"{"model":"gpt-4","messages":[]}"#.to_string(),
-                    ))
+                    .body(Body::from(r#"{"model":"gpt-4","messages":[]}"#.to_string()))
                     .expect("build request"),
             )
             .await
@@ -840,22 +838,13 @@ mod tests {
         let state = test_state().await;
         state
             .policy_store
-            .upsert_policy(
-                "restricted",
-                None,
-                Some(r#"["/v1/models"]"#),
-                None,
-                None,
-            )
+            .upsert_policy("restricted", None, Some(r#"["/v1/models"]"#), None, None)
             .await
             .expect("policy");
 
         // A router with both routes so GET /v1/models resolves.
         let app = Router::new()
-            .route(
-                "/v1/models",
-                axum::routing::get(|| async { "ok" }),
-            )
+            .route("/v1/models", axum::routing::get(|| async { "ok" }))
             .route(
                 "/v1/chat/completions",
                 axum::routing::post(|| async { "ok" }),
@@ -902,13 +891,7 @@ mod tests {
         let state = test_state().await;
         state
             .policy_store
-            .upsert_policy(
-                "restricted",
-                Some(r#"["gpt-4o"]"#),
-                None,
-                None,
-                None,
-            )
+            .upsert_policy("restricted", Some(r#"["gpt-4o"]"#), None, None, None)
             .await
             .expect("policy");
 
@@ -974,9 +957,7 @@ mod tests {
                     .method(axum::http::Method::POST)
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"model":"gpt-4","messages":[]}"#.to_string(),
-                    ))
+                    .body(Body::from(r#"{"model":"gpt-4","messages":[]}"#.to_string()))
                     .expect("build request"),
             )
             .await
