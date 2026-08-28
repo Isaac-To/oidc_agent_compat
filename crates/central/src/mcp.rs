@@ -68,6 +68,11 @@ impl McpServerInput {
                 "MCP server id must be non-empty and must not contain '/' or spaces".into(),
             ));
         }
+        if id.contains("__") {
+            return Err(Error::Config(
+                "MCP server id must not contain '__' (reserved as the tool-name separator in the combined hub)".into(),
+            ));
+        }
         if self.name.trim().is_empty() {
             return Err(Error::Config("MCP server name must not be empty".into()));
         }

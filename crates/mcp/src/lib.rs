@@ -36,6 +36,7 @@
 )]
 
 pub mod errors;
+pub mod hub;
 pub mod jsonrpc;
 pub mod parse;
 pub mod protocol;
