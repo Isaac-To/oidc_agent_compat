@@ -391,11 +391,36 @@ async fn wait_for_callback(
     use tokio::io::AsyncWriteExt;
 
     let mut stream = stream;
-    let mut buf = Vec::with_capacity(1024);
-    // Read the request headers (the callback is a small GET).
-    let _ = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buf)).await;
+    let mut buf = Vec::with_capacity(4096);
+    // Read only the HTTP request head (the request line + headers), NOT the
+    // whole body. `read_to_end` would block until the peer closes the
+    // connection, but a well-behaved browser keeps the callback connection
+    // alive until it receives our response — so `read_to_end` would always
+    // burn the full read timeout before we respond. The authorize-code
+    // callback is a GET with no meaningful body, so the request head is all
+    // we need. On timeout or I/O error we parse whatever head we have.
+    let head = tokio::time::timeout(Duration::from_secs(10), async {
+        while !buf.ends_with(b"\r\n\r\n") && buf.len() < 4096 {
+            let n = stream.read_buf(&mut buf).await?;
+            if n == 0 {
+                break; // peer closed; parse whatever head we have
+            }
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await;
+    let _ = head; // best-effort read; parse the head we collected regardless
 
-    let request_str = String::from_utf8_lossy(&buf);
+    // The length of the request head (up to and including the blank line).
+    let head_len = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4)
+        .unwrap_or(buf.len());
+
+    // `head_len` is bounded above by `buf.len()`, so this slice is always
+    // in-bounds; use `get(..)` to satisfy the `indexing_slicing` lint.
+    let request_str = String::from_utf8_lossy(buf.get(..head_len).unwrap_or(&buf));
     // The first line looks like: GET /callback?code=...&state=... HTTP/1.1
     let request_line = request_str
         .lines()
@@ -1010,5 +1035,95 @@ mod tests {
             Some("Alice Doe"),
             "display name must survive login so admins see real names"
         );
+    }
+
+    /// The callback reader must return as soon as the request head (request
+    /// line + headers) has arrived — it must NOT wait for the peer to close
+    /// the connection. A well-behaved browser keeps the connection open until
+    /// it receives the response, so the old `read_to_end` implementation
+    /// always burned the full read timeout and made interactive login hang.
+    #[tokio::test]
+    async fn wait_for_callback_returns_promptly_without_awaiting_eof() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::net::TcpStream;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Client connects and sends only the request head, then deliberately
+        // KEEPS the connection open (no EOF), a buffer response is written.
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            let head =
+                b"GET /callback?code=abc123&state=xyz HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: test\r\n\r\n";
+            stream.write_all(head).await.expect("write head");
+            // Do NOT close the stream here — the server must not need EOF.
+            stream.flush().await.expect("flush");
+
+            // Read the server's response; then the server has replied and we
+            // can close. This also proves the response was written promptly.
+            let mut resp = [0u8; 512];
+            let _n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut resp))
+                .await
+                .expect("response within timeout")
+                .expect("read response");
+            stream.shutdown().await.expect("shutdown");
+        });
+
+        // The server must respond well before the full 10s read timeout,
+        // even though the client never closes its end.
+        let got = tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_callback(listener, Duration::from_secs(10)),
+        )
+        .await
+        .expect("wait_for_callback must return without awaiting client EOF")
+        .expect("valid callback");
+
+        assert_eq!(got.0.secret(), "abc123");
+        assert_eq!(got.1.secret(), "xyz");
+        client.await.expect("client task");
+    }
+
+    /// A callback whose head contains no blank line (e.g. a truncated/malformed
+    /// request) must not panic; `head_len` falls back to the whole buffer.
+    /// The client shuts down its write half after sending so the server's
+    /// read loop sees EOF and proceeds to parse what it has.
+    #[tokio::test]
+    async fn wait_for_callback_tolerates_missing_blank_line() {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::net::TcpStream;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let client = tokio::spawn(async move {
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            let junk = b"GET /callback?code=only&state=ss HTTP/1.1\r\n";
+            stream.write_all(junk).await.expect("write");
+            stream.flush().await.expect("flush");
+            stream.shutdown().await.expect("shutdown write half (EOF)");
+            let mut resp = [0u8; 512];
+            let _n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut resp))
+                .await
+                .expect("response within timeout")
+                .expect("read response");
+        });
+
+        let got = tokio::time::timeout(
+            Duration::from_secs(3),
+            wait_for_callback(listener, Duration::from_secs(10)),
+        )
+        .await
+        .expect("must not hang on malformed head")
+        .expect("valid callback");
+
+        assert_eq!(got.0.secret(), "only");
+        assert_eq!(got.1.secret(), "ss");
+        client.await.expect("client task");
     }
 }
