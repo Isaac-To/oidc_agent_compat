@@ -137,6 +137,7 @@ pub fn router(state: AppState) -> Router {
             device_store: state.device_store.clone(),
             audit: state.audit.clone(),
             usage_tracker: state.usage_tracker.clone(),
+            mcp_manager: state.mcp_manager.clone(),
             admin_group: admin_group.to_string(),
         };
         proxy_router = proxy_router.merge(crate::admin::router(admin_state));

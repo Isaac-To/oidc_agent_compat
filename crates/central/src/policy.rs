@@ -16,13 +16,13 @@
 
 use std::collections::HashSet;
 
-use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Statement, Value};
 use uuid::Uuid;
 
 use oidc_agent_common::error::{Error, Result};
 use oidc_agent_common::time_util;
 
-use crate::entity::group_policy;
+use crate::entity::{group_policy, mcp_server_policy};
 use crate::optimizer::TokenSaverConfig;
 
 /// A resolved policy for a user, merging all their groups' policies.
@@ -550,6 +550,90 @@ impl PolicyStore {
             }
         }
         Ok(union)
+    }
+
+    /// Returns the MCP server policy for a single group, if present.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on query failure.
+    pub async fn get_mcp_policy(&self, group_name: &str) -> Result<Option<mcp_server_policy::Model>> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+        mcp_server_policy::Entity::find()
+            .filter(mcp_server_policy::Column::GroupName.eq(group_name))
+            .one(&self.db)
+            .await
+            .map_err(|e| Error::Database(format!("get mcp server policy: {e}")))
+    }
+
+    /// Creates or replaces the MCP server policy for a group.
+    ///
+    /// `allowed_tools` is a JSON-serializable list of `"server:tool"` entries.
+    /// Passing `None` stores an all-allowed policy (`allowed_tools = NULL`);
+    /// passing an empty slice stores a deny-all policy (`"[]"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on persistence failure.
+    pub async fn upsert_mcp_policy(
+        &self,
+        group_name: &str,
+        allowed_tools: Option<&[String]>,
+    ) -> Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, QueryFilter};
+        let now = time_util::now_utc();
+        let tools_json = allowed_tools.map(|v| serde_json::to_string(v).unwrap_or_default());
+        let existing = mcp_server_policy::Entity::find()
+            .filter(mcp_server_policy::Column::GroupName.eq(group_name))
+            .one(&self.db)
+            .await
+            .map_err(|e| Error::Database(format!("get mcp server policy: {e}")))?;
+
+        if let Some(existing) = existing {
+            let mut active: mcp_server_policy::ActiveModel = existing.into();
+            active.allowed_tools = sea_orm::Set(tools_json);
+            active.updated_at = sea_orm::Set(now);
+            active
+                .update(&self.db)
+                .await
+                .map_err(|e| Error::Database(format!("update mcp server policy: {e}")))?;
+        } else {
+            let id = Uuid::new_v4().to_string();
+            let tools_val = tools_json
+                .map(|v| sea_orm::Value::String(Some(Box::new(v))))
+                .unwrap_or(sea_orm::Value::String(None));
+            let now_str = time_util::format_time(&now);
+            self.db
+                .execute(Statement::from_sql_and_values(
+                    self.db.get_database_backend(),
+                    "INSERT INTO mcp_server_policies (id, group_name, allowed_tools, created_at, updated_at) VALUES ($1, $2, $3, $4, $5)",
+                    vec![
+                        id.into(),
+                        group_name.to_string().into(),
+                        tools_val,
+                        now_str.clone().into(),
+                        now_str.into(),
+                    ],
+                ))
+                .await
+                .map_err(|e| Error::Database(format!("insert mcp server policy: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Deletes an MCP server policy by group name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on delete failure.
+    pub async fn delete_mcp_policy(&self, group_name: &str) -> Result<bool> {
+        use sea_orm::{ColumnTrait, QueryFilter};
+        let result = mcp_server_policy::Entity::delete_many()
+            .filter(mcp_server_policy::Column::GroupName.eq(group_name))
+            .exec(&self.db)
+            .await
+            .map_err(|e| Error::Database(format!("delete mcp server policy: {e}")))?;
+        Ok(result.rows_affected > 0)
     }
 }
 
