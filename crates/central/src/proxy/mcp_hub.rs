@@ -69,8 +69,14 @@ pub async fn mcp_hub_handler(
     let (method, id) = match parsed {
         Ok(Some(req)) => (req.method.clone(), req.id),
         Ok(None) => {
-            // Not a request object (notification/response/batch). Try to
+            // Not a request object (notification/response/scalar). Try to
             // classify and forward/broadcast as appropriate; otherwise allow.
+            return json_rpc_error(StatusCode::OK, -32600, "invalid request");
+        }
+        Err(oac_mcp::McpError::BatchUnsupported) => {
+            // Batches are rejected at the proxy boundary: a batch can
+            // contain tools/call requests that would bypass per-tool
+            // permission enforcement if forwarded verbatim.
             return json_rpc_error(StatusCode::OK, -32600, "invalid request");
         }
         Err(_) => return json_rpc_error(StatusCode::BAD_REQUEST, -32700, "parse error"),

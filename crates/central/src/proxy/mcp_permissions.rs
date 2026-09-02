@@ -88,8 +88,10 @@ pub async fn mcp_permissions_middleware(
         })?;
 
     // Determine the JSON-RPC method + tool.
-    // Non-request payloads (responses/notifications/batches) are not tool
-    // targets; the request passes through and is audited as best-effort.
+    // Non-request payloads (responses/notifications) are not tool targets;
+    // the request passes through and is audited as best-effort. Batches
+    // (arrays) are rejected — a batch can contain tools/call requests that
+    // would bypass per-tool permission enforcement if forwarded verbatim.
     let (tool_call, parse_error) = match parse::extract_tool_call(&body_bytes, &server) {
         Ok(Some(call)) => (Some(call), None),
         Ok(None) => (None, None),
@@ -133,9 +135,17 @@ pub async fn mcp_permissions_middleware(
             }
         }
         None => {
-            if parse_error.is_some() {
-                // Malformed body. Fail closed on tool-bearing routes.
-                (false, Some("malformed JSON-RPC body".to_string()))
+            if let Some(err) = &parse_error {
+                // Fail closed on tool-bearing routes. Batches get a specific
+                // message so operators can distinguish a rejected batch
+                // (policy) from a genuinely malformed body.
+                let reason = match err {
+                    oac_mcp::McpError::BatchUnsupported => {
+                        "batch JSON-RPC messages are not supported"
+                    }
+                    _ => "malformed JSON-RPC body",
+                };
+                (false, Some(reason.to_string()))
             } else {
                 // Not a request we enforce (response/notification): allow.
                 (true, None)

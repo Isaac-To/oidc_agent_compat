@@ -29,8 +29,10 @@ pub const ARGS_PREVIEW_MAX_CHARS: usize = 512;
 ///
 /// # Errors
 ///
-/// Returns [`McpError`] on malformed UTF-8/JSON. Non-request payloads
-/// (responses, notifications, batches, scalars) return `Ok(None)`.
+/// Returns [`McpError`] on malformed UTF-8/JSON, or
+/// [`McpError::BatchUnsupported`] for JSON-RPC batch (array) messages.
+/// Non-request payloads (responses, notifications, scalars) return
+/// `Ok(None)`.
 pub fn extract_tool_call(body: &[u8], server: &str) -> Result<Option<ToolCall>> {
     let Some(req) = parse_request_body(body)? else {
         return Ok(None);
@@ -172,9 +174,16 @@ mod tests {
     }
 
     #[test]
-    fn batch_is_ignored() {
+    fn batch_is_rejected() {
+        // A JSON-RPC batch (array) must be rejected, not silently passed
+        // through — a batch can contain tools/call requests that would
+        // bypass per-tool permission enforcement if forwarded verbatim.
         let b = body(r#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]"#);
-        assert!(extract_tool_call(&b, "srv").expect("parse").is_none());
+        let err = extract_tool_call(&b, "srv").unwrap_err();
+        assert!(
+            matches!(err, crate::McpError::BatchUnsupported),
+            "batch must be rejected with BatchUnsupported, got {err:?}"
+        );
     }
 
     #[test]
