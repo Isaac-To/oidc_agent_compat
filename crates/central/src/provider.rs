@@ -16,7 +16,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
     QueryOrder, Statement, Value,
 };
-use sha2::{Digest, Sha256};
+// sha2 is used indirectly via crate::crypto::sha256_hex.
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -131,27 +131,14 @@ impl ProviderStore {
 
     /// Parses a 32-byte AES key from a hexadecimal string.
     ///
+    /// Delegates to [`crate::crypto::encryption_key_from_hex`].
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Config`] when the value is not exactly 64 hexadecimal
     /// characters long.
     pub fn encryption_key_from_hex(value: &str) -> Result<Zeroizing<[u8; 32]>> {
-        let value = value.trim();
-        if value.len() != 64 {
-            return Err(Error::Config(
-                "provider encryption key must be exactly 64 hexadecimal characters".into(),
-            ));
-        }
-        let mut key = [0_u8; 32];
-        for (index, byte) in key.iter_mut().enumerate() {
-            let start = index * 2;
-            *byte = u8::from_str_radix(&value[start..start + 2], 16).map_err(|_| {
-                Error::Config(
-                    "provider encryption key must contain only hexadecimal characters".into(),
-                )
-            })?;
-        }
-        Ok(Zeroizing::new(key))
+        crate::crypto::encryption_key_from_hex(value)
     }
 
     /// Lists all providers in stable identifier order.
@@ -591,9 +578,7 @@ fn provider_models_contain(models: Option<&str>, requested: &str) -> bool {
 }
 
 fn digest(secret: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(secret.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::crypto::sha256_hex(secret.as_bytes())
 }
 
 fn encrypt(key: &[u8; 32], secret: &str) -> Result<(Vec<u8>, [u8; 12])> {

@@ -15,6 +15,7 @@
 
 pub mod admin;
 pub mod audit;
+pub mod crypto;
 pub mod db;
 pub mod device_store;
 pub mod entity;
