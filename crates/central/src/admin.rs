@@ -319,7 +319,7 @@ async fn create_provider(
         .provider_store
         .upsert_provider(&input)
         .await
-        .map_err(internal_error)?;
+        .map_err(map_validation_err)?;
     record_admin_audit(
         state.audit.db(),
         &admin.subject,
@@ -371,7 +371,7 @@ async fn update_provider(
         .provider_store
         .upsert_provider(&input)
         .await
-        .map_err(internal_error)?;
+        .map_err(map_validation_err)?;
     record_admin_audit(
         state.audit.db(),
         &admin.subject,
@@ -416,7 +416,7 @@ async fn set_default_provider(
         .provider_store
         .set_default_provider(&id)
         .await
-        .map_err(internal_error)?;
+        .map_err(map_validation_err)?;
     record_admin_audit(
         state.audit.db(),
         &admin.subject,
@@ -575,7 +575,7 @@ async fn add_key(
             &body.allowed_groups,
         )
         .await
-        .map_err(internal_error)?;
+        .map_err(map_validation_err)?;
     record_admin_audit(
         state.audit.db(),
         &admin.subject,
@@ -615,7 +615,7 @@ async fn update_key(
         .provider_store
         .update_key(&provider_id, &key_id, &update)
         .await
-        .map_err(internal_error)?;
+        .map_err(map_validation_err)?;
     record_admin_audit(
         state.audit.db(),
         &admin.subject,
@@ -720,6 +720,21 @@ type HandlerResult<T> = std::result::Result<T, (StatusCode, String)>;
 fn internal_error(e: Error) -> (StatusCode, String) {
     tracing::error!(error = %e, "admin API error");
     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+/// Maps an [`Error`] to the appropriate HTTP status for admin handlers that
+/// perform input validation. [`Error::Config`] (returned by the provider,
+/// policy, and MCP stores for invalid input) maps to `400 Bad Request`;
+/// all other errors map to `500 Internal Server Error` via
+/// [`internal_error`].
+fn map_validation_err(e: Error) -> (StatusCode, String) {
+    match &e {
+        Error::Config(msg) => {
+            tracing::warn!(error = %e, "admin API validation error");
+            (StatusCode::BAD_REQUEST, msg.to_string())
+        }
+        _ => internal_error(e),
+    }
 }
 
 async fn list_policies(
@@ -2921,8 +2936,8 @@ mod tests {
             .expect("router run");
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
 
-        // set-default on an unknown provider → 500 from the store error
-        // (the store rejects defaulting a provider that does not exist).
+        // set-default on an unknown provider → 400 (the store rejects
+        // defaulting a provider that does not exist with Error::Config).
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
@@ -2937,7 +2952,7 @@ mod tests {
             .expect("router run");
         assert_eq!(
             resp.status(),
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::http::StatusCode::BAD_REQUEST,
             "defaulting a missing provider must not silently succeed"
         );
     }
