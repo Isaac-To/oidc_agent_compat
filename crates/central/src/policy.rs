@@ -520,9 +520,11 @@ impl PolicyStore {
     ///
     /// Returns:
     /// - `Ok(None)` if any matching group policy has `allowed_tools = NULL`
-    ///   (allow-all), or if there are no matching policies (deny-all unless
-    ///   an allow-all is present — for tools, no-policy means no tools).
-    /// - `Ok(Some(set))` with the union of explicit entries otherwise.
+    ///   (allow-all wins outright).
+    /// - `Ok(Some(set))` with the union of explicit entries otherwise —
+    ///   including the empty set when the caller has no groups or no
+    ///   matching policies (MCP tools are opt-in: no policy means no
+    ///   tools).
     ///
     /// # Errors
     ///
@@ -532,7 +534,11 @@ impl PolicyStore {
         groups: &[String],
     ) -> Result<Option<HashSet<String>>> {
         if groups.is_empty() {
-            return Ok(None);
+            // No groups → no policy can match. MCP tools are opt-in
+            // (deny-by-default), so this resolves to an empty allowlist,
+            // NOT allow-all. A verified identity with no groups (or a
+            // malformed groups claim) must not reach any MCP tool.
+            return Ok(Some(HashSet::new()));
         }
         let placeholders: Vec<String> = groups
             .iter()
@@ -1247,5 +1253,40 @@ mod tests {
             .expect("resolve")
             .expect("some (empty)");
         assert!(servers.is_empty(), "no policy → no servers reachable");
+    }
+
+    #[tokio::test]
+    async fn mcp_empty_groups_denies_all_tools() {
+        // Regression: an empty groups list used to resolve to allow-all.
+        // MCP tools are opt-in, so no groups must mean no tools.
+        let store = setup_test_db().await;
+        store.upsert_mcp_policy("eng", None).await.expect("policy");
+
+        // Even with an allow-all policy configured for some other group, a
+        // caller with no groups must not reach any tool.
+        assert!(
+            !store
+                .resolve_mcp_tool_allowed(&[], "fs", "anything")
+                .await
+                .expect("resolve"),
+            "empty groups must deny all tools (was allow-all)"
+        );
+
+        // Non-tools/call gating (has-any-tool) also denies.
+        assert!(
+            !store
+                .resolve_mcp_has_any_tool(&[], "fs")
+                .await
+                .expect("resolve"),
+            "empty groups must deny non-tools/call methods too"
+        );
+
+        // The hub fan-out set is empty (not None/all).
+        let servers = store
+            .resolve_mcp_allowed_servers(&[])
+            .await
+            .expect("resolve")
+            .expect("must be Some(empty), not allow-all None");
+        assert!(servers.is_empty());
     }
 }
