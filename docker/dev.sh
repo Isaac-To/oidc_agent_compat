@@ -299,23 +299,6 @@ wait_for() {
     exit 1
 }
 
-wait_for_https() {
-    local url="$1"
-    local timeout="${2:-30}"
-    local name="${3:-service}"
-    local elapsed=0
-    while [ $elapsed -lt $timeout ]; do
-        if curl -skf "$url" > /dev/null 2>&1; then
-            ok "$name is ready"
-            return 0
-        fi
-        sleep 2
-        elapsed=$((elapsed + 2))
-    done
-    err "Timeout waiting for $name at $url"
-    exit 1
-}
-
 # ─── Main ────────────────────────────────────────────────────────────────
 
 case "${1:-}" in

@@ -220,10 +220,11 @@ Minimum Rust 1.85; edition 2024.
 
 - `cargo audit` flags 2 **pre-existing** transitive advisories (`rsa 0.9.10`,
   `rustls-pemfile 2.2.0`) — not our code, no fix available.
-- `cargo deny check` is **broken on master**: `deny.toml` line 32
-  `allow-build-scripts = true` is incompatible with cargo-deny 0.20.2 (expects
-  an array). Fix would be `allow-build-scripts = []`. Do not loosen policy
-  without explicit user approval.
+- `cargo deny check` uses the array form for `allow-build-scripts` in
+  `deny.toml` (compatible with cargo-deny 0.20.2). Do not change this to
+  `allow-build-scripts = true` (the boolean form is incompatible with
+  cargo-deny 0.20.2) or loosen the build-script policy without explicit
+  user approval.
 
 ---
 

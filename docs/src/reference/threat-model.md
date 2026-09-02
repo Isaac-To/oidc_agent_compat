@@ -81,6 +81,7 @@ Agent (Codex, etc.)
 | Local key leaks to other local users | `0600` on SQLite + agent config | ✅ Implemented |
 | Local key leaks in logs | Never logged; `Zeroizing` wrapper | ✅ Implemented |
 | PII (email, subject) leaks in logs | Structured logging, no body logging, redaction layer | ✅ Implemented |
+| Secrets in MCP tool-call arguments leak into audit log | `redact_args` replaces values for known-sensitive keys (`api_key`, `token`, `password`, `secret`, etc.) with `[REDACTED]` before serialization, then truncates to 512 chars as a second line of defense | ✅ Implemented |
 | Hop-by-hop header leakage | RFC 7230 §6.1 hop-by-hop stripping on forward + response | ✅ Implemented |
 | ID token alg downgrade (`none`/HS*) | Alg pin {RS256, ES256} before signature verification | ✅ Implemented |
 
@@ -93,6 +94,7 @@ Agent (Codex, etc.)
 | OIDC callback hangs forever | 5-minute callback timeout | ✅ Implemented |
 | Attacker floods relay with requests | Loopback-only binding (not network-accessible) | ✅ Implemented |
 | Attacker floods central proxy | Per-IP token-bucket rate limiter (60 req/min default, production only) | ✅ Implemented |
+| Rate-limiter memory grows unbounded from unique IPs | Amortized eviction: every 128th request sweeps buckets idle for ≥10 window periods | ✅ Implemented |
 
 ### E — Elevation of Privilege
 
@@ -111,6 +113,9 @@ Agent (Codex, etc.)
 | Admin API mutations go unlogged | All mutations recorded in append-only `admin_audit_log` | ✅ Implemented |
 | Revoked device continues to access | Devices auto-register on first verified request; revocation checked in `permissions_middleware` (uses `identity_id` or `subject` as device ID) | ✅ Implemented |
 | Expired local session continues to access | OIDC-login API keys expire after `session_ttl_hours` (24 hours by default); expired rows are deleted | ✅ Implemented |
+| MCP `tools/call` bypasses per-tool policy via JSON-RPC batch | Batches (arrays) are rejected at the proxy boundary with `BatchUnsupported`; per-server endpoint returns 403, hub returns `-32600` | ✅ Implemented |
+| MCP `tools/call` to denied tool via per-server endpoint | `mcp_permissions` middleware enforces per-tool allowlist (403 on denial, fail-closed on policy-store errors) | ✅ Implemented |
+| MCP `tools/call` to denied tool via hub endpoint | Hub splits prefixed tool name, enforces policy inline, routes only to allowed servers | ✅ Implemented |
 
 ## Token-saver trust model
 

@@ -94,6 +94,8 @@ services:
   # Connects to the relay via the Docker network at http://relay:8787.
   # Uses the built-in 'openai' provider with a custom host pointing at the relay.
   goose:
+    # NOTE: pinned to :latest for convenience. For reproducible dev stacks,
+    # pin to a specific tag or digest (e.g. ghcr.io/aaif-goose/goose@sha256:...).
     image: ghcr.io/aaif-goose/goose:latest
     environment:
       # Use the built-in openai provider pointing at the relay.
