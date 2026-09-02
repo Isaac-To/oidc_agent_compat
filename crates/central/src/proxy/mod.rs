@@ -229,9 +229,12 @@ pub async fn serve(
             "central proxy listening on {} (dev HTTP)",
             config.listen_addr
         );
-        axum::serve(listener, app)
-            .with_graceful_shutdown(oidc_agent_common::shutdown::shutdown_signal())
-            .await?;
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(oidc_agent_common::shutdown::shutdown_signal())
+        .await?;
         return Ok(());
     }
 
@@ -259,7 +262,7 @@ pub async fn serve(
     tracing::info!("central proxy listening on {} (mTLS)", config.listen_addr);
     axum_server::bind_rustls(config.listen_addr, tls_config)
         .handle(handle)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .await?;
     Ok(())
 }
@@ -526,6 +529,71 @@ mod tests {
                 .expect("request");
             assert_eq!(resp.status(), StatusCode::OK);
         }
+    }
+
+    /// Verifies the rate-limit middleware keys on the `ConnectInfo<SocketAddr>`
+    /// extension (injected by `into_make_service_with_connect_info`) rather
+    /// than falling back to `0.0.0.0`. Two distinct client IPs must get
+    /// independent buckets even when the global capacity is 1.
+    #[tokio::test]
+    async fn rate_limit_keys_on_connect_info_not_global_bucket() {
+        let mut state = test_state(None).await;
+        state.config.dev_mode = false;
+        state.rate_limiter = Some(rate_limit::RateLimiter::new(
+            1,
+            std::time::Duration::from_secs(60),
+        ));
+        let app = rate_limited_app(state);
+
+        let ip1: std::net::SocketAddr = "203.0.113.1:1234".parse().expect("addr");
+        let ip2: std::net::SocketAddr = "203.0.113.2:5678".parse().expect("addr");
+
+        // First request from ip1 — consumes the single token in ip1's bucket.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models")
+                    .extension(axum::extract::ConnectInfo(ip1))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("ip1 first");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second request from ip1 — same bucket, now exhausted → 429.
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models")
+                    .extension(axum::extract::ConnectInfo(ip1))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("ip1 second");
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // First request from ip2 — independent bucket, must succeed even
+        // though ip1 is exhausted. If the middleware fell back to 0.0.0.0
+        // (the pre-fix bug), this would share ip1's bucket and fail.
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models")
+                    .extension(axum::extract::ConnectInfo(ip2))
+                    .body(axum::body::Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("ip2 first");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "distinct client IP must get an independent bucket"
+        );
     }
 
     #[test]
