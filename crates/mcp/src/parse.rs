@@ -21,11 +21,12 @@ pub const ARGS_PREVIEW_MAX_CHARS: usize = 512;
 /// Classifies a request body and extracts enforcement metadata.
 ///
 /// Returns:
-/// - `Some(ToolCall)` when the body is a `tools/call` request that must be
+/// - `Some(ToolCall)` with `method == "tools/call"` and the tool name in
+///   `tool` when the body is a `tools/call` request that must be
 ///   permission-checked against `server`.
-/// - `Some(ToolCall { tool: METHOD })` for other recognized request methods
-///   (e.g. `tools/list`, `initialize`) with an empty tool name — used for
-///   audit classification, no per-tool enforcement.
+/// - `Some(ToolCall { method, tool: "" })` for other recognized request
+///   methods (e.g. `tools/list`, `initialize`) — used for audit
+///   classification, no per-tool enforcement.
 ///
 /// # Errors
 ///
@@ -57,6 +58,7 @@ pub fn extract_tool_call(body: &[u8], server: &str) -> Result<Option<ToolCall>> 
         }
         return Ok(Some(ToolCall {
             server: server.to_string(),
+            method: METHOD_TOOLS_CALL.to_string(),
             tool: params.name,
             id: req.id.clone(),
             args_preview: redact_args(params.arguments.as_ref()),
@@ -66,7 +68,8 @@ pub fn extract_tool_call(body: &[u8], server: &str) -> Result<Option<ToolCall>> 
     // surface them for audit classification with an empty tool name.
     Ok(Some(ToolCall {
         server: server.to_string(),
-        tool: req.method,
+        method: req.method,
+        tool: String::new(),
         id: req.id.clone(),
         args_preview: None,
     }))
@@ -172,6 +175,7 @@ mod tests {
         );
         let call = extract_tool_call(&b, "fs").expect("parse").expect("some");
         assert_eq!(call.server, "fs");
+        assert_eq!(call.method, "tools/call");
         assert_eq!(call.tool, "read_file");
         let preview = call.args_preview.expect("args present");
         assert!(preview.contains("/tmp/x"));
@@ -182,6 +186,7 @@ mod tests {
         let b =
             body(r#"{"jsonrpc":"2.0","id":"abc","method":"tools/call","params":{"name":"ping"}}"#);
         let call = extract_tool_call(&b, "srv").expect("parse").expect("some");
+        assert_eq!(call.method, "tools/call");
         assert_eq!(call.tool, "ping");
         assert!(call.args_preview.is_none());
     }
@@ -190,9 +195,20 @@ mod tests {
     fn tools_list_is_audit_classified() {
         let b = body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
         let call = extract_tool_call(&b, "srv").expect("parse").expect("some");
-        // Not a tool call; method surfaced as the tool for classification.
-        assert_eq!(call.tool, "tools/list");
+        // Not a tool call: method carries the classification, tool is empty.
+        assert_eq!(call.method, "tools/list");
+        assert!(call.tool.is_empty());
         assert!(call.args_preview.is_none());
+    }
+
+    #[test]
+    fn initialize_is_audit_classified() {
+        let b = body(
+            r#"{"jsonrpc":"2.0","id":8,"method":"initialize","params":{"protocol_version":"2025-06-18"}}"#,
+        );
+        let call = extract_tool_call(&b, "srv").expect("parse").expect("some");
+        assert_eq!(call.method, "initialize");
+        assert!(call.tool.is_empty());
     }
 
     #[test]

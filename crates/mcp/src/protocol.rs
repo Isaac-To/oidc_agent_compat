@@ -76,7 +76,12 @@ pub struct ToolCallParams {
     pub arguments: Option<serde_json::Value>,
 }
 
-/// A parsed tool invocation extracted from a `tools/call` request.
+/// A parsed MCP client request extracted at the proxy boundary.
+///
+/// For `tools/call` requests, `method` is `"tools/call"` and `tool` carries
+/// the invoked tool name. For other recognized request methods
+/// (`initialize`, `tools/list`, …), `tool` is empty and `method` carries
+/// the method name — callers must branch on `method`, never on `tool`.
 ///
 /// The `server` field is the upstream MCP server endpoint the request is
 /// routed to (inferred from the URL path by the proxy).
@@ -84,7 +89,9 @@ pub struct ToolCallParams {
 pub struct ToolCall {
     /// The MCP server name the tool belongs to.
     pub server: String,
-    /// The tool name.
+    /// The JSON-RPC method (`tools/call`, `tools/list`, `initialize`, …).
+    pub method: String,
+    /// The tool name (empty for non-`tools/call` methods).
     pub tool: String,
     /// The JSON-RPC request id, if the call was a request (not a
     /// notification). Used for audit correlation but not persisted.
