@@ -100,21 +100,11 @@ pub async fn mcp_permissions_middleware(
 
     let is_tool_call_method = tool_call
         .as_ref()
-        .map(|c| c.tool != c.server)
-        .unwrap_or(false);
-    let mcp_method = if tool_call.is_some() {
-        if is_tool_call_method {
-            oac_mcp::protocol::METHOD_TOOLS_CALL.to_string()
-        } else {
-            // Non-tools/call request method surfaced in `tool` by the parser.
-            tool_call
-                .as_ref()
-                .map(|c| c.tool.clone())
-                .unwrap_or_default()
-        }
-    } else {
-        "unknown".to_string()
-    };
+        .is_some_and(|c| c.method == oac_mcp::protocol::METHOD_TOOLS_CALL);
+    let mcp_method = tool_call
+        .as_ref()
+        .map(|c| c.method.clone())
+        .unwrap_or_else(|| "unknown".to_string());
     let tool_name = if is_tool_call_method {
         tool_call
             .as_ref()

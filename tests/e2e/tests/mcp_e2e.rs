@@ -605,6 +605,106 @@ async fn relay_requires_auth_for_mcp() {
 }
 
 #[tokio::test]
+async fn per_server_endpoint_allows_non_tools_call_methods_under_specific_policy() {
+    // Regression: non-tools/call methods (initialize, tools/list) used to be
+    // misclassified as tools/call of a "tool" literally named after the
+    // method, so a specific allowlist (fs:read_file) denied them with 403.
+    // They must pass through when the group has at least one allowed tool
+    // on the server, and be audited with the method and no tool name.
+    let (relay_addr, client, key, _server, audit, _key_store) = setup_mcp_system().await;
+    let url = format!("http://{relay_addr}/mcp/fs");
+
+    for method in ["initialize", "tools/list"] {
+        let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": method });
+        let resp = client
+            .post(&url)
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "{method} must be forwarded, not denied by per-tool policy"
+        );
+        let json: serde_json::Value = resp.json().await.expect("json body");
+        assert!(
+            json.get("result").is_some(),
+            "{method} must return a JSON-RPC result: {json}"
+        );
+    }
+
+    // Central audit classified them as methods (no tool name).
+    use sea_orm::EntityTrait;
+    let entries = oac_central::entity::audit_log::Entity::find()
+        .all(audit.db())
+        .await
+        .expect("audit load");
+    for method in ["initialize", "tools/list"] {
+        let entry = entries
+            .iter()
+            .find(|e| e.mcp_method.as_deref() == Some(method))
+            .expect("audit row for the method");
+        assert_eq!(entry.mcp_server.as_deref(), Some("fs"));
+        assert!(
+            entry.mcp_tool.as_deref().is_none_or(str::is_empty),
+            "non-tools/call must not record a tool name"
+        );
+        assert_eq!(entry.permission_decision.as_deref(), Some("allowed"));
+    }
+}
+
+#[tokio::test]
+async fn per_server_endpoint_denies_non_tools_call_methods_under_deny_all_policy() {
+    // A group whose policy is an explicit empty allowlist (deny-all) must
+    // also deny non-tools/call methods: the server is fully off-limits.
+    // (Achieved by minting a second identity whose group has a deny-all
+    // policy on "fs".)
+    let (relay_addr, client, _key, _server, audit, key_store) = setup_mcp_system().await;
+
+    // Give the "interns" group an explicit deny-all policy (empty allowlist)
+    // on central's policy store, then mint a relay user in that group.
+    let policy_store = oac_central::policy::PolicyStore::new(audit.db().clone());
+    policy_store
+        .upsert_mcp_policy("interns", Some(&[]))
+        .await
+        .expect("deny-all policy");
+    let ident = key_store
+        .upsert_identity(
+            "https://idp.example.com",
+            "intern-user",
+            None,
+            None,
+            Some(r#"["interns"]"#),
+        )
+        .await
+        .expect("identity");
+    let minted = key_store
+        .mint_key(&ident.id, "intern-e2e", None)
+        .await
+        .expect("mint");
+    let intern_key = minted.plaintext.to_string();
+
+    let url = format!("http://{relay_addr}/mcp/fs");
+    let body = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+    let resp = client
+        .post(&url)
+        .header("authorization", format!("Bearer {intern_key}"))
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "deny-all policy must also deny non-tools/call methods"
+    );
+}
+
+#[tokio::test]
 async fn relay_activity_records_mcp_metadata() {
     let (relay_addr, client, key, _server, _audit, key_store) = setup_mcp_system().await;
     let url = format!("http://{relay_addr}/mcp/fs");
