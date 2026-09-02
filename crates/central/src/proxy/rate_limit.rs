@@ -134,9 +134,10 @@ pub async fn rate_limit_middleware(
         None => return next.run(request).await,
     };
 
-    // Extract the client IP from the connection info.
-    // axum::serve and axum_server both provide ConnectInfo<SocketAddr> when
-    // the server is started with `.into_make_service_with_connect_info()`.
+    // Extract the client IP from the connection info. The server is started
+    // with `.into_make_service_with_connect_info()` so every request carries
+    // `ConnectInfo<SocketAddr>` in its extensions. The fallback to
+    // `0.0.0.0` only triggers if a future code path forgets to inject it.
     let ip = request
         .extensions()
         .get::<ConnectInfo<std::net::SocketAddr>>()
