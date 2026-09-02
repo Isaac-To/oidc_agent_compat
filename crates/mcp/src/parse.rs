@@ -85,18 +85,75 @@ pub fn is_client_request(req: &JsonRpcRequest) -> bool {
 /// Serializes tool arguments to a compact JSON preview, length-capped to
 /// [`ARGS_PREVIEW_MAX_CHARS`]. Returns `None` when `args` is `None`.
 ///
-/// This is intentionally a lossy, truncated representation — never the full
-/// arguments — so secrets passed as arguments do not leak into the audit
-/// log (only the prefix up to the cap is retained).
+/// Before serialization, values for known-sensitive keys are replaced with
+/// `"[REDACTED]"` so secrets passed as tool arguments (e.g.
+/// `{"api_key": "sk-..."}`) do not leak into the audit log. The result is
+/// then truncated to the character cap as a second line of defense.
+///
+/// This is intentionally a lossy representation — never the full arguments.
 #[must_use]
 pub fn redact_args(args: Option<&Value>) -> Option<String> {
     let value = args?;
-    let json = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    // Walk the JSON and redact known-sensitive keys before serializing.
+    let redacted = redact_sensitive_values(value);
+    let json = serde_json::to_string(&redacted).unwrap_or_else(|_| "{}".to_string());
     if json.chars().count() <= ARGS_PREVIEW_MAX_CHARS {
         Some(json)
     } else {
         let truncated: String = json.chars().take(ARGS_PREVIEW_MAX_CHARS).collect();
         Some(format!("{truncated}…[truncated]"))
+    }
+}
+
+/// Keys whose values are redacted in tool-argument audit previews.
+///
+/// This is a conservative allowlist of common secret-bearing key names.
+/// The match is case-sensitive on the exact key (not a substring match) to
+/// avoid over-redacting unrelated fields.
+const SENSITIVE_ARG_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "api-key",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "password",
+    "secret",
+    "authorization",
+    "auth",
+    "bearer",
+    "credential",
+    "credentials",
+    "private_key",
+    "private-key",
+    "client_secret",
+];
+
+/// Returns `true` if `key` matches a known-sensitive argument key
+/// (case-sensitive exact match).
+fn is_sensitive_arg_key(key: &str) -> bool {
+    SENSITIVE_ARG_KEYS.contains(&key)
+}
+
+/// Recursively walks a JSON value and replaces values for known-sensitive
+/// keys with `"[REDACTED]"`. Objects and arrays are traversed; scalars are
+/// returned unchanged.
+fn redact_sensitive_values(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (key, val) in map {
+                if is_sensitive_arg_key(key) {
+                    out.insert(key.clone(), Value::String("[REDACTED]".into()));
+                } else {
+                    out.insert(key.clone(), redact_sensitive_values(val));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(redact_sensitive_values).collect()),
+        _ => value.clone(),
     }
 }
 
@@ -165,6 +222,117 @@ mod tests {
         let preview = call.args_preview.expect("args present");
         assert!(preview.contains("[truncated]"));
         assert!(preview.chars().count() <= ARGS_PREVIEW_MAX_CHARS + 16);
+    }
+
+    #[test]
+    fn sensitive_keys_are_redacted_in_args_preview() {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "x",
+                "arguments": {
+                    "api_key": "sk-secret-12345",
+                    "password": "hunter2",
+                    "token": "abc-token",
+                    "normal_field": "visible",
+                }
+            }
+        });
+        let b = serde_json::to_vec(&req).expect("serialize");
+        let call = extract_tool_call(&b, "srv").expect("parse").expect("some");
+        let preview = call.args_preview.expect("args present");
+        assert!(
+            !preview.contains("sk-secret-12345"),
+            "api_key value must be redacted: {preview}"
+        );
+        assert!(
+            !preview.contains("hunter2"),
+            "password value must be redacted: {preview}"
+        );
+        assert!(
+            !preview.contains("abc-token"),
+            "token value must be redacted: {preview}"
+        );
+        assert!(
+            preview.contains("[REDACTED]"),
+            "redacted values must show [REDACTED]: {preview}"
+        );
+        assert!(
+            preview.contains("visible"),
+            "non-sensitive values must be visible: {preview}"
+        );
+    }
+
+    #[test]
+    fn nested_sensitive_keys_are_redacted() {
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "x",
+                "arguments": {
+                    "config": {
+                        "credentials": "secret-value",
+                        "host": "example.com",
+                    },
+                    "items": [
+                        { "api_key": "nested-secret" },
+                        { "name": "item2" }
+                    ]
+                }
+            }
+        });
+        let b = serde_json::to_vec(&req).expect("serialize");
+        let call = extract_tool_call(&b, "srv").expect("parse").expect("some");
+        let preview = call.args_preview.expect("args present");
+        assert!(
+            !preview.contains("secret-value"),
+            "nested credentials must be redacted: {preview}"
+        );
+        assert!(
+            !preview.contains("nested-secret"),
+            "array-item api_key must be redacted: {preview}"
+        );
+        assert!(
+            preview.contains("example.com"),
+            "non-sensitive nested values must be visible: {preview}"
+        );
+        assert!(
+            preview.contains("item2"),
+            "non-sensitive array items must be visible: {preview}"
+        );
+    }
+
+    #[test]
+    fn redaction_is_key_exact_match_not_substring() {
+        // A key like "api_key_url" should NOT be redacted (it's not in the
+        // sensitive list — only exact matches are redacted).
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "x",
+                "arguments": {
+                    "api_key_url": "https://example.com/keys",
+                    "key_id": "key-123"
+                }
+            }
+        });
+        let b = serde_json::to_vec(&req).expect("serialize");
+        let call = extract_tool_call(&b, "srv").expect("parse").expect("some");
+        let preview = call.args_preview.expect("args present");
+        assert!(
+            preview.contains("https://example.com/keys"),
+            "non-exact key match must not be redacted: {preview}"
+        );
+        assert!(
+            preview.contains("key-123"),
+            "key_id is not in the sensitive list: {preview}"
+        );
     }
 
     #[test]
