@@ -58,7 +58,16 @@ pub struct RateLimiter {
     refill_per_second: f64,
     /// The per-IP bucket states.
     buckets: Arc<Mutex<HashMap<IpAddr, BucketState>>>,
+    /// The window duration, used to compute the eviction threshold.
+    window: Duration,
+    /// Monotonic call counter for amortized eviction.
+    call_count: Arc<Mutex<u64>>,
 }
+
+/// Evict buckets that have been idle for at least this many window periods.
+const EVICT_AFTER_WINDOWS: u64 = 10;
+/// Evict on every Nth call to try_take to amortize the cost.
+const EVICT_EVERY_N_CALLS: u64 = 128;
 
 impl RateLimiter {
     /// Creates a new `RateLimiter` with the given capacity and window.
@@ -76,6 +85,8 @@ impl RateLimiter {
             capacity: f64::from(capacity),
             refill_per_second,
             buckets: Arc::new(Mutex::new(HashMap::new())),
+            window,
+            call_count: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -91,6 +102,17 @@ impl RateLimiter {
     pub fn try_take(&self, ip: IpAddr) -> Result<(), u64> {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().map_err(|_| 1u64)?;
+
+        // Amortized eviction: every EVICT_EVERY_N_CALLS, remove buckets that
+        // have been idle for at least EVICT_AFTER_WINDOWS window periods.
+        // This bounds memory growth from unique IPs without sweeping on
+        // every request.
+        if let Ok(mut count) = self.call_count.lock() {
+            *count = count.wrapping_add(1);
+            if *count % EVICT_EVERY_N_CALLS == 0 {
+                self.evict_stale_locked(&mut buckets, now);
+            }
+        }
 
         let entry = buckets.entry(ip).or_insert(BucketState {
             tokens: self.capacity,
@@ -111,6 +133,20 @@ impl RateLimiter {
             let retry_after_secs = (tokens_needed / self.refill_per_second).ceil() as u64;
             Err(retry_after_secs.max(1))
         }
+    }
+
+    /// Removes buckets whose `last_update` is older than
+    /// `EVICT_AFTER_WINDOWS * window`. The caller must hold the bucket lock.
+    fn evict_stale_locked(&self, buckets: &mut HashMap<IpAddr, BucketState>, now: Instant) {
+        let threshold = self.window * EVICT_AFTER_WINDOWS as u32;
+        buckets.retain(|_, state| now.duration_since(state.last_update) < threshold);
+    }
+
+    /// Returns the number of tracked IP buckets. Primarily for testing and
+    /// observability.
+    #[cfg(test)]
+    fn bucket_count(&self) -> usize {
+        self.buckets.lock().map(|b| b.len()).unwrap_or(0)
     }
 }
 
@@ -249,5 +285,62 @@ mod tests {
             limiter.try_take(test_ip()).is_ok(),
             "should refill after window"
         );
+    }
+
+    #[test]
+    fn evicts_stale_buckets() {
+        // Use a 10ms window so the eviction threshold (10x = 100ms) is
+        // reachable quickly. Capacity is large so we don't exhaust the
+        // bucket while triggering eviction.
+        let limiter = RateLimiter::new(1000, Duration::from_millis(10));
+
+        // Create buckets for several IPs.
+        for i in 0..5_u8 {
+            let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, i));
+            assert!(limiter.try_take(ip).is_ok());
+        }
+        assert_eq!(limiter.bucket_count(), 5, "five buckets created");
+
+        // Wait longer than the eviction threshold (10 * 10ms = 100ms).
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Trigger eviction by making EVICT_EVERY_N_CALLS calls. The stale
+        // buckets should be evicted; only the IP we just used remains.
+        for _ in 0..EVICT_EVERY_N_CALLS {
+            assert!(limiter.try_take(test_ip()).is_ok());
+        }
+        assert_eq!(
+            limiter.bucket_count(),
+            1,
+            "stale buckets must be evicted, only the active IP should remain"
+        );
+    }
+
+    #[test]
+    fn eviction_preserves_recently_used_buckets() {
+        let limiter = RateLimiter::new(1000, Duration::from_millis(10));
+
+        let recent_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let stale_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+
+        // Create both buckets.
+        assert!(limiter.try_take(stale_ip).is_ok());
+        // Wait so stale_ip becomes old, but not yet evictable.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(limiter.try_take(recent_ip).is_ok());
+        // Wait so stale_ip exceeds the threshold but recent_ip does not.
+        std::thread::sleep(Duration::from_millis(60));
+
+        // Trigger eviction.
+        for _ in 0..EVICT_EVERY_N_CALLS {
+            assert!(limiter.try_take(test_ip()).is_ok());
+        }
+        assert_eq!(
+            limiter.bucket_count(),
+            2,
+            "recent_ip and test_ip must survive; only stale_ip should be evicted"
+        );
+        // Verify recent_ip still has a working bucket (not exhausted).
+        assert!(limiter.try_take(recent_ip).is_ok());
     }
 }
