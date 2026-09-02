@@ -11,8 +11,9 @@ use serde_json::Value;
 /// A JSON-RPC 2.0 request/notification object.
 ///
 /// Mirrors the subset of JSON-RPC 2.0 that MCP clients send. Batch
-/// (array) messages are intentionally represented as `None` — see
-/// [`crate::parse`].
+/// (array) messages are rejected by [`parse_request_body`] with
+/// [`crate::McpError::BatchUnsupported`] — see that function's docs for
+/// the security rationale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
     /// Always `"2.0"`.
@@ -66,9 +67,12 @@ pub struct JsonRpcErrorObj {
 /// Parses a raw request body into a JSON-RPC request object.
 ///
 /// Returns `Ok(None)` when the body is not a JSON-RPC *request* the proxy
-/// needs to enforce (e.g. it is a response, an empty object, or a batch
-/// that v1 does not support). Returns an error for malformed UTF-8 or
-/// malformed JSON.
+/// needs to enforce (e.g. it is a response, an empty object, or a scalar).
+/// Returns `Err(McpError::BatchUnsupported)` for JSON-RPC batch (array)
+/// messages so the proxy boundary can reject them — silently passing a
+/// batch through would bypass per-tool permission enforcement, since a
+/// batch can contain `tools/call` requests that are never individually
+/// inspected. Returns an error for malformed UTF-8 or malformed JSON.
 ///
 /// # Errors
 ///
@@ -80,7 +84,7 @@ pub fn parse_request_body(body: &[u8]) -> Result<Option<JsonRpcRequest>, crate::
     let value: Value =
         serde_json::from_str(text).map_err(|e| crate::McpError::InvalidJsonRpc(e.to_string()))?;
     match value {
-        Value::Array(_) => Ok(None),
+        Value::Array(_) => Err(crate::McpError::BatchUnsupported),
         Value::Object(_) => {
             let req: JsonRpcRequest = serde_json::from_value(value).map_err(|e| {
                 crate::McpError::Malformed(format!("missing jsonrpc/method fields: {e}"))

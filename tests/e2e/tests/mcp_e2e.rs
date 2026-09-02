@@ -633,6 +633,75 @@ async fn relay_activity_records_mcp_metadata() {
     assert_eq!(mcp.central_status, Some(200));
 }
 
+#[tokio::test]
+async fn batch_jsonrpc_is_rejected_at_per_server_endpoint() {
+    // A JSON-RPC batch (array) containing a tools/call must be rejected at
+    // the per-server /mcp/{server} endpoint, not forwarded verbatim —
+    // otherwise the tools/call inside the batch would bypass per-tool
+    // permission enforcement.
+    let (relay_addr, client, key, _server, _audit, _key_store) = setup_mcp_system().await;
+    let url = format!("http://{relay_addr}/mcp/fs");
+
+    let batch = serde_json::json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": { "name": "read_file", "arguments": {} } },
+        { "jsonrpc": "2.0", "id": 2, "method": "tools/list" }
+    ]);
+
+    let resp = client
+        .post(&url)
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .json(&batch)
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "batch must be rejected, not forwarded"
+    );
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    assert!(
+        body.get("error").is_some(),
+        "response must carry a JSON-RPC error object"
+    );
+}
+
+#[tokio::test]
+async fn batch_jsonrpc_is_rejected_at_hub_endpoint() {
+    // The combined /mcp hub must also reject batches.
+    let (relay_addr, client, key, _central_db) = setup_hub_system().await;
+    let url = format!("http://{relay_addr}/mcp");
+
+    let batch = serde_json::json!([
+        { "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": { "name": "fs__read_file", "arguments": {} } }
+    ]);
+
+    let resp = client
+        .post(&url)
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .json(&batch)
+        .send()
+        .await
+        .expect("request");
+    // The hub returns 200 with a JSON-RPC error (not 4xx) because JSON-RPC
+    // errors are delivered in the response body, not via HTTP status.
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.expect("json body");
+    let code = body
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(|c| c.as_i64());
+    assert_eq!(
+        code,
+        Some(-32600),
+        "hub must return -32600 invalid request for batches"
+    );
+}
+
 // --- Combined /mcp hub tests ---
 
 #[tokio::test]
