@@ -151,12 +151,11 @@ async fn handle_tools_call(
     raw_body: &[u8],
     start: Instant,
 ) -> Response<Body> {
-    // Extract the tool name from the JSON-RPC body.
-    let tool_name = oac_mcp::parse::extract_tool_call(raw_body, "hub")
+    // Extract the tool name and args preview from the JSON-RPC body.
+    let parsed = oac_mcp::parse::extract_tool_call(raw_body, "hub")
         .ok()
-        .flatten()
-        .map(|call| call.tool);
-    let Some(tool_name) = tool_name else {
+        .flatten();
+    let Some(call) = parsed else {
         let _ = record_hub_audit(
             state,
             identity,
@@ -169,6 +168,7 @@ async fn handle_tools_call(
         .await;
         return json_rpc_error(StatusCode::BAD_REQUEST, -32700, "malformed tools/call");
     };
+    let tool_name = call.tool;
 
     // Split into server + tool.
     let Some((server, tool)) = hub::split_tool_name(&tool_name) else {
@@ -286,30 +286,51 @@ async fn handle_tools_call(
     let rewritten = rewrite_tool_name(raw_body, tool);
     match call_upstream(state, server, &resolved, &rewritten).await {
         Ok((resp, status, _stream)) => {
-            let _ = record_hub_audit(
-                state,
-                identity,
-                METHOD_TOOLS_CALL,
-                &tool_name,
-                status,
-                start,
-                None,
-            )
-            .await;
+            // Audit with the real target server and the unprefixed tool
+            // name (plus the redacted args preview) — consistent with the
+            // per-server endpoint and with how denials are recorded.
+            if let Some(identity) = identity {
+                let grant = McpGrant {
+                    server: server.to_string(),
+                    method: METHOD_TOOLS_CALL.to_string(),
+                    tool: tool.to_string(),
+                    decision: "allowed".to_string(),
+                    reason: None,
+                    args_preview: call.args_preview.clone(),
+                };
+                record_mcp_audit(
+                    state,
+                    identity,
+                    &grant,
+                    status,
+                    start.elapsed().as_millis() as i64,
+                    false,
+                )
+                .await;
+            }
             resp
         }
         Err(e) => {
             tracing::error!(error = %e, server = %server, "hub: upstream call failed");
-            let _ = record_hub_audit(
-                state,
-                identity,
-                METHOD_TOOLS_CALL,
-                &tool_name,
-                StatusCode::BAD_GATEWAY,
-                start,
-                None,
-            )
-            .await;
+            if let Some(identity) = identity {
+                let grant = McpGrant {
+                    server: server.to_string(),
+                    method: METHOD_TOOLS_CALL.to_string(),
+                    tool: tool.to_string(),
+                    decision: "allowed".to_string(),
+                    reason: None,
+                    args_preview: call.args_preview.clone(),
+                };
+                record_mcp_audit(
+                    state,
+                    identity,
+                    &grant,
+                    StatusCode::BAD_GATEWAY,
+                    start.elapsed().as_millis() as i64,
+                    false,
+                )
+                .await;
+            }
             json_rpc_error(
                 StatusCode::BAD_GATEWAY,
                 -32603,
