@@ -1,7 +1,11 @@
 # Host-side relay config for testing the OIDC login flow against the dev
 # Keycloak. Used only for manual verification of `oac-relay login`.
+#
+# Listens on 8788 to avoid a port conflict with the Docker dev relay, which
+# serves on 8787. (The OIDC login callback binds an ephemeral loopback port
+# per RFC 8252, so only this serve port needs to differ.)
 
-listen_addr = "127.0.0.1:8787"
+listen_addr = "127.0.0.1:8788"
 database_url = "sqlite:///tmp/oac-relay-login-test.db"
 dev_mode = true
 
