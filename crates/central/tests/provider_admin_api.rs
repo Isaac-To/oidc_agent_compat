@@ -208,7 +208,7 @@ async fn provider_crud_rejects_invalid_payloads() {
         .oneshot(admin_request("POST", "/admin/v1/providers", Some(bad_url)))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let mut missing = provider_body();
     missing["id"] = serde_json::json!("");
@@ -217,7 +217,7 @@ async fn provider_crud_rejects_invalid_payloads() {
         .oneshot(admin_request("POST", "/admin/v1/providers", Some(missing)))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -480,7 +480,7 @@ async fn key_add_rejects_invalid_bodies() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let resp = router
         .clone()
@@ -495,7 +495,7 @@ async fn key_add_rejects_invalid_bodies() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -602,7 +602,7 @@ async fn blank_group_entries_are_rejected_with_a_clear_error() {
             .unwrap();
         assert_eq!(
             resp.status(),
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_REQUEST,
             "blank groups must not be accepted: {bad_groups}"
         );
         let body = body_string(resp).await;
