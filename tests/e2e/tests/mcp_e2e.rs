@@ -835,7 +835,7 @@ async fn hub_tools_list_aggregates_prefixed_and_filters_by_policy() {
 
 #[tokio::test]
 async fn hub_tools_call_routes_to_correct_upstream() {
-    let (relay_addr, client, key, _central_db) = setup_hub_system().await;
+    let (relay_addr, client, key, central_db) = setup_hub_system().await;
     let url = format!("http://{relay_addr}/mcp");
 
     // fs__read_file is allowed and routed to the "fs" upstream.
@@ -854,6 +854,21 @@ async fn hub_tools_call_routes_to_correct_upstream() {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert_eq!(text, "fs-content", "routed to fs upstream");
+
+    // The audit row must attribute the call to the real target server with
+    // the unprefixed tool name (not server "hub" / "fs__read_file").
+    use sea_orm::EntityTrait;
+    let entries = oac_central::entity::audit_log::Entity::find()
+        .all(&central_db)
+        .await
+        .expect("audit load");
+    let row = entries
+        .iter()
+        .find(|e| e.mcp_method.as_deref() == Some("tools/call"))
+        .expect("hub tools/call audit row");
+    assert_eq!(row.mcp_server.as_deref(), Some("fs"));
+    assert_eq!(row.mcp_tool.as_deref(), Some("read_file"));
+    assert_eq!(row.permission_decision.as_deref(), Some("allowed"));
 }
 
 #[tokio::test]
