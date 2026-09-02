@@ -246,7 +246,7 @@ impl RelayConfig {
     /// - `oidc.issuer` is empty or not a valid URL.
     /// - `oidc.client_id` is empty.
     /// - `oidc.client_secret_env` is empty.
-    /// - `oidc.redirect_uri` does not start with `http://127.0.0.1`.
+    /// - `oidc.redirect_uri` is not a loopback `http` URL (RFC 8252 §7.3).
     /// - `central.url` is empty or not `https://`.
     pub fn validate(&self) -> Result<()> {
         if !self.dev_mode {
@@ -339,6 +339,11 @@ fn validate_oidc(oidc: &OidcConfig) -> Result<()> {
             oidc.redirect_uri
         )));
     }
+    // Strong check: parse the URL and verify the host is a loopback address.
+    // The starts_with guard above gives a fast early rejection and a clear
+    // message; this catches bypasses like http://127.0.0.1.evil.com/cb
+    // that a prefix check alone would accept.
+    crate::oidc::validate_loopback_redirect(&oidc.redirect_uri)?;
     Ok(())
 }
 
@@ -503,6 +508,21 @@ server_key_path = "/server.key"
         );
         let err = RelayConfig::from_toml(&toml).unwrap_err();
         assert!(err.to_string().contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn relay_rejects_redirect_uri_with_subdomain_bypass() {
+        // A naive starts_with("http://127.0.0.1") check would accept this,
+        // but the host is 127.0.0.1.evil.com — not a loopback address.
+        let toml = valid_relay_toml().replace(
+            "http://127.0.0.1:0/callback",
+            "http://127.0.0.1.evil.com/callback",
+        );
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("loopback"),
+            "must reject subdomain bypass: {err}"
+        );
     }
 
     #[test]
