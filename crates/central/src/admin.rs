@@ -105,7 +105,7 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/admin/v1/mcp/servers",
-            get(list_mcp_servers).post(upsert_mcp_server),
+            get(list_mcp_servers).post(create_mcp_server),
         )
         .route(
             "/admin/v1/mcp/servers/{id}",
@@ -1310,7 +1310,9 @@ async fn record_admin_audit(
 /// Request body for creating/updating an MCP server.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct McpServerRequest {
-    /// Stable server identifier (required on create; `{id}` path on update).
+    /// Stable server identifier. Required on `POST /admin/v1/mcp/servers`
+    /// (the collection route has no `{id}` path segment); ignored on `PUT`
+    /// `/admin/v1/mcp/servers/{id}`, where the path `{id}` wins.
     #[serde(default)]
     pub id: String,
     /// Human-readable name.
@@ -1384,19 +1386,42 @@ async fn list_mcp_servers(
     ))
 }
 
+/// Creates an MCP server from a body that must carry its own `id`
+/// (there is no `{id}` path segment on the collection route).
+async fn create_mcp_server(
+    State(state): State<AdminState>,
+    admin: AdminIdentity,
+    axum::Json(body): axum::Json<McpServerRequest>,
+) -> HandlerResult<axum::Json<McpServerResponse>> {
+    if body.id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "MCP server id must not be empty on create (POST /admin/v1/mcp/servers)".to_string(),
+        ));
+    }
+    store_mcp_server(state, admin, body.id.clone(), body).await
+}
+
+/// Creates or replaces the MCP server with the `{id}` from the path; a
+/// body `id`, if present, is ignored (the path wins).
 async fn upsert_mcp_server(
     State(state): State<AdminState>,
     admin: AdminIdentity,
     Path(id): Path<String>,
     axum::Json(body): axum::Json<McpServerRequest>,
 ) -> HandlerResult<axum::Json<McpServerResponse>> {
-    let actual_id = if body.id.is_empty() {
-        id
-    } else {
-        body.id.clone()
-    };
+    store_mcp_server(state, admin, id, body).await
+}
+
+/// Shared persistence + audit path for MCP server create/upsert.
+async fn store_mcp_server(
+    state: AdminState,
+    admin: AdminIdentity,
+    id: String,
+    body: McpServerRequest,
+) -> HandlerResult<axum::Json<McpServerResponse>> {
     let input = crate::mcp::McpServerInput {
-        id: actual_id.clone(),
+        id: id.clone(),
         name: body.name,
         base_url: body.base_url,
         enabled: body.enabled,
@@ -1411,7 +1436,7 @@ async fn upsert_mcp_server(
         state.audit.db(),
         &admin.subject,
         "upsert_mcp_server",
-        &actual_id,
+        &id,
         None,
     )
     .await;
