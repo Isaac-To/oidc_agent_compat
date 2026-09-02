@@ -1,3 +1,5 @@
 [toolchain]
-channel = "stable"
+# Pinned to match the Docker builder images (rust:1.98-slim). Bump in
+# lockstep with the Dockerfiles when upgrading.
+channel = "1.98"
 components = ["rustfmt", "clippy"]

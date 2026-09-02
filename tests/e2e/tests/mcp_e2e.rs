@@ -560,7 +560,7 @@ async fn allowed_tool_is_forwarded_and_audited() {
 }
 
 #[tokio::test]
-async fn denied_tool_returns_403_and_is_denited_in_audit() {
+async fn denied_tool_returns_403_and_is_denied_in_audit() {
     let (relay_addr, client, key, _server, audit, _key_store) = setup_mcp_system().await;
     let url = format!("http://{relay_addr}/mcp/fs");
 
