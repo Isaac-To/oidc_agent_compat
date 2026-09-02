@@ -30,8 +30,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
-use oidc_agent_common::config::AdminConfig;
-use oidc_agent_common::error::{Error, Result};
+use oidc_agent_common::error::Error;
 
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
@@ -1559,20 +1558,6 @@ fn map_mcp_err(e: oidc_agent_common::error::Error) -> (StatusCode, String) {
     }
 }
 
-/// Validates the admin config at startup. Currently a no-op since the
-/// config is simple (just a group name), but reserved for future
-/// validation logic.
-///
-/// # Errors
-///
-/// Returns [`Error::Config`] if the admin group is empty.
-pub fn validate_admin_config(config: &AdminConfig) -> Result<()> {
-    if config.admin_group.is_empty() {
-        return Err(Error::config("admin.admin_group must not be empty"));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1709,19 +1694,37 @@ mod tests {
     }
 
     #[test]
-    fn validate_admin_config_rejects_empty_group() {
-        let config = AdminConfig {
-            admin_group: "".into(),
+    fn empty_admin_group_fails_config_validation() {
+        // Enforced at config load by CentralConfig::validate (common crate)
+        // so a misconfigured admin section fails fast at startup.
+        let build = |admin_group: &str| oidc_agent_common::config::CentralConfig {
+            listen_addr: "0.0.0.0:8443".parse().expect("addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: oidc_agent_common::config::OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "c".into(),
+                client_secret_env: "S".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            mtls: oidc_agent_common::config::MtlsServerConfig {
+                ca_cert_path: "/ca.pem".into(),
+                server_cert_path: "/s.pem".into(),
+                server_key_path: "/s.key".into(),
+            },
+            admin: Some(oidc_agent_common::config::AdminConfig {
+                admin_group: admin_group.into(),
+            }),
+            pricing: None,
+            dev_mode: true,
+            rate_limit_requests: 60,
+            rate_limit_window_secs: 60,
         };
-        assert!(validate_admin_config(&config).is_err());
-    }
-
-    #[test]
-    fn validate_admin_config_accepts_nonempty_group() {
-        let config = AdminConfig {
-            admin_group: "oac-admins".into(),
-        };
-        assert!(validate_admin_config(&config).is_ok());
+        assert!(
+            build("").validate().is_err(),
+            "empty admin_group must fail startup"
+        );
+        assert!(build("oac-admins").validate().is_ok());
     }
 
     #[tokio::test]
