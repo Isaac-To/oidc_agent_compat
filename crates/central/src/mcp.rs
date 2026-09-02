@@ -15,7 +15,7 @@ use sea_orm::{
     ActiveModelTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryOrder, Set, Statement,
     Value,
 };
-use sha2::{Digest, Sha256};
+// sha2 is used indirectly via crate::crypto::sha256_hex.
 use zeroize::Zeroizing;
 
 use oidc_agent_common::error::{Error, Result};
@@ -155,29 +155,13 @@ impl McpManager {
 
     /// Parses a 32-byte AES key from a hexadecimal string.
     ///
+    /// Delegates to [`crate::crypto::encryption_key_from_hex`].
+    ///
     /// # Errors
     /// Returns [`Error::Config`] if the value is not exactly 64 hexadecimal
     /// characters.
     pub fn encryption_key_from_hex(value: &str) -> Result<Zeroizing<[u8; 32]>> {
-        let trimmed = value.trim();
-        if trimmed.len() != 64 {
-            return Err(Error::Config(
-                "MCP encryption key must be exactly 64 hexadecimal characters".into(),
-            ));
-        }
-        let mut key = Zeroizing::new([0u8; 32]);
-        for (i, chunk) in trimmed.as_bytes().chunks(2).enumerate() {
-            let byte = u8::from_str_radix(
-                std::str::from_utf8(chunk)
-                    .map_err(|_| Error::Config("MCP encryption key must be hexadecimal".into()))?,
-                16,
-            )
-            .map_err(|_| Error::Config("MCP encryption key must be hexadecimal".into()))?;
-            if let Some(slot) = key.get_mut(i) {
-                *slot = byte;
-            }
-        }
-        Ok(key)
+        crate::crypto::encryption_key_from_hex(value)
     }
 
     /// Creates a new MCP server, encrypting any supplied auth header.
@@ -355,20 +339,6 @@ fn decrypt(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8]) -> Result<Zeroizing<
         .decrypt(&nonce, ciphertext)
         .map_err(|_| Error::crypto("decrypt MCP auth header"))?;
     Ok(Zeroizing::new(plain))
-}
-
-/// Computes the SHA-256 of a value (used for diagnostics; never stored where
-/// it would leak).
-#[allow(dead_code)]
-pub(crate) fn sha256_hex(value: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value);
-    let out = hasher.finalize();
-    let mut s = String::with_capacity(64);
-    for b in out.iter() {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 #[cfg(test)]
