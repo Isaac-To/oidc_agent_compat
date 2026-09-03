@@ -62,8 +62,8 @@ Agent → [127.0.0.1 relay] → mTLS → [central proxy] → [OpenAI-compatible 
 - **Device revocation** — relay identities are auto-registered on their
   first request; administrators can revoke or reinstate them.
 - **Session expiry** — OIDC-login keys expire after 24 hours by default;
-  configure `session_ttl_hours` or explicitly set it to `none` for legacy
-  compatibility.
+  configure `session_ttl_hours` to change the lifetime (expiry cannot be
+  disabled).
 - **No `unsafe` code** — `#![forbid(unsafe_code)]` across all crates.
 
 ## Remaining deployment-specific work

@@ -22,7 +22,7 @@ minimal production config:
 
 ```toml
 listen_addr = "127.0.0.1:8787"
-database_url = "sqlite:///data/relay.db"
+database_url = "sqlite://~/.oac/relay.db"
 dev_mode = false
 
 [oidc]
@@ -50,6 +50,9 @@ Key points:
 - `scopes` should include `groups` if you want group-based authorization
   enforced by the central proxy.
 - `central.url` must be `https://` in production (mTLS enforced).
+- Cert paths (`ca_cert_path`, `client_cert_path`, `client_key_path`) must
+  be absolute — `~` is **not** expanded (only `sqlite://` database URLs
+  expand `~`).
 
 See [Configuration Reference](./configuration.md) for all fields.
 
@@ -64,7 +67,7 @@ export OAC_OIDC_CLIENT_SECRET="your-oidc-client-secret"
 ### `oac-relay login` — authenticate and configure the agent
 
 ```sh
-oac-relay login --config config.toml
+oac-relay --config ~/.oac/relay.toml login
 ```
 
 This runs the full OIDC authorization-code + PKCE flow:
@@ -90,7 +93,9 @@ The agent config is written to one of:
 | Codex | `~/.codex/config.json` (or `$CODEX_HOME/config.json`) | JSON: `{"api_base_url": "...", "api_key": "..."}` |
 | Generic | `~/.oac/agent-env.sh` | Shell: `export OPENAI_API_BASE='...'` / `export OPENAI_API_KEY='...'` |
 
-The file is created with `0600` permissions.
+The Codex config is used only if `CODEX_HOME` is set or
+`~/.codex/config.json` already exists; otherwise the generic env file is
+written. The file is created with `0600` permissions.
 
 On success, the relay prints:
 
@@ -101,7 +106,7 @@ oac-relay: login successful for alice@example.com (agent config written to /home
 ### `oac-relay serve` — start the relay server
 
 ```sh
-oac-relay serve --config config.toml
+oac-relay --config ~/.oac/relay.toml serve
 ```
 
 - Opens the SQLite DB (runs migrations, enforces `0600` perms).
@@ -113,10 +118,12 @@ oac-relay serve --config config.toml
 ### `oac-relay logout` — revoke all local keys
 
 ```sh
-oac-relay logout --config config.toml
+oac-relay --config ~/.oac/relay.toml logout
 ```
 
-Revokes all API keys for all identities stored in the local DB. Prints
+Revokes all API keys for all identities stored in the local DB. The agent
+config file is **not** deleted — the key stays in the file but stops
+working; run `login` again to mint a fresh key. Prints
 `oac-relay: revoked N key(s)`.
 
 ### `oac-relay print-key` — re-print the API key
@@ -132,7 +139,7 @@ auto-injected config.
 ### `oac-relay list-keys` — list all local keys
 
 ```sh
-oac-relay list-keys --config config.toml
+oac-relay --config ~/.oac/relay.toml list-keys
 ```
 
 Lists all API keys in the local DB: id, label, created_at, last_used_at.
@@ -140,11 +147,11 @@ Lists all API keys in the local DB: id, label, created_at, last_used_at.
 ### `oac-relay revoke-key <KEY_ID>` — revoke a single key
 
 ```sh
-oac-relay revoke-key <key-id> --config config.toml
+oac-relay --config ~/.oac/relay.toml revoke-key <key-id>
 ```
 
-Revokes a single key by its ID. Prints `revoked key <id>` or
-`key <id> not found`.
+Revokes a single key by its ID. Prints `oac-relay: revoked key <id>` or
+`oac-relay: key <id> not found`.
 
 ## How the agent connects
 

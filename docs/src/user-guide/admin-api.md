@@ -1,8 +1,9 @@
 # Admin API
 
 The central proxy exposes an admin API at `/admin/v1/` for managing group
-policies, providers, provider API keys, devices, audit logs, usage, and quotas. The admin API is only
-mounted if `[admin]` is present in the central config.
+policies, providers, provider API keys, MCP servers, MCP policies, devices,
+audit logs, usage, and quotas. The admin API is only mounted if `[admin]` is
+present in the central config.
 
 ## Authentication
 
@@ -35,7 +36,11 @@ API-key material.
 
 #### `POST /admin/v1/providers`
 
-Create or update a provider.
+Create or update (upsert) a provider. `id`, `name`, and `base_url` are
+required; `enabled` is optional (default `true`) and `is_default` is
+optional (default `false`). **Response:** `200` — the stored provider JSON
+(not `201`). Missing required fields → `422`; invalid input (empty
+`id`/`name`, invalid `base_url`) → `400`.
 
 ```json
 {
@@ -54,25 +59,36 @@ providers. At most one provider is marked as the default.
 
 #### `GET|PUT|DELETE /admin/v1/providers/{id}`
 
-Get, update, or delete a provider. Deleting a provider also deletes its keys.
-`PUT` uses the same fields as provider creation, except `id` is taken from the
-path.
+Get, update, or delete a provider. Unlike `POST`, `PUT` requires `name`,
+`base_url`, `enabled`, and `is_default` (all mandatory; missing → `422`) and
+returns `404` when the provider does not exist (`POST` upserts instead).
+`PUT` uses the same fields as provider creation, except `id` is taken from
+the path. `DELETE` → `204` (`404` if missing); deleting a provider also
+deletes its keys.
 
 #### `POST /admin/v1/providers/{id}/default`
 
-Mark an enabled provider as the default fallback.
+Mark an enabled provider as the default fallback. **Response:** `204` on
+success; `400` when the provider is unknown or disabled (not `404`).
 
 ### Provider keys
 
 #### `GET /admin/v1/providers/{id}/keys`
 
-List key metadata: key ID, label, priority, digest, enabled state, and allowed
-groups. Plaintext and encrypted key material are never returned.
+List key metadata. Each entry has `id`, `provider_id`, `label`, `priority`,
+`key_digest`, `enabled`, and `allowed_groups`. Plaintext and encrypted key
+material are never returned. `404` when the provider is unknown.
+
+#### `GET /admin/v1/providers/{id}/keys/{key_id}`
+
+Get a single key's metadata (same shape as the list entries), or `404` when
+the provider or key is unknown.
 
 #### `POST /admin/v1/providers/{id}/keys`
 
 Add a key. The plaintext is accepted once and encrypted with AES-256-GCM
-before it is stored.
+before it is stored. **Response:** `200` — key metadata JSON (not `201`);
+`404` when the provider is unknown; invalid input (empty key/label) → `400`.
 
 ```json
 {
@@ -91,7 +107,21 @@ tries the next authorized enabled key.
 #### `PUT|DELETE /admin/v1/providers/{id}/keys/{key_id}`
 
 Update key metadata/access rules or delete a key. Key plaintext cannot be
-changed by `PUT`; add a replacement key for rotation.
+changed by `PUT`; add a replacement key for rotation. `PUT` body:
+
+```json
+{
+  "label": "production-primary",
+  "priority": 0,
+  "enabled": true,
+  "allowed_groups": ["engineering"]
+}
+```
+
+`label`, `priority`, and `enabled` are required (missing → `422`);
+`allowed_groups` is optional (default `[]`). **Responses:** `PUT` → `200`
+with key metadata; `DELETE` → `204` (`404` when the provider or key is
+unknown).
 
 ### Group policies
 
@@ -185,16 +215,53 @@ table.
 `user_subject`, `identity_id`, `email`, `groups`, `model`, `backend`,
 `endpoint`, `request_id`, `status`, `latency_ms`, `stream`,
 `prompt_tokens`, `completion_tokens`, `total_tokens`,
-`permission_decision`, `denial_reason`, `cost_usd`, `created_at`
-(formatted `YYYY-MM-DD HH:MM:SS`). When the token saver ran on a request,
-entries also carry `token_saver_applied`, `tokens_saved`, `messages_dropped`,
-and `saver_reasons`.
+`permission_decision`, `denial_reason`, `cost_usd`,
+`token_saver_applied`, `tokens_saved`, `messages_dropped`, `saver_reasons`,
+`created_at` (formatted `YYYY-MM-DD HH:MM:SS`). The four token-saver fields
+are present in **every** entry (`null` when the saver did not run on that
+request).
+
+### Token saver
+
+#### `GET /admin/v1/token-saver`
+
+Aggregate token-saver engagement so admins can observe what the saver is
+doing across groups.
+
+**Response:** `200` — an object with:
+
+```json
+{
+  "groups": [
+    {
+      "group": "engineering",
+      "enabled": true,
+      "max_input_tokens": 8000,
+      "requests_optimized": 12,
+      "tokens_saved": 3400,
+      "messages_dropped": 24
+    }
+  ],
+  "total_requests_optimized": 12,
+  "total_tokens_saved": 3400,
+  "total_messages_dropped": 24
+}
+```
+
+`requests_optimized` counts audit rows where the saver applied; `tokens_saved`
+and `messages_dropped` are sums across those rows. Each optimized request is
+attributed to the **first** group in its audit row's `groups` array (or
+`"unknown"` when unset), and a group that has a policy but zero optimized
+requests still gets a row (with zeroed counters). The `enabled` and
+`max_input_tokens` fields reflect the *current* policy configuration. This
+endpoint returns metrics only — never prompt content.
 
 ### Usage
 
 #### `GET /admin/v1/usage`
 
-Query usage counters.
+Query usage counters. Returns **only today's (UTC)** usage rows; there are
+no date-range or pagination parameters.
 
 **Query parameters:**
 
@@ -214,8 +281,11 @@ Get quota status for a user.
 
 The response includes the groups snapshot from the user's most recent usage
 record and resolves `daily_request_quota` and `daily_token_quota` using the
-same most-permissive-wins policy merge used for enforcement. If the user has
-not made a request today, the groups are unknown and both quotas are `null`.
+same most-permissive-wins policy merge used for enforcement. `groups` is the
+raw JSON array **string** from the usage snapshot (e.g.
+`"[\"engineering\"]"`), not a parsed array. If the user has not made a
+request today, `groups` and both quotas are `null` and the counters are
+`request_count: 0`, `token_count: 0`, `cost_usd: 0.0`.
 
 ---
 
@@ -227,11 +297,15 @@ No MCP server URL or auth header is stored in the central TOML configuration.
 #### `GET /admin/v1/mcp/servers`
 
 List configured MCP servers. Response bodies contain metadata only — never
-any auth header.
+any auth header value; each entry carries a `has_auth: bool` instead.
 
 #### `POST /admin/v1/mcp/servers`
 
-Create or update an MCP server.
+Create an MCP server (an existing `id` is replaced). The body must carry
+its own non-empty `id` (`400` when missing or empty); `name` and `base_url`
+are required, `enabled` defaults to `true`, and `auth_header` is optional.
+**Response:** `200` — `{ "id", "name", "base_url", "enabled",
+"has_auth" }`.
 
 ```json
 {
@@ -243,20 +317,26 @@ Create or update an MCP server.
 }
 ```
 
-`auth_header` is optional. When present it is attached to every request that
-central forwards to this server and is **encrypted at rest** (AES-256-GCM)
-with the master encryption key. It is never returned by any API and never
-logged.
+`auth_header` is an optional `"Header: value"` pair. When present it is
+attached to every request that central forwards to this server and is
+**encrypted at rest** (AES-256-GCM) with the provider encryption key
+(`OAC_PROVIDER_ENCRYPTION_KEY` / `/run/secrets/provider-encryption-key`).
+It is never returned by any API (only `has_auth`) and never logged.
 
-> **Naming constraint:** a server `id` must not contain `__` (double
-> underscore). The hub reserves `__` as the separator between a server id
-> and a tool name (`github__list_files`).
+> **Naming constraints:** a server `id` must be non-empty and must not
+> contain `__`, `/`, or spaces (`400`); `name` must be non-empty (`400`).
+> The hub reserves `__` as the separator between a server id and a tool
+> name (`github__list_files`).
 
 #### `GET|PUT|DELETE /admin/v1/mcp/servers/{id}`
 
-Get, update, or delete an MCP server. `PUT` matches the `POST` body except
-`id` is taken from the path. Deleting a server removes it from the registry;
-existing per-group policies that reference it become inert.
+Get, update, or delete an MCP server. `GET` returns `404` when the id is
+unknown. `PUT` creates or replaces the server identified by the **path**
+`{id}` — the path id always wins and a body `id` is ignored — with the same
+body otherwise as `POST`. `DELETE` returns `200` with `{"deleted": <bool>}`
+and never `404` (`"deleted": false` means the id was unknown). Deleting a
+server removes it from the registry; existing per-group policies that
+reference it become inert.
 
 ### MCP policies
 
@@ -275,21 +355,34 @@ Get a group's MCP policy.
 { "group_name": "engineering", "allowed_tools": ["github:list_files"] }
 ```
 
-`allowed_tools: null` means **all tools allowed** on all configured servers.
 `allowed_tools: []` means **no tools allowed**.
+
+> **Ambiguity warning:** `allowed_tools: null` is returned both for an
+> explicit **allow-all** policy *and* for a group with **no policy row at
+> all** — but enforcement differs: an allow-all policy permits every tool,
+> while no policy means deny-all. To tell them apart, check whether the group
+> was ever configured: an allow-all policy was explicitly `PUT` with
+> `allowed_tools` omitted, whereas no row at all means the group was never
+> configured and gets deny-all enforcement.
 
 #### `PUT /admin/v1/mcp/policies/{group}`
 
-Set (replace) a group's MCP policy.
+Set (replace) a group's MCP policy. Omitting `allowed_tools` entirely stores
+an **allow-all** policy; an explicit `[]` stores a **deny-all** policy.
 
 ```json
 { "allowed_tools": ["fs:read_file"] }
 ```
 
+Entries are exact `"server:tool"` string matches — no wildcards or
+prefixes.
+
 #### `DELETE /admin/v1/mcp/policies/{group}`
 
-Delete the group's policy. A group with no policy and no allow-all policy on
-a relevant group **cannot call any tools** (tools are deny-by-default).
+Delete the group's policy. **Response:** `200` with `{"deleted": <bool>}`
+(never `404`). A group with no policy **cannot call any tools** — unless
+another of the caller's groups grants them — because tools are
+deny-by-default.
 
 ---
 
@@ -339,38 +432,6 @@ a relevant group **cannot call any tools** (tools are deny-by-default).
 ```
 
 All fields are optional (`null` = all/unlimited).
-
-### Token saver
-
-#### `GET /admin/v1/token-saver`
-
-Aggregate token-saver engagement so admins can observe what the saver is
-doing across groups.
-
-**Response:** `200` — an object with:
-
-```json
-{
-  "groups": [
-    {
-      "group": "engineering",
-      "enabled": true,
-      "max_input_tokens": 8000,
-      "requests_optimized": 12,
-      "tokens_saved": 3400,
-      "messages_dropped": 24
-    }
-  ],
-  "total_requests_optimized": 12,
-  "total_tokens_saved": 3400,
-  "total_messages_dropped": 24
-}
-```
-
-`requests_optimized` counts audit rows where the saver applied; `tokens_saved`
-and `messages_dropped` are sums across those rows. The `enabled` and
-`max_input_tokens` fields reflect the *current* policy configuration. This
-endpoint returns metrics only — never prompt content.
 
 ### `DeviceResponse`
 
@@ -430,13 +491,32 @@ If no policies exist for any of the user's groups, the default policy is
 
 ## Admin audit logging
 
-All mutations (`upsert_policy`, `delete_policy`, `revoke_device`,
-`reinstate_device`) are recorded in the `admin_audit_log` table, which is
-append-only (enforced by SQLite triggers that abort UPDATE/DELETE).
+All admin mutations are recorded in the `admin_audit_log` table, which is
+append-only (enforced by SQLite triggers that abort UPDATE/DELETE). Recorded
+actions: `upsert_policy`, `delete_policy`, `revoke_device`,
+`reinstate_device`, `upsert_provider` (create and update), `delete_provider`,
+`set_default_provider`, `add_provider_key`, `update_provider_key`,
+`delete_provider_key`, `upsert_mcp_server`, `delete_mcp_server`,
+`upsert_mcp_policy`, `delete_mcp_policy`.
 
 ---
 
 ## CLI equivalents
 
-All admin API operations are available via the `oac-central admin` CLI.
-See [CLI Reference](./cli-reference.md#admin) for the full command list.
+Most admin operations are available via the `oac-central admin` CLI:
+providers (list/set/delete/default), provider keys (list/add/delete), group
+policies (list/get/set/delete), devices (list/revoke/reinstate), audit
+queries, usage queries, and quota status. See
+[CLI Reference](./cli-reference.md#admin) for the full command list.
+
+Not available via the CLI — use the HTTP API directly (e.g. `curl` through
+the relay):
+
+- `GET`/`PUT` a single provider key
+  (`/admin/v1/providers/{id}/keys/{key_id}`)
+- `GET /admin/v1/token-saver`
+- all MCP endpoints (`/admin/v1/mcp/servers`, `/admin/v1/mcp/policies`)
+
+Also note that the CLI `policy-set` cannot set `token_saver_enabled`,
+`max_input_tokens`, `collapse_repeated_lines`, or `strip_ansi`; configure
+those via `PUT /admin/v1/group-policies/{name}`.

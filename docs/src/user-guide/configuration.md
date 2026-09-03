@@ -19,11 +19,11 @@ All configs are parsed and validated by
 | Field | Type | Required | Default | Validation |
 |---|---|---|---|---|
 | `listen_addr` | `SocketAddr` | yes | — | Must be loopback (`127.0.0.0/8` or `::1`) unless `dev_mode = true` |
-| `database_url` | `String` | yes | — | SQLite URL, e.g. `sqlite:///data/relay.db` |
+| `database_url` | `String` | yes | — | SQLite URL, e.g. `sqlite://~/.oac/relay.db` (`~` is expanded in `sqlite://` URLs) |
 | `oidc` | table | yes | — | See [OIDC](#oidc) below |
 | `central` | table | yes | — | See [Central connection](#central-connection) below |
 | `dev_mode` | `bool` | no | `false` | When `true`: allows non-loopback bind, HTTP central URL, auto-mints dev key |
-| `session_ttl_hours` | `u64` or `null` | no | `24` | Lifetime of OIDC-login API keys; after expiry, run `oac-relay login` again. `null` explicitly disables expiry. |
+| `session_ttl_hours` | `u64` | no | `24` | Lifetime of OIDC-login API keys in hours; after expiry, run `oac-relay login` again. Valid range `1..=876000`; expiry cannot be disabled |
 
 ### OIDC
 
@@ -32,7 +32,7 @@ All configs are parsed and validated by
 | `issuer` | `String` | yes | Non-empty; must start with `http://` or `https://` |
 | `client_id` | `String` | yes | Non-empty |
 | `client_secret_env` | `String` | yes | Non-empty — **name** of env var holding the secret (never the secret itself) |
-| `redirect_uri` | `String` | yes | Must start with `http://127.0.0.1` (loopback) |
+| `redirect_uri` | `String` | yes | Must be a loopback `http://127.0.0.1` URL; the host is parsed and verified (e.g. `http://127.0.0.1.evil.com/cb` is rejected) |
 | `scopes` | `Vec<String>` | yes | e.g. `["openid", "email", "profile", "groups"]` |
 
 > Include `"groups"` in scopes if you want group-based authorization
@@ -47,11 +47,15 @@ All configs are parsed and validated by
 | `client_cert_path` | `PathBuf` | yes | Relay mTLS client cert (PEM) |
 | `client_key_path` | `PathBuf` | yes | Relay mTLS client key (PEM, must be `0600`) |
 
+> Cert paths are raw filesystem reads — `~` is **not** expanded. Use
+> absolute paths (e.g. `/home/yourname/.oac/certs/ca.crt`). Only
+> `sqlite://` database URLs expand `~`.
+
 ### Example (production)
 
 ```toml
 listen_addr = "127.0.0.1:8787"
-database_url = "sqlite:///data/relay.db"
+database_url = "sqlite://~/.oac/relay.db"
 dev_mode = false
 session_ttl_hours = 24
 
@@ -82,8 +86,8 @@ client_key_path = "/etc/oac/client.key"
 | `oidc` | table | yes | — | See [OIDC](#oidc-1) below |
 | `mtls` | table | yes | — | See [mTLS server](#mtls-server) below |
 | `admin` | table | no | `None` (admin API disabled) | See [Admin](#admin) below |
-| `pricing` | table | no | `None` (no cost tracking) | See [Pricing](#pricing) below |
-| `dev_mode` | `bool` | no | `false` | When `true`: plain HTTP, permissive auth |
+| `pricing` | table | no | `None` (no cost tracking; `cost_usd` always `0.0`) | See [Pricing](#pricing) below |
+| `dev_mode` | `bool` | no | `false` | When `true`: plain HTTP, permissive identity handling, and the rate limiter is disabled (`rate_limit_*` ignored) |
 | `rate_limit_requests` | `u32` | no | `60` | Maximum requests per client IP per rate-limit window; must be greater than zero |
 | `rate_limit_window_secs` | `u64` | no | `60` | Token-bucket window in seconds; must be greater than zero |
 
@@ -98,10 +102,10 @@ Same shape as the relay's OIDC config:
 
 | Field | Type | Required | Validation |
 |---|---|---|---|
-| `issuer` | `String` | yes | Non-empty; valid URL |
+| `issuer` | `String` | yes | Non-empty; must start with `http://` or `https://` |
 | `client_id` | `String` | yes | Non-empty |
 | `client_secret_env` | `String` | yes | Non-empty (env var name) |
-| `redirect_uri` | `String` | yes | Must start with `http://127.0.0.1` |
+| `redirect_uri` | `String` | yes | Must be a loopback `http://127.0.0.1` URL (host verified) |
 | `scopes` | `Vec<String>` | yes | e.g. `["openid"]` |
 
 ### Providers and API keys
@@ -156,6 +160,10 @@ If this section is absent, the admin API (`/admin/v1/`) is not mounted.
 | `output_per_1k_usd` | `f64` | Price per 1K completion tokens (USD) |
 
 Manual config overrides take precedence over auto-fetched prices.
+Auto-fetch (best-effort, from the backend `/v1/models`) runs at startup and
+then every `fetch_interval_secs` — but only when a `[pricing]` section is
+present. Without the section, prices are never fetched and `cost_usd` is
+always `0.0`.
 
 ### Example (production)
 

@@ -75,7 +75,7 @@ issuer = "https://idp.example.com/realms/your-realm"   # ← your IdP
 client_id = "oac-central"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
-scopes = ["openid", "email", "profile"]
+scopes = ["openid"]
 
 [mtls]
 ca_cert_path = "/certs/ca.crt"
@@ -140,11 +140,12 @@ cp target/release/oac-relay /usr/local/bin/oac-relay
 mkdir -p ~/.oac
 cp docker/prod/configs/relay.toml ~/.oac/relay.toml
 
-# mTLS certs (distributed by your admin):
+# mTLS certs (distributed by your admin; Step 1 put them in
+# docker/prod/certs/ — run from the repo root):
 mkdir -p ~/.oac/certs
-cp ca.crt ~/.oac/certs/
-cp client.crt ~/.oac/certs/
-cp client.key ~/.oac/certs/
+cp docker/prod/certs/ca.crt ~/.oac/certs/
+cp docker/prod/certs/client.crt ~/.oac/certs/
+cp docker/prod/certs/client.key ~/.oac/certs/
 chmod 600 ~/.oac/certs/client.key
 ```
 
@@ -152,7 +153,7 @@ Edit `~/.oac/relay.toml` to point at your central proxy:
 
 ```toml
 listen_addr = "127.0.0.1:8787"
-database_url = "sqlite:///data/relay.db"
+database_url = "sqlite://~/.oac/relay.db"
 dev_mode = false
 
 [oidc]
@@ -165,9 +166,11 @@ scopes = ["openid", "email", "profile", "groups"]
 
 [central]
 url = "https://central.example.com:8443"   # ← your central proxy
-ca_cert_path = "~/.oac/certs/ca.crt"
-client_cert_path = "~/.oac/certs/client.crt"
-client_key_path = "~/.oac/certs/client.key"
+# Cert paths must be ABSOLUTE — "~" is not expanded (only sqlite:// URLs
+# expand "~"). Replace /home/you with your actual home directory:
+ca_cert_path = "/home/you/.oac/certs/ca.crt"
+client_cert_path = "/home/you/.oac/certs/client.crt"
+client_key_path = "/home/you/.oac/certs/client.key"
 ```
 
 ## Step 6: Log in and start the relay
