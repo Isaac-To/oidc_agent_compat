@@ -5,13 +5,15 @@
 # The relay is exposed to the host on 127.0.0.1:8787 for direct tests.
 #
 # Usage:
-#   ./docker/dev.sh up      — generate certs, start all containers
-#   ./docker/dev.sh down    — stop all containers
-#   ./docker/dev.sh status  — show status
-#   ./docker/dev.sh logs    — tail logs from all services
-#   ./docker/dev.sh goose   — configure Goose to use the relay
-#   ./docker/dev.sh test    — send test requests through the full chain
-#   ./docker/dev.sh shell   — open a shell in the relay container
+#   ./docker/dev.sh up         — generate certs, start all containers,
+#                                register the mock provider + key
+#   ./docker/dev.sh down       — stop all containers
+#   ./docker/dev.sh status     — show status
+#   ./docker/dev.sh logs       — tail logs from all services
+#   ./docker/dev.sh goose      — configure Goose to use the relay
+#   ./docker/dev.sh goose-run  — run a headless Goose prompt
+#   ./docker/dev.sh test       — send test requests through the full chain
+#   ./docker/dev.sh shell      — open a shell in the relay container
 
 set -euo pipefail
 

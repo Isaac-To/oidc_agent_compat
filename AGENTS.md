@@ -75,7 +75,7 @@ are non-negotiable.
   ```
 - If you changed Docker-relevant code and Docker is available, also run:
   ```sh
-  ./docker/dev.sh test            # full chain + SSE + master-key-leak check
+  ./docker/dev.sh test            # full chain + SSE + provider-key-leak check
   ```
 - If you changed documentation, run `mdbook build docs/` and confirm no
   warnings.
@@ -96,6 +96,7 @@ change behavior, update the relevant docs in the same branch and commit:
 | CLI flags / commands | `docs/src/user-guide/cli-reference.md` |
 | Config schema / fields | `docs/src/user-guide/configuration.md` |
 | Admin API endpoints | `docs/src/user-guide/admin-api.md` |
+| MCP behavior / permissions | `docs/src/user-guide/mcp.md` |
 | Architecture / data flow | `docs/src/developer-guide/README.md`, `docs/src/reference/architecture.md`, `docs/src/reference/data-flow.md` |
 | Conventions / lints | `docs/src/developer-guide/conventions.md` |
 | Crate internals | corresponding `docs/src/developer-guide/*-internals.md` |
@@ -130,8 +131,8 @@ RFCs and standards; do not invent ad-hoc variants.
 - **JWT**: RFC 7519 (JWT), RFC 7515 (JWS). Pin signing alg to
   `{RS256, ES256}`; reject `none`.
 - **Secrets**: NIST SP 800-63B (authenticator handling), OWASP Cryptographic
-  Storage Cheat Sheet. Master key in `Zeroizing` memory, never logged,
-  never sent to a laptop.
+  Storage Cheat Sheet. Provider encryption key and decrypted provider keys
+  held in `Zeroizing` memory, never logged, never sent to a laptop.
 - **Constant-time comparison** for secrets (RFC 6151 guidance).
 
 See `/memories/repo/oidc-security-research.md` for the full citation list.
@@ -166,11 +167,12 @@ only implemented features (TODOs excluded to avoid misleading users).
 
 ## Workspace layout
 
-Cargo workspace, edition 2024, resolver 2. Four members:
+Cargo workspace, edition 2024, resolver 2. Five members:
 
 | Crate | Path | Role |
 |---|---|---|
 | `oidc-agent-common` | `crates/common` | Shared primitives: config, errors, keys, OIDC client, mTLS, logging, shutdown |
+| `oac-mcp` | `crates/mcp` | MCP protocol types and parsing: JSON-RPC 2.0 parsing, tool-call extraction with redacted args previews, hub `server__tool` name handling |
 | `oac-relay` | `crates/relay` | Laptop relay binary + lib (lib exposed for integration tests) |
 | `oac-central` | `crates/central` | Central proxy binary + lib |
 | `oac-e2e-tests` | `tests/e2e` | In-process end-to-end tests (spins up mock backend + central + relay) |
@@ -190,11 +192,12 @@ Key modules:
 - `crates/common/src/oidc.rs` — OIDC RP client builder + `CustomAdditionalClaims` (groups/roles extraction).
 - `crates/common/src/mtls.rs` — rustls mTLS client/server builders.
 - `crates/relay/src/login.rs` — `oac-relay login`: auth-code + PKCE flow, loopback callback, ID-token validation, agent config injection.
-- `crates/relay/src/proxy/` — `mod.rs`, `auth.rs` (local key check), `forward.rs` (relay→central), `host_guard.rs` (DNS rebinding defense).
+- `crates/relay/src/proxy/` — `mod.rs`, `auth.rs` (local key check), `forward.rs` (relay→central), `host_guard.rs` (DNS rebinding defense), `mcp_forward.rs` (byte-tunnel for `/mcp` and `/mcp/{server}`).
 - `crates/relay/src/keystore.rs`, `agent_config.rs`, `db.rs`, `migration.rs`, `entity/` — persistence + agent config injection.
 - `crates/relay/src/activity.rs` — relay-side activity logger (append-only `relay_activity_log`).
-- `crates/central/src/proxy/` — `mod.rs`, `auth.rs` (validates relay user tokens), `forward.rs` (central→backend, SSE streaming), `permissions.rs` (group-based model/endpoint enforcement), `rate_limit.rs`.
-- `crates/central/src/admin.rs` — admin API (`/admin/v1/`) for policy/device/audit management.
+- `crates/central/src/proxy/` — `mod.rs`, `auth.rs` (validates relay user tokens), `forward.rs` (central→backend, SSE streaming), `permissions.rs` (group-based model/endpoint enforcement), `rate_limit.rs`, `mcp_permissions.rs` (per-tool MCP allowlists), `mcp_hub.rs` (combined `/mcp` hub), `mcp_forward.rs` (per-server `/mcp/{server}` forwarding).
+- `crates/central/src/mcp.rs` — MCP server registry; `auth_header` values AES-256-GCM encrypted at rest with the provider encryption key.
+- `crates/central/src/admin.rs` — admin API (`/admin/v1/`) for policy/provider/device/audit/MCP management.
 - `crates/central/src/policy.rs` — `PolicyStore` + `resolve_policy` (group→policy merge, most-permissive-wins).
 - `crates/central/src/device_store.rs` — device registration + revocation store.
 - `crates/central/src/provider.rs` — runtime provider/key store; provider keys are AES-256-GCM encrypted at rest with the configured MEK.
@@ -283,13 +286,16 @@ Everything runs in Docker; Goose runs headless in a container.
   Never probe a prod central proxy over plain HTTP.
 - Relay auto-mints dev key `oac_test_key_alice` when `dev_mode=true`
   (`crates/relay/src/main.rs` `serve()` → `seed_dev_key`). Idempotent.
-- `dev.sh test` exercises the full chain + SSE + master-key-leak check.
-- Master key `sk-mock-backend-master-key` is loaded via a central-init
-  one-shot container. It must never appear in relay responses/logs.
+- `dev.sh test` exercises the full chain + SSE + provider-key-leak check.
+- Mock provider key `sk-mock-backend-master-key` is registered at runtime by
+  `docker/dev.sh` `cmd_up()` via the admin API (`POST /admin/v1/providers` +
+  `POST /admin/v1/providers/mock-backend/keys`) using dev-mode identity
+  headers. It must never appear in relay responses.
 - Dockerfile runtime base **must be `debian:trixie-slim`** (not
   `bookworm-slim`) to match the `rust:1.98-slim` builder's glibc 2.41.
-- Keycloak realm `oac-dev` allows `http://127.0.0.1:*` (any port) for client
-  `oac-relay`. Test users: `alice`/`alice-pass-123`, `bob`/`bob-pass-456`,
+- Keycloak realm `oac-dev` allows `http://127.0.0.1:*` and
+  `http://localhost:*` (any port) for client `oac-relay`. Test users:
+  `alice`/`alice-pass-123`, `bob`/`bob-pass-456`,
   `charlie`/`charlie-pass-789`, `admin`/`admin-pass-000`.
 
 See `docker/README.md` for the full service table and quick start.

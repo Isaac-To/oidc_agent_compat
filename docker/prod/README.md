@@ -21,9 +21,12 @@ docker compose logs -f central
 
 ### Prerequisites
 
-1. mTLS certs under `docker/prod/certs/` (`./docker/generate-certs.sh`).
+1. mTLS certs under `docker/prod/certs/` (`./docker/generate-certs.sh`, then
+   `mkdir -p docker/prod/certs && cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/`).
 2. OIDC client secret: `echo "OAC_OIDC_CLIENT_SECRET=..." > docker/prod/.env`.
-3. Master key as Docker secret: `echo -n 'sk-...' | docker secret create oac_master_key -`.
+3. Provider encryption key as Docker secret (64 hex chars):
+   `openssl rand -hex 32 | docker secret create oac_provider_encryption_key -`.
+   Providers and their API keys are added after startup via the admin API.
 4. Config: edit `docker/prod/configs/central.toml`.
 
 See the [full guide](../../docs/src/user-guide/docker-prod.md) for relay

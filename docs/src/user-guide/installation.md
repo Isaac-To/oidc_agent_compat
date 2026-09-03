@@ -22,7 +22,8 @@
 
 - **OpenAI-compatible backend** — OpenAI, Azure OpenAI, OpenRouter, Ollama,
   vLLM, or any backend that speaks the OpenAI API. You need: the base URL
-  and a master API key.
+  and an API key (registered with central via the admin API; never placed
+  in a config file).
 
 ### For the dev stack (optional)
 

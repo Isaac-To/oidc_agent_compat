@@ -8,8 +8,8 @@ employee's laptop**.
 ## Why this exists
 
 AI coding agents (Codex, Goose, Cursor, etc.) need an API key to talk to a
-backend. In an enterprise, handing every employee the master backend key is
-a non-starter: keys leak, get committed to git, and can't be easily
+backend. In an enterprise, handing every employee a shared backend API key
+is a non-starter: keys leak, get committed to git, and can't be easily
 revoked per-person. This project solves that by inserting two components
 between the agent and the backend:
 

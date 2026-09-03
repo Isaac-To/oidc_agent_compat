@@ -56,12 +56,14 @@ you handle real provider keys.
       unbounded cost. See [Admin API](./admin-api.md).
 - [ ] **Add provider keys without echo, never paste into a shell log.**
       Use `oac-central admin provider-key-add`, which reads the secret
-      without echo and stores only a SHA-256 digest. Keys are never
-      returned by the admin API and never logged.
-- [ ] **Verify the master-key-leak test.**
-      In the Docker dev stack, `./docker/dev.sh test` includes a
-      master-key-leak check proving `sk-mock-backend-master-key` never
-      appears in relay responses/logs.
+      without echo. The key is stored AES-256-GCM encrypted (central must
+      decrypt it to forward upstream) alongside a SHA-256 digest used to
+      identify it. Key material is never returned by the admin API and
+      never logged.
+- [ ] **Verify the provider-key-leak test.**
+      In the Docker dev stack, `./docker/dev.sh test` includes a leak
+      check asserting `sk-mock-backend-master-key` never appears in the
+      relay's `/v1/models` response body.
 - [ ] **Monitor the audit log.**
       `oac-central admin audit-query` lets you review who accessed what,
       which models they used, token/cost totals, and permission decisions.

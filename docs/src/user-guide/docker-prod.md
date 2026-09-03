@@ -24,10 +24,12 @@ Agent → 127.0.0.1 relay (native binary, laptop) → mTLS → central (containe
 
 ### Prerequisites
 
-1. **mTLS certificates** under `docker/prod/certs/`:
+1. **mTLS certificates** under `docker/prod/certs/` (the directory is
+   gitignored, so create it first):
 
    ```sh
    ./docker/generate-certs.sh
+   mkdir -p docker/prod/certs
    cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/
    ```
 
@@ -63,8 +65,11 @@ docker compose logs -f central
 ```
 
 The central proxy serves mTLS on `:8443` with client cert required. The
-provider encryption key is read from `/run/secrets/provider-encryption-key`, never as an env var,
-never baked into the image.
+recommended way to supply the provider encryption key is the Docker secret
+mounted at `/run/secrets/provider-encryption-key`. The binary also accepts
+it via the `OAC_PROVIDER_ENCRYPTION_KEY` env var (checked first) — useful
+outside Docker — but in production prefer the secret; the key is never
+baked into the image.
 
 ### Healthcheck
 
@@ -76,8 +81,10 @@ required).
 
 - `dev_mode = false` in all prod configs. Central enforces mTLS and
   rejects relay requests lacking valid identity headers.
-- Provider encryption key read from Docker secret (`/run/secrets/provider-encryption-key`), never
-  env var, never baked into image, never sent to laptop.
+- Provider encryption key supplied via Docker secret
+  (`/run/secrets/provider-encryption-key`; the `OAC_PROVIDER_ENCRYPTION_KEY`
+  env var is a fallback for non-Docker deployments), never baked into the
+  image, never sent to a laptop.
 - Central image runs as non-root user (`oac`).
 - Config and certs mounted read-only.
 - Dockerfile runtime base is `debian:trixie-slim` (must match the
@@ -130,11 +137,12 @@ cp target/release/oac-relay /usr/local/bin/oac-relay
 mkdir -p ~/.oac
 cp docker/prod/configs/relay.toml ~/.oac/relay.toml
 
-# Copy the mTLS certs:
+# Copy the mTLS certs (from wherever your admin distributed them, e.g.
+# docker/prod/certs/ if generated on this machine — run from the repo root):
 mkdir -p ~/.oac/certs
-cp ca.crt ~/.oac/certs/
-cp client.crt ~/.oac/certs/
-cp client.key ~/.oac/certs/
+cp docker/prod/certs/ca.crt ~/.oac/certs/
+cp docker/prod/certs/client.crt ~/.oac/certs/
+cp docker/prod/certs/client.key ~/.oac/certs/
 chmod 600 ~/.oac/certs/client.key
 ```
 
@@ -142,7 +150,7 @@ chmod 600 ~/.oac/certs/client.key
 
 ```toml
 listen_addr = "127.0.0.1:8787"
-database_url = "sqlite:///data/relay.db"
+database_url = "sqlite://~/.oac/relay.db"
 dev_mode = false
 
 [oidc]
@@ -155,9 +163,10 @@ scopes = ["openid", "email", "profile", "groups"]
 
 [central]
 url = "https://central.example.com:8443"
-ca_cert_path = "/etc/oac/ca.crt"
-client_cert_path = "/etc/oac/client.crt"
-client_key_path = "/etc/oac/client.key"
+# Absolute paths only — "~" is not expanded (replace /home/you):
+ca_cert_path = "/home/you/.oac/certs/ca.crt"
+client_cert_path = "/home/you/.oac/certs/client.crt"
+client_key_path = "/home/you/.oac/certs/client.key"
 ```
 
 ### Run
@@ -218,8 +227,10 @@ Before going live, verify every item on this checklist:
 
 ### Secrets
 
-- [ ] Master backend key stored as a Docker secret (not an env var, not
-  baked into the image).
+- [ ] **Provider encryption key** stored as a Docker secret (64 hex
+  chars; not in git, not baked into the image). Provider API keys are added
+  post-startup via the admin API and stored AES-256-GCM encrypted — there
+  is no master backend key at deploy time.
 - [ ] OIDC client secret provided via `.env` file or orchestrator secret
   mechanism.
 - [ ] `.env` file is in `.gitignore` (it is by default).
