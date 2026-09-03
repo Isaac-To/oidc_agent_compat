@@ -216,7 +216,8 @@ cargo test --workspace          # full suite: unit + integration + in-process e2
 cargo build --release
 ```
 
-Rust toolchain is pinned via `rust-toolchain.toml` (stable + rustfmt + clippy).
+Rust toolchain is pinned via `rust-toolchain.toml` (channel 1.98 +
+rustfmt + clippy, matching the `rust:1.98-slim` Docker builders).
 Minimum Rust 1.85; edition 2024.
 
 ### Known caveats (do not "fix" without asking)
