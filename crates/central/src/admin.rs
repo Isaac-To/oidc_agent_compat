@@ -30,8 +30,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 
-use oidc_agent_common::config::AdminConfig;
-use oidc_agent_common::error::{Error, Result};
+use oidc_agent_common::error::Error;
 
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
@@ -105,7 +104,7 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/admin/v1/mcp/servers",
-            get(list_mcp_servers).post(upsert_mcp_server),
+            get(list_mcp_servers).post(create_mcp_server),
         )
         .route(
             "/admin/v1/mcp/servers/{id}",
@@ -1310,7 +1309,9 @@ async fn record_admin_audit(
 /// Request body for creating/updating an MCP server.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct McpServerRequest {
-    /// Stable server identifier (required on create; `{id}` path on update).
+    /// Stable server identifier. Required on `POST /admin/v1/mcp/servers`
+    /// (the collection route has no `{id}` path segment); ignored on `PUT`
+    /// `/admin/v1/mcp/servers/{id}`, where the path `{id}` wins.
     #[serde(default)]
     pub id: String,
     /// Human-readable name.
@@ -1384,19 +1385,42 @@ async fn list_mcp_servers(
     ))
 }
 
+/// Creates an MCP server from a body that must carry its own `id`
+/// (there is no `{id}` path segment on the collection route).
+async fn create_mcp_server(
+    State(state): State<AdminState>,
+    admin: AdminIdentity,
+    axum::Json(body): axum::Json<McpServerRequest>,
+) -> HandlerResult<axum::Json<McpServerResponse>> {
+    if body.id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "MCP server id must not be empty on create (POST /admin/v1/mcp/servers)".to_string(),
+        ));
+    }
+    store_mcp_server(state, admin, body.id.clone(), body).await
+}
+
+/// Creates or replaces the MCP server with the `{id}` from the path; a
+/// body `id`, if present, is ignored (the path wins).
 async fn upsert_mcp_server(
     State(state): State<AdminState>,
     admin: AdminIdentity,
     Path(id): Path<String>,
     axum::Json(body): axum::Json<McpServerRequest>,
 ) -> HandlerResult<axum::Json<McpServerResponse>> {
-    let actual_id = if body.id.is_empty() {
-        id
-    } else {
-        body.id.clone()
-    };
+    store_mcp_server(state, admin, id, body).await
+}
+
+/// Shared persistence + audit path for MCP server create/upsert.
+async fn store_mcp_server(
+    state: AdminState,
+    admin: AdminIdentity,
+    id: String,
+    body: McpServerRequest,
+) -> HandlerResult<axum::Json<McpServerResponse>> {
     let input = crate::mcp::McpServerInput {
-        id: actual_id.clone(),
+        id: id.clone(),
         name: body.name,
         base_url: body.base_url,
         enabled: body.enabled,
@@ -1411,7 +1435,7 @@ async fn upsert_mcp_server(
         state.audit.db(),
         &admin.subject,
         "upsert_mcp_server",
-        &actual_id,
+        &id,
         None,
     )
     .await;
@@ -1532,20 +1556,6 @@ fn map_mcp_err(e: oidc_agent_common::error::Error) -> (StatusCode, String) {
         oidc_agent_common::error::Error::Config(msg) => (StatusCode::BAD_REQUEST, msg.to_string()),
         _ => internal_error(e),
     }
-}
-
-/// Validates the admin config at startup. Currently a no-op since the
-/// config is simple (just a group name), but reserved for future
-/// validation logic.
-///
-/// # Errors
-///
-/// Returns [`Error::Config`] if the admin group is empty.
-pub fn validate_admin_config(config: &AdminConfig) -> Result<()> {
-    if config.admin_group.is_empty() {
-        return Err(Error::config("admin.admin_group must not be empty"));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1684,19 +1694,37 @@ mod tests {
     }
 
     #[test]
-    fn validate_admin_config_rejects_empty_group() {
-        let config = AdminConfig {
-            admin_group: "".into(),
+    fn empty_admin_group_fails_config_validation() {
+        // Enforced at config load by CentralConfig::validate (common crate)
+        // so a misconfigured admin section fails fast at startup.
+        let build = |admin_group: &str| oidc_agent_common::config::CentralConfig {
+            listen_addr: "0.0.0.0:8443".parse().expect("addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: oidc_agent_common::config::OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "c".into(),
+                client_secret_env: "S".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            mtls: oidc_agent_common::config::MtlsServerConfig {
+                ca_cert_path: "/ca.pem".into(),
+                server_cert_path: "/s.pem".into(),
+                server_key_path: "/s.key".into(),
+            },
+            admin: Some(oidc_agent_common::config::AdminConfig {
+                admin_group: admin_group.into(),
+            }),
+            pricing: None,
+            dev_mode: true,
+            rate_limit_requests: 60,
+            rate_limit_window_secs: 60,
         };
-        assert!(validate_admin_config(&config).is_err());
-    }
-
-    #[test]
-    fn validate_admin_config_accepts_nonempty_group() {
-        let config = AdminConfig {
-            admin_group: "oac-admins".into(),
-        };
-        assert!(validate_admin_config(&config).is_ok());
+        assert!(
+            build("").validate().is_err(),
+            "empty admin_group must fail startup"
+        );
+        assert!(build("oac-admins").validate().is_ok());
     }
 
     #[tokio::test]

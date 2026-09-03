@@ -323,13 +323,22 @@ mod tests {
         let recent_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let stale_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
 
+        // Eviction threshold: EVICT_AFTER_WINDOWS (10) * 10ms = 100ms idle.
+        // Sleeps only ever overshoot (never undershoot), so design the
+        // margins asymmetrically to stay robust on loaded CI runners:
+        // - stale_ip must be *guaranteed* past the threshold: it is at
+        //   least 150ms idle by eviction time (50ms margin), and any
+        //   scheduling overshoot only makes it staler.
+        // - recent_ip must stay *safely under* the threshold: only 20ms
+        //   elapse after its creation before eviction runs, leaving an
+        //   80ms overshoot budget before it could be evicted in error.
         // Create both buckets.
         assert!(limiter.try_take(stale_ip).is_ok());
-        // Wait so stale_ip becomes old, but not yet evictable.
-        std::thread::sleep(Duration::from_millis(50));
+        // Wait so stale_ip is already well past the eviction threshold.
+        std::thread::sleep(Duration::from_millis(150));
         assert!(limiter.try_take(recent_ip).is_ok());
-        // Wait so stale_ip exceeds the threshold but recent_ip does not.
-        std::thread::sleep(Duration::from_millis(60));
+        // Brief wait: recent_ip stays far below the threshold.
+        std::thread::sleep(Duration::from_millis(20));
 
         // Trigger eviction.
         for _ in 0..EVICT_EVERY_N_CALLS {

@@ -131,18 +131,14 @@ async fn run_handler(
 /// Best-effort parse of the MCP tool and method from a request body.
 ///
 /// Returns `(tool, method)`. For `tools/call` the tool name is returned;
-/// for other request methods the method name is surfaced in `tool` (matching
-/// the central audit classification). On any parse failure both are `None`.
+/// for other request methods the tool is `None` and the method name is
+/// surfaced (matching the central audit classification). On any parse
+/// failure both are `None`.
 fn parse_mcp_meta(body: &[u8], server: &str) -> (Option<String>, Option<String>) {
     match parse::extract_tool_call(body, server) {
         Ok(Some(call)) => {
-            let method = if call.tool == call.server {
-                // Non-tools/call method surfaced in `tool` by the parser.
-                Some(call.tool.clone())
-            } else {
-                Some(oac_mcp::protocol::METHOD_TOOLS_CALL.to_string())
-            };
-            let tool = if call.tool == call.server {
+            let method = Some(call.method.clone());
+            let tool = if call.tool.is_empty() {
                 None
             } else {
                 Some(call.tool.clone())

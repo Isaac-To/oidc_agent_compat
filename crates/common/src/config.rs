@@ -286,7 +286,9 @@ impl CentralConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Config`] if OIDC fields are invalid.
+    /// Returns [`Error::Config`] if OIDC fields are invalid, rate-limit
+    /// fields are zero, or an enabled `[admin]` section has an empty
+    /// `admin_group`.
     pub fn validate(&self) -> Result<()> {
         validate_oidc(&self.oidc)?;
         if self.rate_limit_requests == 0 {
@@ -298,6 +300,13 @@ impl CentralConfig {
             return Err(Error::Config(
                 "rate_limit_window_secs must be greater than zero".into(),
             ));
+        }
+        if let Some(admin) = &self.admin {
+            if admin.admin_group.trim().is_empty() {
+                return Err(Error::Config(
+                    "admin.admin_group must not be empty when [admin] is configured".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -430,6 +439,21 @@ server_key_path = "/server.key"
         );
         let err = CentralConfig::from_toml(&toml).unwrap_err();
         assert!(err.to_string().contains("rate_limit_window_secs"), "{err}");
+    }
+
+    #[test]
+    fn central_rejects_empty_admin_group_when_admin_configured() {
+        let toml = format!("{}\n[admin]\nadmin_group = \"\"\n", valid_central_toml());
+        let err = CentralConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("admin_group"), "{err}");
+
+        // A non-empty group is fine, and no [admin] section at all is fine.
+        let toml = format!(
+            "{}\n[admin]\nadmin_group = \"oac-admins\"\n",
+            valid_central_toml()
+        );
+        CentralConfig::from_toml(&toml).expect("non-empty admin_group is valid");
+        CentralConfig::from_toml(valid_central_toml()).expect("no [admin] section is valid");
     }
 
     #[test]
