@@ -75,7 +75,8 @@ pub async fn complete_login(
         .await?;
 
     // 2. Mint a new local key with the configured session lifetime (None
-    //    = never expires; the v1 default).
+    //    = never expires; only reachable programmatically — TOML configs
+    //    default to Some(24)).
     let expires_at = config
         .session_ttl_hours
         .map(|hours| {

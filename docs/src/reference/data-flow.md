@@ -101,7 +101,13 @@ User-Agent: codex/1.0
      `401`. (Dev mode: logs warning, allows through.)
    - Inserts `VerifiedRelayIdentity` into extensions.
 
-2. **Permissions** (`permissions_middleware`):
+2. **Rate limit** (`rate_limit_middleware`, production only):
+   - Per-IP token bucket (60 req/min default).
+   - Exceeded → `429 Too Many Requests` with `Retry-After`.
+   - Runs **before** permission checks, so policy-denied requests still
+     consume a rate-limit token.
+
+3. **Permissions** (`permissions_middleware`):
    - Skip `/healthz`.
    - Parse groups from `x-oac-user-groups` JSON array.
    - `PolicyStore::resolve_policy(&groups)` — most-permissive-wins merge.
@@ -111,15 +117,15 @@ User-Agent: codex/1.0
      `403` (`"endpoint_not_allowed"`).
    - **Model check** (POST) — extract model, check
      `policy.is_model_allowed` → `403` (`"model_not_allowed"`).
-   - **Request quota check** — if `daily_request_quota` set and
-     `usage.request_count >= quota` → `429` (`"quota_exceeded"`).
+   - **Quota checks** (both pre-flight): **token quota** — if
+     `daily_token_quota` set and `usage.token_count >= quota` → `429`
+     (`"token_quota_exceeded"`); **request quota** — an atomic
+     `try_reserve_request` reservation → `429` (`"quota_exceeded"`)
+     when it cannot be taken (released again if the upstream request
+     fails).
    - On allow: inserts `PermissionDecision` into extensions.
    - If the resolved policy has the token saver enabled, attaches a
      `TokenSaverGrant` (config) to the extensions for the forward handler.
-
-3. **Rate limit** (`rate_limit_middleware`, production only):
-   - Per-IP token bucket (60 req/min default).
-   - Exceeded → `429 Too Many Requests` with `Retry-After`.
 
 4. **Forward** (`proxy_handler` → `forward_request`):
    - Reads body (max 10 MB).
@@ -188,6 +194,37 @@ When `Content-Type: text/event-stream`:
   extract `usage` from the final chunk (before `data: [DONE]`). Audit and
   usage accounting are deferred until the stream completes; the forwarded
   SSE bytes are not modified.
+
+## MCP request flow
+
+MCP traffic rides a parallel path with per-tool enforcement:
+
+1. The agent POSTs JSON-RPC to `http://127.0.0.1:8787/mcp/{server}`
+   (single server) or `/mcp` (combined hub).
+2. The relay authenticates the local key (same as `/v1`), best-effort
+   parses `mcp_server`/`mcp_tool`/`mcp_method` for its activity log, and
+   byte-tunnels the body to central with the `x-oac-*` identity headers.
+   **Batches (JSON-RPC arrays) are rejected** — a batch could smuggle
+   `tools/call` requests past per-tool enforcement.
+3. Central validates identity, then:
+   - **Per-server endpoint**: `mcp_permissions_middleware` classifies the
+     method (`tools/call` vs other), resolves the caller's
+     per-group/per-server/per-tool allowlist, and denies with `403`
+     (`-32001`) outside it; non-`tools/call` methods require at least one
+     allowed tool on that server. Callers with no groups are denied all.
+   - **Hub**: the handler splits the `server__tool` prefix, enforces the
+     same policy inline, fans `tools/list` out to enabled servers the
+     policy can reach, and answers `ping` locally.
+4. Central injects the server's encrypted `auth_header` (decrypted into
+   `Zeroizing` memory), strips hop-by-hop headers, forwards the bytes,
+   and passes SSE responses through unchanged.
+5. Every request — allowed or denied — produces an audit entry with
+   `mcp_server`, `mcp_tool`, `mcp_method`, the permission decision, and a
+   redacted, 512-char-capped args preview; the relay records the same
+   metadata in its activity log.
+
+See [MCP Support](../user-guide/mcp.md) for the user-facing behavior and
+error codes.
 - **Relay**: streams via `bytes_stream()` → `Body::from_stream` (raw
   byte passthrough).
 

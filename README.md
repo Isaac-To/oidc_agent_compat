@@ -2,7 +2,7 @@
 
 An enterprise-grade OIDC-to-AI-agent forwarder that lets employees use any
 OpenAI-compatible AI agent (Codex, Goose, etc.) through company-approved
-backends — **without the master backend key ever touching an employee's
+backends — **without provider API keys ever touching an employee's
 laptop**.
 
 ## Architecture
@@ -13,11 +13,12 @@ Agent → [127.0.0.1 relay] → mTLS → [central proxy] → [OpenAI-compatible 
 ```
 
 - **Central proxy** (company-hosted) — manages encrypted provider keys,
-  authenticates employees via OIDC, enforces group policies and quotas, and
-  forwards approved requests to the AI backend with SSE streaming.
+  enforces group policies and quotas, and forwards approved requests to
+  the AI backend with SSE streaming. Trusts the relay-verified employee
+  identity forwarded over mTLS (the relay is the OIDC relying party).
 - **Laptop relay** (thin, per-employee) — listens on `127.0.0.1`,
   authenticates the employee via OIDC, relays agent traffic to the central
-  proxy over mTLS. Holds **no master key**.
+  proxy over mTLS. Holds **no provider API keys**.
 
 ## Documentation
 
@@ -55,6 +56,7 @@ Production setup in 7 steps (central proxy in Docker + relay on laptop):
 ```sh
 # 1. Generate mTLS certs (use your company PKI for real production):
 ./docker/generate-certs.sh   # ⚠️ self-signed test certs — dev only
+mkdir -p docker/prod/certs   # gitignored, create it first
 cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/
 
 # 2. Configure the central proxy:
@@ -64,6 +66,9 @@ cp docker/certs/{ca,server,client}.{crt,key} docker/prod/certs/
 # 3. Provide secrets:
 echo "OAC_OIDC_CLIENT_SECRET=your-secret" > docker/prod/.env
 openssl rand -hex 32 | docker secret create oac_provider_encryption_key -
+# ⚠️ `docker secret create` requires Swarm; without it, edit
+# docker/prod/docker-compose.yml to use a `file:` secret source instead
+# (see docs/src/user-guide/docker-prod.md).
 
 # 4. Deploy the central proxy:
 cd docker/prod && docker compose up -d --build

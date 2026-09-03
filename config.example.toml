@@ -16,7 +16,8 @@
 # listen_addr = "127.0.0.1:8787"
 # database_url = "sqlite://~/.oac/relay.db"
 # dev_mode = false
-# # Lifetime of OIDC-login API keys in hours (default 24; null disables expiry).
+# # Lifetime of OIDC-login API keys in hours (default 24; range 1-876000;
+# # expiry cannot be disabled).
 # session_ttl_hours = 24
 #
 # [oidc]
@@ -31,9 +32,11 @@
 #
 # [central]
 # url = "https://central.example.com"
+# NOTE: cert paths are raw filesystem reads — "~" is NOT expanded. Use
+# absolute paths (only sqlite:// database URLs expand "~").
 # ca_cert_path = "/etc/oac/ca.pem"
-# client_cert_path = "~/.oac/client.pem"
-# client_key_path = "~/.oac/client.key"
+# client_cert_path = "/home/yourname/.oac/client.pem"
+# client_key_path = "/home/yourname/.oac/client.key"
 
 # ─── Central proxy configuration (company-hosted) ───────────────────────────
 # Save as central.toml. Providers and their API keys are managed at runtime
@@ -41,8 +44,9 @@
 #
 # listen_addr = "0.0.0.0:8443"
 # database_url = "postgres://central.example.com/oac"
-# # When true, allows requests without relay-forwarded identity headers
-# # (for dev/testing only). Defaults to false.
+# # When true, serves plain HTTP, allows requests without relay-forwarded
+# # identity headers, and disables the rate limiter entirely (for
+# # dev/testing only). Defaults to false.
 # dev_mode = false
 # # Production per-client-IP token bucket. Defaults to 60 requests per 60s.
 # rate_limit_requests = 60
@@ -73,7 +77,11 @@
 # admin_group = "oac-admins"
 #
 # # Optional per-model pricing for cost tracking in usage/audit reports.
-# # If omitted, prices are auto-fetched (OpenAI-compatible) on a timer.
+# # If the [pricing] section is omitted entirely, costs are NOT tracked
+# # (cost_usd = 0.0). When present, manual entries below override
+# # auto-fetched prices; prices are auto-fetched from the backend
+# # /v1/models at startup (best-effort) and every fetch_interval_secs
+# # (default 3600; set 0 to disable auto-fetch).
 # [pricing]
 # # fetch_interval_secs = 3600
 # # [[pricing.models]]

@@ -28,8 +28,8 @@
 //! [central]
 //! url = "https://central.example.com"
 //! ca_cert_path = "/etc/oac/ca.pem"
-//! client_cert_path = "~/.oac/client.pem"
-//! client_key_path = "~/.oac/client.key"
+//! client_cert_path = "/home/you/.oac/client.pem"
+//! client_key_path = "/home/you/.oac/client.key"
 //! ```
 
 use std::net::SocketAddr;

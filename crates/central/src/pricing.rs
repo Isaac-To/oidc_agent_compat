@@ -7,7 +7,7 @@
 //!    `/v1/models` endpoint with pricing fields (e.g. OpenRouter's
 //!    `pricing.prompt` / `pricing.completion` per-token), the central proxy
 //!    fetches them at startup and refreshes periodically.
-//! 2. **Manual config overrides** — the `[central.pricing]` TOML table.
+//! 2. **Manual config overrides** — the `[pricing]` TOML table.
 //!    Manual prices **always take precedence** over fetched prices, so
 //!    admins can pin or override specific models.
 //!

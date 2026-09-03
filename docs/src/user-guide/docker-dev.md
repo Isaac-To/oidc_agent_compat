@@ -7,11 +7,15 @@ to get a working end-to-end setup.
 ## Architecture
 
 ```
-Goose (Docker) → relay (Docker, :8787) → central (Docker, :8443) → mock-backend (Docker, :8090)
+Goose (Docker) → relay (Docker, :8787) → central (Docker, :8443) → mock-backend (Docker, :8080)
                                        ↑ encrypted provider key (dev secret)
                     ↑ OIDC (browser)
               Keycloak (Docker, :8080)
 ```
+
+(Ports shown are the in-network container ports. The mock backend is
+published to the host on `localhost:8090`; the relay is published on
+`127.0.0.1:8787`.)
 
 ## Services
 
@@ -27,12 +31,17 @@ Goose (Docker) → relay (Docker, :8787) → central (Docker, :8443) → mock-ba
 
 All users are in the `oac-dev` Keycloak realm:
 
-| Username | Password | Email | Role |
+| Username | Password | Email | Last name |
 |---|---|---|---|
 | `alice` | `alice-pass-123` | alice@example.com | Engineer |
 | `bob` | `bob-pass-456` | bob@example.com | Senior |
 | `charlie` | `charlie-pass-789` | charlie@example.com | Intern |
-| `admin` | `admin-pass-000` | admin@example.com | Admin |
+| `admin` | `admin-pass-000` | admin@example.com | User |
+
+> The dev realm defines **no groups or roles** — the last-name column is
+> just profile data. Group-based policies cannot be exercised through real
+> OIDC logins in this stack; `dev.sh` performs admin operations directly
+> with dev-mode identity headers instead.
 
 Keycloak admin console: `http://localhost:8080/admin` (admin / admin).
 
@@ -42,14 +51,14 @@ The `docker/dev.sh` script orchestrates the dev stack:
 
 | Command | Description |
 |---|---|
-| `./docker/dev.sh up` | Generate certs (if missing), build and start all containers, wait for healthchecks, load master key, restart central, print service URLs + test users |
+| `./docker/dev.sh up` | Generate certs (if missing), build and start all containers, wait for healthchecks, register the mock provider + its key via the admin API, print service URLs + test users |
 | `./docker/dev.sh down` | Stop all containers |
 | `./docker/dev.sh status` | Show container status |
 | `./docker/dev.sh logs` | Tail logs from all services |
 | `./docker/dev.sh shell` | Open a shell in the relay container |
 | `./docker/dev.sh goose` | Show Goose usage info |
 | `./docker/dev.sh goose-run "prompt"` | Run a headless Goose prompt through the full chain |
-| `./docker/dev.sh test` | Send test requests through the full chain (infra + full chain + SSE + master-key-leak check) |
+| `./docker/dev.sh test` | Send test requests through the full chain (infra + full chain + SSE + provider-key-leak check) |
 
 ## Quick start
 
@@ -126,15 +135,25 @@ avoid port conflicts with the Docker relay on `:8787`.
 ## Admin API
 
 The dev central config enables the admin API with
-`admin_group = "oac-admins"`. Log in via the relay with a user in the
-`oac-admins` group, then use the admin CLI:
+`admin_group = "oac-admins"`. The dev Keycloak realm defines no groups, so
+no real login can satisfy that check — instead, `dev.sh up` calls the admin
+API directly with dev-mode identity headers
+(`X-OAC-User-Subject: dev-admin`, `X-OAC-User-Groups: ["oac-admins"]`) to
+register the mock provider and its key. To exercise group-based admin
+access end-to-end, add groups and a group mapper to the realm first.
+
+For reference, the admin CLI form (against a stack where your login's
+groups include the admin group — note `--key` precedes the subcommand):
 
 ```sh
 export OAC_API_KEY="<key from oac-relay login>"
-./target/release/oac-central admin policy-list --key $OAC_API_KEY
-./target/release/oac-central admin policy-set engineering --models gpt-4o --key $OAC_API_KEY
-./target/release/oac-central admin audit-query --key $OAC_API_KEY
+./target/release/oac-central admin --key $OAC_API_KEY policy-list
+./target/release/oac-central admin --key $OAC_API_KEY policy-set engineering --models gpt-4o
+./target/release/oac-central admin --key $OAC_API_KEY audit-query
 ```
+
+In the stock dev stack (no groups in the realm) these calls return `403`;
+`dev.sh` covers admin operations with the dev-mode headers shown above.
 
 See [Admin API](./admin-api.md) for all endpoints.
 
@@ -153,8 +172,8 @@ The test command verifies:
    `Mock response to: hello`.
 9. Full chain `POST /v1/chat/completions` (SSE streaming) →
    `content-type: text/event-stream` and `data: [DONE]` terminator.
-10. Master key leak check: relay response must NOT contain
-    `sk-mock-backend-master-key`.
+10. Provider key leak check: the relay's `/v1/models` response body must
+    NOT contain `sk-mock-backend-master-key`.
 
 ## Files
 

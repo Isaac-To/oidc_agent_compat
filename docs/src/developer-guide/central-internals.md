@@ -51,17 +51,22 @@ pub struct AppState {
 
 ### Router
 
-Middleware order (outer → inner):
+Middleware order (outer → inner, as executed — in axum the last
+`.layer()` applied is outermost):
 
 1. `RequestBodyLimitLayer(10 MB)`.
 2. `auth::auth_middleware` — validates relay-forwarded identity headers.
-3. `permissions::permissions_middleware` — group-based enforcement.
-4. `rate_limit::rate_limit_middleware` — per-IP token bucket (prod only).
+3. `rate_limit::rate_limit_middleware` — per-IP token bucket (prod only).
+4. `permissions::permissions_middleware` — group-based enforcement.
 5. Handler (`forward::proxy_handler`).
+
+Note the consequence: rate limiting runs **before** policy resolution,
+so a request that will be denied by policy still consumes a rate-limit
+token.
 
 The admin API router is merged only if `config.admin` is present.
 
-Routes (same as relay):
+Routes (OpenAI paths are the same set the relay exposes):
 
 | Method | Path | Auth |
 |---|---|---|
@@ -70,6 +75,8 @@ Routes (same as relay):
 | `POST` | `/v1/responses` | required |
 | `GET` | `/v1/models` | required |
 | `POST` | `/v1/embeddings` | required |
+| any | `/mcp/{server}` | required (per-tool MCP middleware) |
+| `POST` only | `/mcp` (hub) | required (hub handler enforces inline) |
 
 ## Auth middleware (`proxy/auth.rs`)
 
@@ -101,6 +108,7 @@ pub struct VerifiedRelayIdentity {
 pub struct PermissionDecision {
     pub decision: String,        // "allowed" or "denied"
     pub reason: Option<String>,  // set when denied
+    pub request_reserved: bool,  // request-quota reservation held (see below)
 }
 ```
 
@@ -117,9 +125,15 @@ Enforcement order:
    `403` (`"endpoint_not_allowed"`).
 7. **Model check** (POST only) — reads body, extracts model, checks
    `policy.is_model_allowed`. Deny `403` (`"model_not_allowed"`).
-8. **Request-count quota check** (pre-flight) — if
-   `daily_request_quota` set and `usage.request_count >= quota` →
-   `429` (`"quota_exceeded"`). Token quotas enforced post-hoc.
+8. **Quota checks** (both pre-flight):
+   - **Token quota** — if `daily_token_quota` set and
+     `usage.token_count >= quota` → `429` (`"token_quota_exceeded"`).
+   - **Request quota** — an **atomic reservation** via
+     `UsageTracker::try_reserve_request` → `429` (`"quota_exceeded"`)
+     when it cannot be taken. The reservation is recorded on the
+     decision (`request_reserved`) and **released if the upstream
+     request ultimately fails**, so failed requests do not consume
+     quota.
 9. On allow: inserts `PermissionDecision` into extensions.
 
 Denial response:
@@ -138,25 +152,36 @@ Denials also write an `AuditEntry` with
 `proxy_handler`:
 
 1. Extracts `VerifiedRelayIdentity` and `PermissionDecision`.
-2. Calls `forward_request()`:
+2. **Token saver** — if the resolved policy attached a `TokenSaverGrant`,
+   applies `optimizer::optimize_prompt` to the request body (dedupe,
+   empty-message pruning, budget drops, opt-in collapses) and carries the
+   savings report for auditing. For streaming requests,
+   `stream_options.include_usage = true` is injected so the backend
+   reports token usage in the final SSE chunk (an explicit `false` is
+   overridden).
+3. Calls `forward_request()`:
    - Reads body (max `MAX_BODY_SIZE`).
    - Extracts model.
    - Sanitizes path.
    - Builds upstream URL: `{provider.base_url}{sanitized_path}`.
    - Builds forward headers (strips hop-by-hop).
-   - **Replaces** `Authorization` with the selected provider key.
+   - **Replaces** `Authorization` with the selected provider key
+     (priority-ordered, group-ACL-filtered; on upstream `401`/`429` the
+     next authorized key is retried).
    - Sends request.
-3. If non-streaming: buffers response, extracts token usage from `usage`
+4. If non-streaming: buffers response, extracts token usage from `usage`
    JSON field.
-4. If SSE: passes through as raw byte stream, wraps with
+5. If SSE: passes through as raw byte stream, wraps with
    `wrap_stream_with_usage_extraction` to intercept `data:` lines and
    extract `usage` from the final chunk.
-5. Computes cost via `PriceTable::compute_cost`; enabled providers are
+6. Computes cost via `PriceTable::compute_cost`; enabled providers are
    refreshed periodically when configured.
-6. Records `AuditEntry` (best-effort) and increments daily usage. For SSE,
+7. Records `AuditEntry` (best-effort, including token-saver accounting:
+   `token_saver_applied`, `tokens_saved`, `messages_dropped`,
+   `saver_reasons`) and increments daily usage. For SSE,
    audit and usage accounting are deferred until the stream completes.
-7. Increments usage counters (best-effort, allowed requests only).
-8. On error: `502 Bad Gateway`.
+8. On error: `502 Bad Gateway` (and the request-quota reservation, if any,
+   is released).
 
 ## Policy store (`policy.rs`)
 
@@ -168,6 +193,7 @@ pub struct ResolvedPolicy {
     pub allowed_endpoints: Option<HashSet<String>>,    // None = all
     pub daily_token_quota: Option<i64>,                 // None = unlimited
     pub daily_request_quota: Option<i64>,               // None = unlimited
+    pub token_saver: TokenSaverConfig,                  // saver settings
 }
 ```
 
@@ -237,6 +263,14 @@ pub struct AuditEntry {
     pub permission_decision: Option<String>,
     pub denial_reason: Option<String>,
     pub cost_usd: Option<f64>,
+    pub token_saver_applied: Option<bool>,
+    pub tokens_saved: Option<i32>,
+    pub messages_dropped: Option<i32>,
+    pub saver_reasons: Option<String>,
+    pub mcp_server: Option<String>,
+    pub mcp_tool: Option<String>,
+    pub mcp_method: Option<String>,
+    pub mcp_args_preview: Option<String>,
 }
 ```
 
@@ -275,22 +309,43 @@ pub struct UsageSnapshot {
   Returns `0.0` for unknown models or missing tokens.
 - `fetch_from_backend(client, base_url)` — fetches `GET {base_url}/v1/models`,
   parses OpenRouter format. **Overrides are never overwritten**.
-- `spawn_refresh_task(client, base_url, interval)` — periodic background
-  refresh.
+- `spawn_provider_price_refresh(provider_store, client, interval)` —
+  periodic background refresh across enabled providers.
 
 Precedence: manual config (`Override`) > auto-fetched (`Fetched`).
+
+## Token saver (`optimizer.rs`)
+
+A pure, admin-controlled module — the only code allowed to modify request
+bodies. Applied server-side in `forward.rs` when the resolved policy
+attaches a `TokenSaverGrant` (from `ResolvedPolicy.token_saver`):
+
+- Deduplicates bit-identical **consecutive** duplicate messages.
+- Removes structurally-empty messages and `tools` entries.
+- Drops oldest whole turns to fit `max_input_tokens` budgets.
+- Opt-in (`collapse_repeated_lines`): collapses consecutive
+  exact-verbatim repeated lines inside a single message into `[×N]`
+  markers (RTK-adapted, lossless-by-construction).
+
+**Never rewrites kept content** except the opt-in repeated-line collapse.
+Savings are reported per request (`tokens_saved`, `messages_dropped`,
+`saver_reasons`) into the audit log; a per-group engagement summary is
+served by `GET /admin/v1/token-saver`.
 
 ## MCP servers (`mcp.rs`)
 
 `McpManager` manages centrally-hosted MCP servers at runtime, mirroring the
 `ProviderStore` pattern. A configured server has a `base_url` (the MCP
 Streamable HTTP endpoint) and an optional per-server `auth_header` stored as
-AES-256-GCM `ciphertext`/`nonce` encrypted at rest with the master key.
+AES-256-GCM `ciphertext`/`nonce` encrypted at rest with the provider
+encryption key (`OAC_PROVIDER_ENCRYPTION_KEY` — the same key used for
+provider API keys; canonical parsing lives in `crypto.rs`).
 
 - `upsert_server` / `get_server` / `list_servers` / `delete_server`.
 - `resolve_server(id)` — returns a `ResolvedMcpServer` with the decrypted
   auth header in `Zeroizing` memory (only for the forwarding path).
-- `encryption_key_from_hex` — parses the 32-byte master key.
+- Server ids must be non-empty and must not contain `__` (the hub
+  separator).
 
 ## MCP forwarding + permissions (`proxy/mcp_forward.rs`, `proxy/mcp_permissions.rs`, `proxy/mcp_hub.rs`)
 
@@ -322,9 +377,11 @@ the two endpoints stay in sync. Server ids must not contain `__`.
 MCP policy resolution (`policy.rs`) treats tools as **deny-by-default**:
 `resolve_mcp_allowed_tools` returns `None` only for an explicit allow-all
 (`allowed_tools = NULL`) policy; otherwise it returns the union of
-`"server:tool"` entries across the user's groups, or an empty set (deny all)
-when none exist. `resolve_mcp_allowed_servers` derives the reachable server
-ids for the hub's `tools/list` fan-out.
+`"server:tool"` entries across the user's groups, or an empty set (deny
+all) when none exist — and also when the caller has **no groups at all**
+(a malformed or missing groups claim must never reach an MCP tool).
+`resolve_mcp_allowed_servers` derives the reachable server ids for the
+hub's `tools/list` fan-out.
 
 ## Rate limiting (`proxy/rate_limit.rs`)
 
@@ -348,6 +405,8 @@ docs.
 pub struct AdminState {
     pub policy_store: PolicyStore,
     pub device_store: DeviceStore,
+    pub provider_store: ProviderStore,
+    pub mcp_manager: McpManager,
     pub audit: AuditLogger,
     pub usage_tracker: UsageTracker,
     pub admin_group: String,

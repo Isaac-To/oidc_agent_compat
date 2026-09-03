@@ -28,11 +28,14 @@ Agent → [127.0.0.1 relay] → mTLS → [central proxy] → [OpenAI-compatible 
 ```
 
 - **Central proxy** (company-hosted) — manages encrypted provider keys,
-  authenticates employees via OIDC, enforces policy and quotas, and forwards
-  approved requests to the AI backend with SSE streaming.
+  enforces policy and quotas, and forwards approved requests to the AI
+  backend with SSE streaming. Trusts the relay-verified identity forwarded
+  over mTLS (the relay is the OIDC relying party). It also hosts MCP
+  servers and enforces per-tool MCP policies.
 - **Laptop relay** (thin, per-employee) — listens on `127.0.0.1`,
-  authenticates the employee via OIDC, relays agent traffic to the central
-  proxy over mTLS. Holds **no master key**.
+  authenticates the employee via OIDC, relays agent traffic (OpenAI-style
+  and MCP JSON-RPC) to the central proxy over mTLS. Holds **no provider
+  API keys**.
 
 ## Status
 

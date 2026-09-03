@@ -1,6 +1,6 @@
 # Workspace Layout
 
-The project is a Cargo workspace with four crates. This page documents the
+The project is a Cargo workspace with five crates. This page documents the
 full source file tree.
 
 ## Crate overview
@@ -40,8 +40,9 @@ crates/common/src/
 crates/mcp/src/
 ├── lib.rs              # Crate root; re-exports modules
 ├── errors.rs           # McpError enum + Result alias
-├── jsonrpc.rs          # JSON-RPC 2.0 request/response framing
+├── jsonrpc.rs          # JSON-RPC 2.0 request/response framing (batches rejected)
 ├── protocol.rs         # MCP method constants + ToolCall/initialize types
+├── hub.rs              # Hub `server__tool` name join/split helpers
 └── parse.rs            # extract_tool_call, redaction, validation helpers
 ```
 
@@ -70,7 +71,7 @@ crates/relay/src/
     └── relay_activity_log.rs  # relay_activity_log entity
 
 crates/relay/tests/
-└── proxy_integration.rs    # 6 integration tests
+└── proxy_integration.rs    # 12 integration tests
 ```
 
 ### `crates/central/` — Central proxy
@@ -81,6 +82,7 @@ crates/central/src/
 ├── main.rs             # Binary: serve and admin CLI
 ├── db.rs               # Central DB setup
 ├── migration.rs        # SeaORM migrations (9 migrations)
+├── crypto.rs           # encryption_key_from_hex + sha256 helpers (shared by provider/mcp)
 ├── admin.rs            # Admin API (/admin/v1/) router, handlers, auth middleware
 ├── policy.rs           # PolicyStore + resolve_policy (group→policy merge) + MCP tool policies
 ├── device_store.rs     # Device registration + revocation store
@@ -89,6 +91,7 @@ crates/central/src/
 ├── audit.rs            # Audit logger (enriched with identity, groups, endpoint, etc.)
 ├── usage.rs            # UsageTracker (per-user daily token/request quotas)
 ├── pricing.rs          # PriceTable (model cost computation, auto-fetch from backend)
+├── optimizer.rs        # Token saver (dedupe, empty-message pruning, budget drops, opt-in collapses)
 ├── proxy/
 │   ├── mod.rs          # Router, AppState, serve()
 │   ├── auth.rs         # Validates relay-forwarded identity headers
@@ -105,11 +108,16 @@ crates/central/src/
     ├── device.rs           # device entity
     ├── admin_audit_log.rs  # admin_audit_log entity (append-only)
     ├── group_policy.rs     # group_policy entity
+    ├── provider.rs         # provider entity
+    ├── provider_key.rs     # provider_key entity (AES-256-GCM ciphertext)
+    ├── provider_key_access.rs # provider_key_access entity (group ACL on keys)
     ├── mcp_server.rs       # mcp_server entity (encrypted auth)
     └── mcp_server_policy.rs# mcp_server_policy entity
 
 crates/central/tests/
-└── proxy_integration.rs    # 10 integration tests (dev + prod + mTLS modes)
+├── proxy_integration.rs    # 22 integration tests (dev + prod + mTLS modes)
+├── provider_admin_api.rs   # 13 provider/key admin API tests
+└── mcp_admin_api.rs        # 5 MCP server/policy admin API tests
 ```
 
 ### `tests/e2e/` — In-process E2E tests
@@ -120,7 +128,8 @@ tests/e2e/
 ├── src/
 │   └── lib.rs          # Lint allows only
 └── tests/
-    └── e2e.rs          # 16 E2E tests (full chain + permissions + device revocation)
+    ├── e2e.rs          # 16 E2E tests (full chain + permissions + device revocation)
+    └── mcp_e2e.rs      # 13 MCP E2E tests (hub, per-server, batches, relay auth, audit)
 ```
 
 ## Workspace `Cargo.toml`
@@ -156,8 +165,11 @@ Pinned via `rust-toolchain.toml`:
 
 ```toml
 [toolchain]
-channel = "stable"
+# Pinned to match the Docker builder images (rust:1.98-slim).
+channel = "1.98"
 components = ["rustfmt", "clippy"]
 ```
 
-Minimum Rust 1.85; edition 2024.
+Minimum Rust 1.85; edition 2024. The channel is pinned (not `stable`) so
+local builds match the `rust:1.98-slim` Docker builders — bump in lockstep
+with the Dockerfiles when upgrading.

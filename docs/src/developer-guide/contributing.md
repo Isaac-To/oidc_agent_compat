@@ -25,9 +25,9 @@ only implemented features (TODOs excluded to avoid misleading users).
 
 ## Branch flow
 
-- Create a feature branch from `main` (e.g. `docs/mdbook-suite`).
+- Create a feature branch from `master` (e.g. `docs/mdbook-suite`).
 - Keep branches focused — one logical change per branch.
-- Squash-merge or rebase-merge into `main`.
+- Squash-merge or rebase-merge into `master`.
 
 ## PR checklist
 

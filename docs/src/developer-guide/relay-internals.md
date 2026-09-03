@@ -14,7 +14,10 @@ Entry point: `oac-relay [OPTIONS] [COMMAND]`. Built with `clap` derive.
   `oac_test_key_alice`).
 - `login` calls `login::run_login()`.
 - `logout`, `print-key`, `list-keys`, `revoke-key` are straightforward
-  DB/key operations.
+  DB/key operations (`print-key` reads the agent config file and needs no
+  config file loaded).
+- `activity { --limit }` prints recent `relay_activity_log` entries
+  (newest first; default 20, capped at 1000).
 
 See [CLI Reference](../user-guide/cli-reference.md) for the user-facing
 command docs.
@@ -88,6 +91,8 @@ Routes:
 | `POST` | `/v1/responses` | required |
 | `GET` | `/v1/models` | required |
 | `POST` | `/v1/embeddings` | required |
+| any | `/mcp/{server}` | required (byte-tunnel) |
+| any | `/mcp` (hub) | required (byte-tunnel) |
 
 ### `AppState`
 
@@ -195,7 +200,11 @@ Methods:
   plaintext (dev only).
 - `verify_key(bearer_token)` — loads all keys, compares each via
   `KeyHash::matches` (constant-time, **no early return** — prevents
-  timing leaks, CWE-208). Updates `last_used_at` on match.
+  timing leaks, CWE-208). Updates `last_used_at` on match. Enforces
+  session expiry: a key past its `expires_at` returns
+  `KeyVerification::Expired` **and is deleted** (the caller surfaces a
+  `session_expired` error; the user must re-run `login`). The dev-mode
+  seeded key is exempt.
 - `revoke_all_keys(identity_id)` — `delete_many`.
 - `revoke_key(key_id)` — `delete_by_id`.
 
@@ -211,6 +220,9 @@ pub struct RelayActivityEntry {
     pub central_status: Option<i32>,
     pub latency_ms: i64,
     pub request_id: Option<String>,
+    pub mcp_server: Option<String>,   // set for /mcp* traffic
+    pub mcp_tool: Option<String>,
+    pub mcp_method: Option<String>,
 }
 ```
 

@@ -52,6 +52,11 @@ Set the OIDC client secret:
 export OAC_OIDC_CLIENT_SECRET="your-oidc-client-secret"
 ```
 
+Note: the `[oidc]` section is schema-required and validated, but central
+never performs an OIDC login at runtime — it trusts relay-forwarded
+identity headers over mTLS. The env var only needs to exist for config
+loading (the Docker stack sets it automatically).
+
 Set the provider-key encryption key through your secret manager or Docker
 secret. For local development only, an environment variable can be used:
 
@@ -64,7 +69,7 @@ export OAC_PROVIDER_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 ### `oac-central serve` — start the central proxy
 
 ```sh
-oac-central serve --config config.toml
+oac-central --config config.toml serve
 ```
 
 - Opens the database (runs migrations).
@@ -73,7 +78,9 @@ oac-central serve --config config.toml
 - Initializes the policy store, device store, audit logger, usage
   tracker, and price table.
 - If `[pricing]` is configured, auto-fetches model prices from the backend
-  at startup (best-effort) and spawns a periodic refresh task.
+  at startup (best-effort) and re-fetches every `fetch_interval_secs`
+  (default 3600; set `0` to disable auto-fetch). Without a `[pricing]`
+  section, costs are not tracked (`cost_usd` is `0.0`).
 - Binds the server:
   - **Dev mode** (`dev_mode = true`): plain HTTP via `axum::serve`.
   - **Production** (`dev_mode = false`): mTLS via

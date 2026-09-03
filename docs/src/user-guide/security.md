@@ -6,7 +6,7 @@ Agent Compatibility Server. For the full technical threat model, see
 set of deployment checks, see the
 [Production Hardening Checklist](./production-checklist.md).
 
-## The master key never touches your laptop
+## Provider keys never touch your laptop
 
 Provider API keys (e.g. an OpenAI API key) are encrypted at rest in the
 central database and decrypted **only** in the central proxy's process

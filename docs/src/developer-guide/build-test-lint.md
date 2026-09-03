@@ -2,8 +2,9 @@
 
 ## Prerequisites
 
-- **Rust 1.85+** (stable). The toolchain is pinned via
-  `rust-toolchain.toml` (stable + rustfmt + clippy).
+- **Rust 1.85+**. The toolchain channel is pinned to **1.98** via
+  `rust-toolchain.toml` (matching the `rust:1.98-slim` Docker builders;
+  components: rustfmt + clippy).
 - For the dev stack: **Docker** and **Docker Compose**.
 - For this documentation book: **mdBook** (`cargo install mdbook`).
 
@@ -99,13 +100,23 @@ mdbook serve docs/ --open
 cargo doc --workspace --open
 ```
 
-## CI checklist
+## CI
 
-Before merging, ensure all of the following pass:
+GitHub CI (`.github/workflows/ci.yml`, on every push/PR to `master`) runs:
+`cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo deny check`, `cargo audit --deny warnings` (with the two documented
+ignores), and `cargo test --all-targets`. A separate workflow builds the
+mdBook on pushes to `master`.
+
+## Pre-merge quality gate
+
+CI plus the following local checks are required before merging (see
+`AGENTS.md`):
 
 - [ ] `cargo test --workspace`
 - [ ] `cargo clippy --workspace --all-targets`
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo build --release`
-- [ ] `./docker/dev.sh test` (if Docker is available)
-- [ ] `mdbook build docs/` (no warnings)
+- [ ] `./docker/dev.sh test` (if Docker-relevant code changed and Docker
+      is available)
+- [ ] `mdbook build docs/` (no warnings, if docs changed)

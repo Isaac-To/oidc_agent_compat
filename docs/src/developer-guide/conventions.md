@@ -60,9 +60,11 @@ never use `anyhow`.
 
 - **Never literal in config**: the OIDC client secret is referenced by
   env-var name (`client_secret_env`); provider API keys are managed through
-  the admin API and encrypted in the central database.
-- **`Zeroizing` memory**: provider keys are held in
-  `zeroize::Zeroizing<String>`, which zeros memory on drop.
+  the admin API and encrypted in the central database; MCP server
+  `auth_header` values are likewise admin-API-managed and AES-256-GCM
+  encrypted at rest with the provider encryption key.
+- **`Zeroizing` memory**: provider keys and decrypted MCP auth headers are
+  held in `zeroize::Zeroizing<String>`, which zeros memory on drop.
 - **Never logged**: the logging layer (`crates/common/src/logging.rs`)
   redacts sensitive fields (`authorization`, `api_key`, `client_secret`,
   `token`, `master_key`, etc.) to `[REDACTED]`.

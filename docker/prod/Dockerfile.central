@@ -1,9 +1,10 @@
 # ─────────────────────────────────────────────────────────────────────────
 # Production image for oac-central
 #
-# Slim, single-binary image. The central proxy holds the master backend key
-# in a secret store and serves mTLS on :8443. It is designed to run behind
-# (or as) a network ingress with mTLS-enforced relay clients.
+# Slim, single-binary image. The central proxy decrypts provider API keys
+# with the provider encryption key (mounted as a Docker secret) and serves
+# mTLS on :8443. It is designed to run behind (or as) a network ingress with
+# mTLS-enforced relay clients.
 #
 # Build:
 #   docker build -f docker/prod/Dockerfile.central -t oac-central:latest .
@@ -17,8 +18,11 @@
 #     -e OAC_OIDC_CLIENT_SECRET=... \
 #     oac-central:latest
 #
-# The master key is NEVER baked into the image. Mount it via a secret:
-#   -v /run/secrets/master-key:/secrets/master-key:ro
+# The provider encryption key is NEVER baked into the image. Mount it via
+# a secret (the path the binary falls back to when the env var is unset):
+#   -v /run/secrets/provider-encryption-key:/run/secrets/provider-encryption-key:ro
+# Provider API keys are added at runtime via the admin API and stored
+# AES-256-GCM encrypted in the database.
 # ─────────────────────────────────────────────────────────────────────────
 
 FROM rust:1.98-slim AS builder
