@@ -39,6 +39,7 @@ Agent (Codex, Goose, etc.)
 | Asset | Location | Sensitivity |
 |---|---|---|
 | Provider API keys | Central DB ciphertext → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop |
+| MCP server auth headers | Central DB ciphertext (`mcp_servers`) → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop, never returned by any API |
 | Local API keys (plaintext) | Agent config file (`0600`) | Medium — loopback-only, revocable |
 | Local API key hashes | Relay SQLite (`0600`) | Low — SHA-256 hashes |
 | OIDC ID tokens | In transit only (not stored in v1) | Medium — short-lived |
@@ -50,6 +51,7 @@ Agent (Codex, Goose, etc.)
 | Crate | Path | Role |
 |---|---|---|
 | `oidc-agent-common` | `crates/common` | Shared primitives: config, errors, keys, OIDC, mTLS, logging, HTTP utilities |
+| `oac-mcp` | `crates/mcp` | MCP/JSON-RPC protocol types and parsing (tool-call extraction, redacted previews, hub name handling) |
 | `oac-relay` | `crates/relay` | Laptop relay binary + lib |
 | `oac-central` | `crates/central` | Central proxy binary + lib |
 | `oac-e2e-tests` | `tests/e2e` | In-process end-to-end tests |

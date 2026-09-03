@@ -120,7 +120,9 @@ Shared DB helpers.
 - `enforce_db_perms(path)` — tightens SQLite file to `0600` on Unix.
 - `temp_sqlite_url()` — generates temp SQLite URL (behind `test-utils`
   feature).
-- `sqlite_path()`, `normalize_sqlite_url()`.
+- `sqlite_path()` — extracts/normalizes the on-disk path (with `~`
+  expansion) from a `sqlite://` URL. (`normalize_sqlite_url()` is a
+  private helper inside the module.)
 
 ### `time_util`
 

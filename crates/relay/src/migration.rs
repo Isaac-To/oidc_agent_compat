@@ -146,9 +146,9 @@ impl MigratorTrait for Migrator {
 /// Migration 0003: add the `expires_at` column to `api_keys`.
 ///
 /// Keys minted after OIDC login can carry a session lifetime (relay config
-/// `session_ttl_hours`). `NULL` means the key never expires (the v1 default
-/// and the dev-mode seeded key). Expired keys are rejected at verification
-/// time and their rows deleted.
+/// `session_ttl_hours`, TOML default 24h). `NULL` means the key never
+/// expires (the dev-mode seeded key). Expired keys are rejected at
+/// verification time and their rows deleted.
 pub struct Migration0003ApiKeyExpiry;
 
 impl MigrationName for Migration0003ApiKeyExpiry {

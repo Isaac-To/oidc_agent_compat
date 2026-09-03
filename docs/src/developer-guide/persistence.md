@@ -69,6 +69,21 @@ END;
 | `latency_ms` | bigint | no |
 | `request_id` | string | yes |
 | `created_at` | timestamptz | no |
+| `mcp_server` | string | yes (m000004) |
+| `mcp_tool` | string | yes (m000004) |
+| `mcp_method` | string | yes (m000004) |
+
+#### `m000003_api_key_expiry`
+
+Adds nullable `expires_at` (timestamptz) to `api_keys`. Keys minted by
+`oac-relay login` expire per `session_ttl_hours` (default 24h); an expired
+key is rejected with `session_expired` and deleted on first use. The
+dev-mode seeded key is exempt (`NULL` = no expiry).
+
+#### `m000004_mcp_activity`
+
+Adds nullable MCP columns `mcp_server`, `mcp_tool`, `mcp_method` to
+`relay_activity_log` (see the table above), populated for `/mcp*` traffic.
 
 ### File permissions
 
@@ -176,6 +191,47 @@ Creates:
 | `token_count` | bigint | no |
 | `cost_usd` | real | no |
 
+#### `m000005_providers`
+
+Creates the runtime provider/key registry:
+
+- **`providers`** — `id`, `name`, `base_url`, `enabled`, `is_default`,
+  `models` (nullable JSON array of model names this provider serves),
+  `created_at`/`updated_at`.
+- **`provider_keys`** — `id`, `provider_id` (FK `ON DELETE CASCADE`),
+  `label`, `priority`, `key_ciphertext` + `key_nonce` (AES-256-GCM),
+  `key_digest` (SHA-256, for rotation identification), `enabled`,
+  `created_at`/`updated_at`.
+- **`provider_key_access`** — optional group ACL rows per key: when rows
+  exist, only members of the listed groups may use that key.
+
+#### `m000006_token_saver`
+
+Adds token-saver columns to `group_policies` (`token_saver_enabled`,
+  `max_input_tokens`) and saver-accounting columns to `audit_log`
+  (`token_saver_applied`, `tokens_saved`, `messages_dropped`,
+  `saver_reasons`).
+
+#### `m000007_collapse_repeated_lines`
+
+Adds the opt-in `collapse_repeated_lines` toggle to `group_policies`.
+
+#### `m000008_strip_ansi`
+
+Adds the `strip_ansi` toggle to `group_policies` (pre-optimization ANSI
+escape stripping).
+
+#### `m000009_mcp`
+
+Creates the MCP registry and policies:
+
+- **`mcp_servers`** — `id`, `name`, `base_url`, `enabled`,
+  `auth_ciphertext` + `auth_nonce` (AES-256-GCM), timestamps.
+- **`mcp_server_policies`** — `group_name`, `allowed_tools` (JSON array
+  of `"server:tool"` entries; `NULL` = allow-all).
+- Adds MCP columns to `audit_log` (`mcp_server`, `mcp_tool`, `mcp_method`,
+  `mcp_args_preview`).
+
 ---
 
 ## Append-only enforcement
@@ -206,6 +262,11 @@ without dropping the triggers first.
 - `group_policy::Model` — `group_policies` table.
 - `admin_audit_log::Model` — `admin_audit_log` table.
 - `usage_counter::Model` — `usage_counters` table.
+- `provider::Model` — `providers` table.
+- `provider_key::Model` — `provider_keys` table (encrypted key material).
+- `provider_key_access::Model` — `provider_key_access` table (group ACL).
+- `mcp_server::Model` — `mcp_servers` table (encrypted auth header).
+- `mcp_server_policy::Model` — `mcp_server_policies` table.
 
 All entities derive `DeriveEntityModel`, have no relations (except
 relay's `api_key` → `identity`), and use default `ActiveModelBehavior`.

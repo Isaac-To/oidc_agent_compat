@@ -1,7 +1,7 @@
 # Architecture
 
 The OIDC Agent Compatibility Server is a Cargo workspace (edition 2024,
-resolver 2) with four crates. This page gives the high-level architecture;
+resolver 2) with five crates. This page gives the high-level architecture;
 for the full file tree, see [Workspace Layout](./workspace-layout.md).
 
 ## System overview
@@ -22,6 +22,7 @@ Agent (Codex, Goose, etc.)
 | Crate | Path | Role |
 |---|---|---|
 | `oidc-agent-common` | `crates/common` | Shared primitives: config, errors, keys, OIDC client, mTLS, logging, shutdown, HTTP utilities, persistence |
+| `oac-mcp` | `crates/mcp` | MCP/JSON-RPC protocol types and parsing (tool-call extraction, redacted previews, hub name handling) |
 | `oac-relay` | `crates/relay` | Laptop relay binary + lib (lib exposed for integration tests) |
 | `oac-central` | `crates/central` | Central proxy binary + lib |
 | `oac-e2e-tests` | `tests/e2e` | In-process end-to-end tests (spins up mock backend + central + relay) |
@@ -44,6 +45,13 @@ Agent (Codex, Goose, etc.)
 5. The **relay** streams the response back to the agent and records a
    relay activity log entry.
 
+MCP traffic follows a parallel path: agents send MCP JSON-RPC to
+`127.0.0.1:8787/mcp/{server}` (or the combined `/mcp` hub); the relay
+byte-tunnels it to central with the same identity headers, and central
+enforces **per-tool allowlists** (see [MCP Support](../user-guide/mcp.md))
+before forwarding to the registered MCP server with its encrypted auth
+header.
+
 For a detailed walkthrough with the header table, see
 [Request Data Flow](../reference/data-flow.md).
 
@@ -53,6 +61,8 @@ For a detailed walkthrough with the header table, see
 2. **Relay → central proxy** (mTLS over network — medium trust).
 3. **Central proxy → backend** (HTTPS — external, low trust).
 4. **Relay/central → IdP** (OIDC — external, low trust).
+5. **Central proxy → MCP servers** (HTTPS — external, medium trust; auth
+   headers attached from the encrypted registry).
 
 ## Key design principles
 

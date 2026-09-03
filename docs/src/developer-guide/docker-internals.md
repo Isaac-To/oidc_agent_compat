@@ -61,28 +61,21 @@ Multi-stage build, central proxy only:
 |---|---|---|---|
 | `keycloak` | `quay.io/keycloak/keycloak:26.0` | `8080:8080` | — |
 | `mock-backend` | built from `./mock-backend` | `8090:8080` | — |
-| `central` | built from `../..` with `docker/dev/Dockerfile` | `8443:8443` | keycloak (healthy), mock-backend (healthy), central-init (completed) |
-| `central-init` | `busybox` | — | — |
+| `central` | built from `../..` with `docker/dev/Dockerfile` | `8443:8443` | keycloak (healthy), mock-backend (healthy) |
 | `relay` | built from `../..` with `docker/dev/Dockerfile` | `127.0.0.1:8787:8787` | central (healthy) |
 | `goose` | `ghcr.io/aaif-goose/goose:latest` | — | relay (healthy) |
 
-### `central-init` (one-shot)
-
-Writes the mock provider encryption key:
-
-```sh
-echo -n "sk-mock-backend-master-key" > /secrets/master-key && chmod 600 /secrets/master-key
-```
-
-This runs before the central proxy starts. The central proxy reads the
-key from `/secrets/master-key` on startup.
+The dev central receives its provider encryption key via the
+`OAC_PROVIDER_ENCRYPTION_KEY` env var (a fixed dev 64-hex value in the
+compose file). After healthchecks pass, `docker/dev.sh up` registers the
+mock provider and its key through the admin API using dev-mode identity
+headers — there is no init container and no key file on disk.
 
 ### Volumes
 
 | Volume | Mount | Used by |
 |---|---|---|
 | `central-data` | `/data` | central |
-| `central-secrets` | `/secrets` | central, central-init |
 | `relay-data` | `/data` | relay |
 | `goose-config` | `/home/goose/.config/goose` | goose |
 | `./workspace` | `/workspace` | goose (working_dir) |
@@ -107,7 +100,9 @@ Only the `central` service:
 - Ports: `8443:8443`
 - Volumes: `./configs/central.toml` → `/config/central.toml:ro`,
   `./certs` → `/certs:ro`, `central-data` → `/data`
-- Secrets: `oac_master_key` → `master-key` (at `/run/secrets/master-key`)
+- Secrets: `oac_provider_encryption_key` → `provider-encryption-key` (at
+  `/run/secrets/provider-encryption-key`; the env var
+  `OAC_PROVIDER_ENCRYPTION_KEY` is an equivalent non-Docker fallback)
 - Healthcheck: `pgrep -x oac-central` (process alive check — plain curl
   would fail TLS handshake with client cert required)
 - Logging: `json-file`, max-size 10m, max-file 3

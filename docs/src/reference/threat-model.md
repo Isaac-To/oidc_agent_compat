@@ -4,8 +4,8 @@
 Disclosure, Denial of Service, Elevation of Privilege).
 
 **Scope:** v1 MVP — relay (laptop), central proxy (company-hosted), and
-the communication channels between them, the IdP, the backend, and the
-agent.
+the communication channels between them, the IdP, the backend, MCP
+servers, and the agent.
 
 ## System overview
 
@@ -27,12 +27,15 @@ Agent (Codex, etc.)
 2. Relay → central proxy (mTLS over network — medium trust).
 3. Central proxy → backend (HTTPS — external, low trust).
 4. Relay/central → IdP (OIDC — external, low trust).
+5. Central proxy → MCP servers (HTTPS — external, medium trust);
+   per-tool policy enforcement happens on central before this hop.
 
 ## Assets
 
 | Asset | Location | Sensitivity |
 |---|---|---|
 | Provider API keys | Central DB ciphertext → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop |
+| MCP server auth headers | Central DB ciphertext (`mcp_servers`) → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop, never returned by any API |
 | Local API keys (plaintext) | Agent config file (`0600`) | Medium — loopback-only, revocable |
 | Local API key hashes | Relay SQLite (`0600`) | Low — SHA-256 hashes |
 | OIDC ID tokens | In transit only (not stored in v1) | Medium — short-lived |
@@ -75,9 +78,9 @@ Agent (Codex, etc.)
 
 | Threat | Control | Status |
 |---|---|---|
-| Master key leaks to laptop | Master key never leaves central proxy process; relay never sees it | ✅ By design |
-| Master key leaks in logs/responses | `Zeroizing` memory, never logged, never in error responses, redaction layer | ✅ Implemented |
-| Master key leaks in relay response | E2E test verifies master key not in relay response | ✅ Tested |
+| Provider key leaks to laptop | Provider key never leaves central proxy process; relay never sees it | ✅ By design |
+| Provider key leaks in logs/responses | `Zeroizing` memory, never logged, never in error responses, redaction layer | ✅ Implemented |
+| Provider key leaks in relay response | E2E + dev-stack tests verify the provider key is not in relay responses | ✅ Tested |
 | Local key leaks to other local users | `0600` on SQLite + agent config | ✅ Implemented |
 | Local key leaks in logs | Never logged; `Zeroizing` wrapper | ✅ Implemented |
 | PII (email, subject) leaks in logs | Structured logging, no body logging, redaction layer | ✅ Implemented |
