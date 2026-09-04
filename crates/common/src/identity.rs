@@ -24,6 +24,8 @@ pub const HEADER_USER_GROUPS: &str = "x-oac-user-groups";
 pub const HEADER_IDENTITY_ID: &str = "x-oac-identity-id";
 /// The request ID for end-to-end correlation.
 pub const HEADER_REQUEST_ID: &str = "x-oac-request-id";
+/// The SHA-256 fingerprint of the relay's mTLS client cert (device binding).
+pub const HEADER_DEVICE_FINGERPRINT: &str = "x-oac-device-fingerprint";
 
 #[cfg(test)]
 mod tests {
@@ -36,5 +38,6 @@ mod tests {
         assert!(HEADER_USER_GROUPS.starts_with("x-oac-"));
         assert!(HEADER_IDENTITY_ID.starts_with("x-oac-"));
         assert!(HEADER_REQUEST_ID.starts_with("x-oac-"));
+        assert!(HEADER_DEVICE_FINGERPRINT.starts_with("x-oac-"));
     }
 }

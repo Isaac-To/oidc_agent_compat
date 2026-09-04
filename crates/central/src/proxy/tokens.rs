@@ -25,6 +25,7 @@ use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use time::Duration;
 
+use oidc_agent_common::identity;
 use oidc_agent_common::keys::extract_bearer;
 use oidc_agent_common::time_util;
 
@@ -97,6 +98,7 @@ pub struct TokenListItem {
 /// is never logged.
 pub async fn mint_token_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<MintTokenRequest>,
 ) -> Result<(StatusCode, Json<MintTokenResponse>), (StatusCode, String)> {
     // Validate required fields.
@@ -139,6 +141,13 @@ pub async fn mint_token_handler(
 
     let expires_at = effective_ttl.map(|s| time_util::now_utc() + Duration::seconds(s));
 
+    // Read the device fingerprint from the X-OAC-Device-Fingerprint header
+    // (set by the relay from its mTLS client cert). None in dev mode.
+    let device_fingerprint = headers
+        .get(identity::HEADER_DEVICE_FINGERPRINT)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
     let minted = state
         .token_store
         .mint_token(&MintRequest {
@@ -150,6 +159,7 @@ pub async fn mint_token_handler(
             identity_id: body.identity_id.clone(),
             label: body.label.clone(),
             expires_at,
+            device_fingerprint,
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -771,5 +781,70 @@ mod tests {
             .await
             .expect("router");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn post_tokens_with_device_fingerprint_stores_it() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .header("x-oac-device-fingerprint", "aabb1122ff")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let token = json["token"].as_str().expect("token field").to_string();
+
+        // Verify the token and check the stored device fingerprint.
+        let verify = state
+            .token_store
+            .verify_token(&token)
+            .await
+            .expect("verify")
+            .expect("verified");
+        assert_eq!(
+            verify.identity.device_fingerprint.as_deref(),
+            Some("aabb1122ff"),
+            "device fingerprint from header must be stored on the token"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tokens_without_device_fingerprint_stores_none() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let token = json["token"].as_str().expect("token field").to_string();
+
+        let verify = state
+            .token_store
+            .verify_token(&token)
+            .await
+            .expect("verify")
+            .expect("verified");
+        assert!(
+            verify.identity.device_fingerprint.is_none(),
+            "missing fingerprint header must store None"
+        );
     }
 }

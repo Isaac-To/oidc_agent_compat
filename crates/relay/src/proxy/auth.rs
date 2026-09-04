@@ -160,6 +160,7 @@ mod tests {
             client: reqwest::Client::new(),
             listen_addr: "127.0.0.1:8787".parse().expect("addr"),
             activity: crate::activity::ActivityLogger::new(db),
+            device_fingerprint: None,
         }
     }
 

@@ -211,6 +211,13 @@ async fn forward_request(
         upstream = upstream.header(identity::HEADER_REQUEST_ID, v);
     }
 
+    // Forward the device fingerprint (device binding) if available.
+    if let Some(ref fp) = state.device_fingerprint {
+        if let Ok(v) = HeaderValue::from_str(fp) {
+            upstream = upstream.header(identity::HEADER_DEVICE_FINGERPRINT, v);
+        }
+    }
+
     // Send the request.
     let upstream_resp = upstream
         .send()
@@ -298,6 +305,7 @@ mod tests {
             client: build_client(&config).expect("client"),
             listen_addr: "127.0.0.1:8787".parse().expect("addr"),
             activity: crate::activity::ActivityLogger::new(db),
+            device_fingerprint: None,
         };
         let app = v1_routes().with_state(state);
 

@@ -237,6 +237,7 @@ async fn setup_mcp_system() -> (
             identity_id: Some(ident.id.clone()),
             label: "mcp-e2e".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint central token");
@@ -272,6 +273,7 @@ async fn setup_mcp_system() -> (
         client: relay_client,
         listen_addr: relay_addr,
         activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
+        device_fingerprint: None,
     };
     let relay_app = relay_proxy::router(relay_state);
     tokio::spawn(async {
@@ -507,6 +509,7 @@ async fn setup_hub_system() -> (
             identity_id: Some(ident.id.clone()),
             label: "hub-e2e".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint central token");
@@ -542,6 +545,7 @@ async fn setup_hub_system() -> (
         client: relay_client,
         listen_addr: relay_addr,
         activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
+        device_fingerprint: None,
     };
     let relay_app = relay_proxy::router(relay_state);
     tokio::spawn(async {
@@ -735,6 +739,7 @@ async fn per_server_endpoint_denies_non_tools_call_methods_under_deny_all_policy
             identity_id: Some(ident.id.clone()),
             label: "intern-e2e".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint central token");

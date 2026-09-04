@@ -49,6 +49,7 @@ async fn setup_router() -> (axum::Router, ProviderStore, String, String) {
             identity_id: None,
             label: "non-admin".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint non-admin token");
@@ -74,6 +75,7 @@ async fn mint_admin_token(state: &AdminState) -> String {
             identity_id: None,
             label: "test".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint admin token");

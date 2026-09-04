@@ -40,6 +40,9 @@ pub struct AppState {
     pub listen_addr: SocketAddr,
     /// The relay-side activity logger.
     pub activity: ActivityLogger,
+    /// The SHA-256 fingerprint of the relay's mTLS client cert (device binding).
+    /// `None` in dev mode (no mTLS).
+    pub device_fingerprint: Option<String>,
 }
 
 /// The maximum request body size (10 MB).
@@ -98,11 +101,21 @@ pub async fn serve(config: RelayConfig, db: DatabaseConnection) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     let listen_addr = listener.local_addr()?;
     let activity = ActivityLogger::new(db);
+
+    // Compute the device fingerprint from the mTLS client cert (if available).
+    // In dev mode (no mTLS), this is None — no device binding enforced.
+    let device_fingerprint = if config.dev_mode {
+        None
+    } else {
+        oidc_agent_common::mtls::cert_fingerprint(&config.central.client_cert_path)
+    };
+
     let state = AppState {
         config: config.clone(),
         client,
         listen_addr,
         activity,
+        device_fingerprint,
     };
     let app = router(state);
     tracing::info!("relay listening on {}", listen_addr);
