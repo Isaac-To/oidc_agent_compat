@@ -394,9 +394,17 @@ use the admin auth middleware.
 
 ### `POST /v1/tokens`
 
-Mint a new opaque token. Called by the relay over mTLS during login.
+Mint a new opaque token. This endpoint serves two authentication modes:
 
-**Request body:**
+1. **Login flow** (relay during OIDC login, no `Authorization` header): the
+   identity (subject, issuer, email, groups, identity_id) is carried in the
+   request body fields. `subject`, `issuer`, and `label` are required.
+2. **Token-create flow** (`oac-relay token create`, with `Authorization:
+   Bearer`): a valid bearer is verified against the token store, and the
+   identity is taken from the verified token record. The body carries only
+   `label` and `ttl_seconds` (subject/issuer/etc. in the body are ignored).
+
+**Request body (login flow):**
 
 ```json
 {
@@ -411,10 +419,18 @@ Mint a new opaque token. Called by the relay over mTLS during login.
 }
 ```
 
-`subject`, `issuer`, and `label` are required. `ttl_seconds` is optional
-(`null` = never expires). The requested TTL is clamped to the admin
-`max_token_ttl_seconds` backstop if set. The plaintext token is returned
-once and never persisted or logged.
+**Request body (token-create flow — body has only label + ttl):**
+
+```json
+{
+  "label": "codex",
+  "ttl_seconds": 31536000
+}
+```
+
+`ttl_seconds` is optional (`null` = never expires). The requested TTL is
+clamped to the admin `max_token_ttl_seconds` backstop if set. The plaintext
+token is returned once and never persisted or logged.
 
 **Response:** `201 Created`
 
@@ -428,10 +444,19 @@ once and never persisted or logged.
 
 ### `DELETE /v1/tokens/current`
 
-Revoke the token in the `Authorization: Bearer ***` header. The token
+Revoke the token in the `Authorization: Bearer` header. The token
 row is deleted from central's database.
 
 **Response:** `204 No Content` (or `404` if not found).
+
+### `DELETE /v1/tokens/{id}`
+
+Revoke a specific token by its row ID (UUID). Bearer-authenticated — the
+caller must hold a valid token (any of their tokens) for authentication. This
+lets a user revoke any of their tokens, not just the current one.
+
+**Response:** `204 No Content` (401 if the bearer is invalid, 500 if the
+revocation fails).
 
 ### `GET /v1/tokens`
 

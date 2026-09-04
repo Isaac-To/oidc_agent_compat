@@ -148,6 +148,10 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(tokens::revoke_current_handler),
         )
         .route(
+            "/v1/tokens/{id}",
+            axum::routing::delete(tokens::revoke_by_id_handler),
+        )
+        .route(
             "/v1/tokens",
             axum::routing::get(tokens::list_tokens_handler),
         )
