@@ -188,21 +188,23 @@ Key modules:
 
 - `crates/common/src/config.rs` — `RelayConfig` / `CentralConfig` TOML schemas + validation (relay rejects `0.0.0.0`).
 - `crates/common/src/error.rs` — unified `Error` enum + `Result` alias. Use this, not `anyhow`, in library code.
-- `crates/common/src/keys.rs` — local API key gen, SHA-256 hashing, constant-time compare.
+- `crates/common/src/keys.rs` — opaque token generation (256-bit CSPRNG, `oac_` prefix), SHA-256 hashing, constant-time compare, bearer extraction.
 - `crates/common/src/oidc.rs` — OIDC RP client builder + `CustomAdditionalClaims` (groups/roles extraction).
 - `crates/common/src/mtls.rs` — rustls mTLS client/server builders.
 - `crates/relay/src/login.rs` — `oac-relay login`: auth-code + PKCE flow, loopback callback, ID-token validation, agent config injection.
-- `crates/relay/src/proxy/` — `mod.rs`, `auth.rs` (local key check), `forward.rs` (relay→central), `host_guard.rs` (DNS rebinding defense), `mcp_forward.rs` (byte-tunnel for `/mcp` and `/mcp/{server}`).
-- `crates/relay/src/keystore.rs`, `agent_config.rs`, `db.rs`, `migration.rs`, `entity/` — persistence + agent config injection.
+- `crates/relay/src/proxy/` — `mod.rs`, `auth.rs` (pass-through — checks Authorization header presence, does not verify), `forward.rs` (relay→central, forwards Authorization header unchanged), `host_guard.rs` (DNS rebinding defense), `mcp_forward.rs` (byte-tunnel for `/mcp` and `/mcp/{server}`).
+- `crates/relay/src/keystore.rs` (OIDC identity storage only — `upsert_identity`; no key methods), `agent_config.rs`, `db.rs`, `migration.rs`, `entity/` — persistence + agent config injection.
 - `crates/relay/src/activity.rs` — relay-side activity logger (append-only `relay_activity_log`).
-- `crates/central/src/proxy/` — `mod.rs`, `auth.rs` (validates relay user tokens), `forward.rs` (central→backend, SSE streaming), `permissions.rs` (group-based model/endpoint enforcement), `rate_limit.rs`, `mcp_permissions.rs` (per-tool MCP allowlists), `mcp_hub.rs` (combined `/mcp` hub), `mcp_forward.rs` (per-server `/mcp/{server}` forwarding).
+- `crates/central/src/proxy/` — `mod.rs`, `auth.rs` (verifies bearer token via TokenStore — zero-trust), `tokens.rs` (token API: mint, revoke, list), `forward.rs` (central→backend, SSE streaming), `permissions.rs` (group-based model/endpoint enforcement), `rate_limit.rs`, `mcp_permissions.rs` (per-tool MCP allowlists), `mcp_hub.rs` (combined `/mcp` hub), `mcp_forward.rs` (per-server `/mcp/{server}` forwarding).
 - `crates/central/src/mcp.rs` — MCP server registry; `auth_header` values AES-256-GCM encrypted at rest with the provider encryption key.
 - `crates/central/src/admin.rs` — admin API (`/admin/v1/`) for policy/provider/device/audit/MCP management.
+- `crates/central/src/proxy/tokens.rs` — token API (`POST /v1/tokens` mint, `DELETE /v1/tokens/current` revoke, `GET /v1/tokens` list).
 - `crates/central/src/policy.rs` — `PolicyStore` + `resolve_policy` (group→policy merge, most-permissive-wins).
 - `crates/central/src/device_store.rs` — device registration + revocation store.
 - `crates/central/src/provider.rs` — runtime provider/key store; provider keys are AES-256-GCM encrypted at rest with the configured MEK.
 - `crates/central/src/audit.rs` — audit logger (enriched with identity, groups, endpoint, request-id, permission decision, token-saver accounting).
 - `crates/central/src/optimizer.rs` — the safe, admin-controlled token saver: a pure module that dedupes exact-verbatim messages, removes structurally-empty messages/`tools`, drops oldest whole turns under a budget, and (opt-in via `collapse_repeated_lines`) collapses consecutive exact-verbatim repeated lines inside a single message into `[×N]` markers (RTK-adapted, lossless-by-construction). **Never rewrites kept content except for the opt-in repeated-line collapse.** Driven by `TokenSaverConfig` from the resolved policy; gated server-side only.
+- `crates/central/src/token_store.rs` — central token store (zero-trust): mint, verify, revoke, list opaque bearer tokens with constant-time hash comparison.
 - `crates/central/src/db.rs`, `migration.rs`, `entity/` — central persistence.
 
 ---
@@ -285,13 +287,14 @@ Everything runs in Docker; Goose runs headless in a container.
   using `axum_server::bind_rustls` with client cert required. In dev mode
   (`dev_mode=true`), it serves plain HTTP for the containerized dev stack.
   Never probe a prod central proxy over plain HTTP.
-- Relay auto-mints dev key `oac_test_key_alice` when `dev_mode=true`
-  (`crates/relay/src/main.rs` `serve()` → `seed_dev_key`). Idempotent.
+- Relay is a dumb forwarder — it does not auto-mint a dev key. `docker/dev.sh`
+  mints a dev token via `POST /v1/tokens` at central after the stack starts, then
+  writes it to the Goose agent config.
 - `dev.sh test` exercises the full chain + SSE + provider-key-leak check.
 - Mock provider key `sk-mock-backend-master-key` is registered at runtime by
   `docker/dev.sh` `cmd_up()` via the admin API (`POST /admin/v1/providers` +
-  `POST /admin/v1/providers/mock-backend/keys`) using dev-mode identity
-  headers. It must never appear in relay responses.
+  `POST /admin/v1/providers/mock-backend/keys`) using the dev token for
+  bearer auth. It must never appear in relay responses.
 - Dockerfile runtime base **must be `debian:trixie-slim`** (not
   `bookworm-slim`) to match the `rust:1.98-slim` builder's glibc 2.41.
 - Keycloak realm `oac-dev` allows `http://127.0.0.1:*` and
@@ -309,7 +312,8 @@ See `docker/README.md` for the full service table and quick start.
 - Distributed Redis-backed rate limiting for horizontally scaled central
   instances (the current limiter is in-memory per IP).
 - Refresh-token handling: v1 intentionally stores no OIDC refresh tokens;
-  local API keys expire according to `session_ttl_hours`, default 24 hours.
+  central-minted tokens expire according to the `--ttl` flag (default: never
+  expires), clamped by the admin `max_token_ttl_seconds` backstop.
 
 ---
 

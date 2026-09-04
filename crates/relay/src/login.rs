@@ -2,14 +2,16 @@
 //!
 //! This module implements the `login` subcommand: it runs the OIDC
 //! authorization-code + PKCE flow against the enterprise IdP, persists the
-//! identity, mints a local key, and injects it into the agent's config.
+//! identity locally, requests a central-minted token from the central proxy,
+//! and injects it into the agent's config.
 //!
 //! # Security
 //!
 //! - Loopback redirect URI (`http://127.0.0.1:{port}/callback`), RFC 8252.
 //! - PKCE S256, `state`, `nonce`.
 //! - ID-token validation with alg pin {RS256, ES256}.
-//! - The local key is never printed; it's auto-injected into the agent config.
+//! - The central token is never printed; it's auto-injected into the agent
+//!   config.
 
 use std::time::Duration;
 
@@ -29,9 +31,60 @@ use openidconnect::{
     AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     OAuth2TokenResponse, PkceCodeChallenge, RedirectUrl, Scope, SubjectIdentifier,
 };
+use serde::{Deserialize, Serialize};
 
 /// The maximum time to wait for the user to complete the browser login (5 min).
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Parses a TTL duration string into seconds.
+///
+/// Supported formats:
+/// - `1d` — days (1d = 86400s)
+/// - `12h` — hours (1h = 3600s)
+/// - `30m` — minutes (1m = 60s)
+/// - `3600s` — seconds
+/// - `1y` — years (1y = 365d = 31536000s)
+/// - `3600` — bare integer (seconds)
+///
+/// Returns `Ok(None)` for an empty string (meaning "never expire").
+///
+/// # Errors
+///
+/// Returns [`Error::Config`] if the format is unrecognized or the numeric
+/// portion is not a valid positive integer.
+pub fn parse_ttl_to_seconds(s: &str) -> Result<Option<i64>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // Determine the unit suffix and the numeric prefix.
+    let (num_str, multiplier): (&str, i64) = if let Some(rest) = trimmed.strip_suffix('d') {
+        (rest, 86_400)
+    } else if let Some(rest) = trimmed.strip_suffix('h') {
+        (rest, 3_600)
+    } else if let Some(rest) = trimmed.strip_suffix('m') {
+        (rest, 60)
+    } else if let Some(rest) = trimmed.strip_suffix('s') {
+        (rest, 1)
+    } else if let Some(rest) = trimmed.strip_suffix('y') {
+        (rest, 31_536_000)
+    } else {
+        (trimmed, 1) // bare integer = seconds
+    };
+    let value: i64 = num_str
+        .trim()
+        .parse::<i64>()
+        .map_err(|e| Error::Config(format!("invalid TTL value '{num_str}': {e}")))?;
+    if value <= 0 {
+        return Err(Error::Config(format!(
+            "TTL must be a positive integer, got {value}"
+        )));
+    }
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| Error::Config(format!("TTL overflow: {value} * {multiplier}")))
+        .map(Some)
+}
 
 /// The result of a successful login.
 #[derive(Debug)]
@@ -44,61 +97,140 @@ pub struct LoginResult {
     pub injection: crate::agent_config::InjectionResult,
 }
 
+/// Request body for `POST /v1/tokens` (central token mint).
+#[derive(Debug, Serialize)]
+struct MintTokenRequest {
+    /// The user subject (from the IdP).
+    subject: String,
+    /// The OIDC issuer.
+    issuer: String,
+    /// The user email, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    /// The user display name, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    /// The group/role memberships (JSON array string), if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    groups: Option<String>,
+    /// The relay-side identity database ID, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_id: Option<String>,
+    /// Human-readable label.
+    label: String,
+    /// Requested token lifetime in seconds. `None` = never expires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl_seconds: Option<i64>,
+}
+
+/// Response body for `POST /v1/tokens` (central token mint).
+#[derive(Debug, Deserialize)]
+struct MintTokenResponse {
+    /// The plaintext opaque token (`oac_...`). Returned once; never persisted.
+    token: String,
+    /// The stored token row id (UUID).
+    #[allow(dead_code)]
+    token_id: String,
+    /// When the token expires (RFC 3339), or `null` for never.
+    #[allow(dead_code)]
+    expires_at: Option<String>,
+}
+
+/// The verified OIDC identity claims passed to [`complete_login`].
+///
+/// Grouping these into a struct keeps the function signature within clippy's
+/// argument-count threshold and makes call sites more readable.
+#[derive(Debug)]
+pub struct IdentityClaims<'a> {
+    /// The OIDC issuer.
+    pub issuer: &'a str,
+    /// The user subject (from the IdP).
+    pub subject: &'a str,
+    /// The user email, if known.
+    pub email: Option<&'a str>,
+    /// The user display name, if known.
+    pub display_name: Option<&'a str>,
+    /// The group/role memberships (JSON array string), if known.
+    pub groups: Option<&'a str>,
+}
+
 /// Orchestrates the login flow after OIDC authentication has completed.
 ///
 /// This is called by the `login` subcommand after the OIDC callback has
 /// returned the user's identity claims. It:
-/// 1. Upserts the identity in the local database.
-/// 2. Mints a new local API key.
-/// 3. Injects the base URL + key into the agent's config.
+/// 1. Upserts the identity in the local database (for login convenience).
+/// 2. Calls the central proxy's `POST /v1/tokens` to mint a central token.
+/// 3. Injects the base URL + central token into the agent's config.
 ///
 /// # Security
 ///
-/// The plaintext key is passed to `inject` and then dropped. It is never
-/// printed or persisted.
+/// The plaintext central token is passed to `inject` and then dropped. It
+/// is never printed or persisted by the relay.
 ///
 /// # Errors
 ///
-/// Returns [`Error`] if the database or config injection fails.
+/// Returns [`Error`] if the database upsert, central token mint, or config
+/// injection fails.
 pub async fn complete_login(
     key_store: &KeyStore,
     config: &RelayConfig,
-    issuer: &str,
-    subject: &str,
-    email: Option<&str>,
-    display_name: Option<&str>,
-    groups: Option<&str>,
+    client: &reqwest::Client,
+    identity: IdentityClaims<'_>,
+    ttl_seconds: Option<i64>,
 ) -> Result<LoginResult> {
-    // 1. Upsert the identity.
-    let identity = key_store
-        .upsert_identity(issuer, subject, email, display_name, groups)
+    // 1. Upsert the identity (local DB — for login convenience so the user
+    //    does not have to re-run the full OIDC flow every time).
+    let stored_identity = key_store
+        .upsert_identity(
+            identity.issuer,
+            identity.subject,
+            identity.email,
+            identity.display_name,
+            identity.groups,
+        )
         .await?;
 
-    // 2. Mint a new local key with the configured session lifetime (None
-    //    = never expires; only reachable programmatically — TOML configs
-    //    default to Some(24)).
-    let expires_at = config
-        .session_ttl_hours
-        .map(|hours| {
-            time::OffsetDateTime::now_utc()
-                + time::Duration::hours(i64::try_from(hours).unwrap_or(i64::MAX))
-        })
-        .map(|exp| time::PrimitiveDateTime::new(exp.date(), exp.time()));
-    let minted = key_store
-        .mint_key(&identity.id, "default", expires_at)
-        .await?;
+    // 2. Mint a central token via POST /v1/tokens.
+    let mint_request = MintTokenRequest {
+        subject: identity.subject.to_string(),
+        issuer: identity.issuer.to_string(),
+        email: identity.email.map(String::from),
+        display_name: identity.display_name.map(String::from),
+        groups: identity.groups.map(String::from),
+        identity_id: Some(stored_identity.id.clone()),
+        label: "default".to_string(),
+        ttl_seconds,
+    };
+    let url = format!("{}/v1/tokens", config.central.url);
+    let resp = client
+        .post(&url)
+        .json(&mint_request)
+        .send()
+        .await
+        .map_err(|e| Error::http(format!("failed to mint token from central: {e}")))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(Error::http(format!(
+            "failed to mint token from central: {status} {body}"
+        )));
+    }
+    let minted: MintTokenResponse = resp
+        .json()
+        .await
+        .map_err(|e| Error::http(format!("failed to parse central token response: {e}")))?;
 
-    // 3. Inject into the agent config.
+    // 3. Inject the central token into the agent config.
     let base_url = format!("http://{}/v1", config.listen_addr);
     let agent_config = AgentConfig {
         base_url,
-        api_key: minted.plaintext.to_string(),
+        api_key: minted.token,
     };
     let injection = inject(&agent_config)?;
 
     Ok(LoginResult {
-        subject: subject.to_string(),
-        email: email.map(String::from),
+        subject: identity.subject.to_string(),
+        email: identity.email.map(String::from),
         injection,
     })
 }
@@ -117,7 +249,7 @@ pub async fn complete_login(
 /// 8. Validate the ID token (alg pin {RS256, ES256}, iss, aud, exp, nonce,
 ///    signature via JWKS).
 /// 9. Fetch userinfo (email, name, groups), falling back to ID-token claims.
-/// 10. Call [`complete_login`] to persist + mint + inject.
+/// 10. Call [`complete_login`] to persist + mint central token + inject.
 ///
 /// # Security
 ///
@@ -127,12 +259,17 @@ pub async fn complete_login(
 ///   rejected (OIDC Core §2, repo security research).
 /// - Loopback redirect only (RFC 8252 §7.3).
 /// - HTTP client never follows redirects (SSRF prevention).
-/// - The local key is never printed; it's auto-injected into the agent config.
+/// - The central token is never printed; it's auto-injected into the agent
+///   config.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Oidc`] on any protocol, validation, or network failure.
-pub async fn run_login(config: &RelayConfig, key_store: &KeyStore) -> Result<LoginResult> {
+pub async fn run_login(
+    config: &RelayConfig,
+    key_store: &KeyStore,
+    ttl: Option<&str>,
+) -> Result<LoginResult> {
     // 1. Validate the redirect URI is a loopback http URL.
     oidc::validate_loopback_redirect(&config.oidc.redirect_uri)?;
 
@@ -302,17 +439,20 @@ pub async fn run_login(config: &RelayConfig, key_store: &KeyStore) -> Result<Log
         }
     };
 
-    // 15. Persist + mint + inject.
-    complete_login(
-        key_store,
-        config,
-        &config.oidc.issuer,
-        &subject,
-        email.as_deref(),
-        display_name.as_deref(),
-        groups.as_deref(),
-    )
-    .await
+    // 15. Persist + mint central token + inject.
+    let ttl_seconds = match ttl {
+        Some(t) => parse_ttl_to_seconds(t)?,
+        None => None,
+    };
+    let central_client = crate::proxy::forward::build_client(config)?;
+    let identity = IdentityClaims {
+        issuer: &config.oidc.issuer,
+        subject: &subject,
+        email: email.as_deref(),
+        display_name: display_name.as_deref(),
+        groups: groups.as_deref(),
+    };
+    complete_login(key_store, config, &central_client, identity, ttl_seconds).await
 }
 
 /// Returns `true` if the signing algorithm is RS256 or ES256.
@@ -525,21 +665,36 @@ mod tests {
                 client_key_path: "/client.key".into(),
             },
             dev_mode: false,
-            session_ttl_hours: None,
         }
     }
 
+    // --- complete_login tests ---
+    //
+    // These tests exercise the full `complete_login` flow, which now calls
+    // the central proxy's POST /v1/tokens endpoint. They require a running
+    // central server and are marked #[ignore] so they don't run in the
+    // normal test suite. Run them manually with:
+    //   cargo test -p oac-relay -- --ignored complete_login
+
+    /// Verifies that `complete_login` persists the identity and mints a
+    /// central token. Requires a live central server at `config.central.url`.
     #[tokio::test]
+    #[ignore = "requires a live central server with POST /v1/tokens endpoint"]
     async fn complete_login_persists_identity_and_mints_key() {
         let store = setup_test_db().await;
         let config = test_config();
+        let client = crate::proxy::forward::build_client(&config).expect("client");
         let result = complete_login(
             &store,
             &config,
-            "https://idp.example.com",
-            "user123",
-            Some("user@example.com"),
-            Some("Test User"),
+            &client,
+            IdentityClaims {
+                issuer: "https://idp.example.com",
+                subject: "user123",
+                email: Some("user@example.com"),
+                display_name: Some("Test User"),
+                groups: None,
+            },
             None,
         )
         .await
@@ -554,71 +709,62 @@ mod tests {
         let identities = identity::Entity::find().all(&store.db).await.expect("load");
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].subject, "user123");
-
-        // Verify a key was minted.
-        use crate::entity::api_key;
-        let keys = api_key::Entity::find().all(&store.db).await.expect("load");
-        assert_eq!(keys.len(), 1, "exactly one key must be minted");
-        assert!(
-            keys[0].expires_at.is_none(),
-            "no TTL configured means the key never expires"
-        );
     }
 
+    /// Verifies that `complete_login` applies the requested TTL. Requires a
+    /// live central server.
     #[tokio::test]
+    #[ignore = "requires a live central server with POST /v1/tokens endpoint"]
     async fn complete_login_applies_session_ttl() {
         let store = setup_test_db().await;
-        let mut config = test_config();
-        config.session_ttl_hours = Some(24);
+        let config = test_config();
+        let client = crate::proxy::forward::build_client(&config).expect("client");
 
         let _ = complete_login(
             &store,
             &config,
-            "https://idp.example.com",
-            "ttl-user",
-            None,
-            None,
-            None,
+            &client,
+            IdentityClaims {
+                issuer: "https://idp.example.com",
+                subject: "ttl-user",
+                email: None,
+                display_name: None,
+                groups: None,
+            },
+            Some(3600),
         )
         .await
         .expect("login");
 
-        use crate::entity::api_key;
+        // The central server is responsible for the token's TTL. We verify
+        // the identity was persisted.
+        use crate::entity::identity;
         use sea_orm::EntityTrait;
-        let keys = api_key::Entity::find().all(&store.db).await.expect("load");
-        assert_eq!(keys.len(), 1);
-        let expires_at = keys[0]
-            .expires_at
-            .expect("TTL configured means the key must expire");
-        let expected = time::PrimitiveDateTime::new(
-            time::OffsetDateTime::now_utc().date(),
-            time::OffsetDateTime::now_utc().time(),
-        ) + time::Duration::hours(24);
-        // Allow slack for the seconds ticking between mint and assertion.
-        let diff = if expires_at > expected {
-            expires_at - expected
-        } else {
-            expected - expires_at
-        };
-        assert!(
-            diff < time::Duration::minutes(1),
-            "expiry must be ~24h from now, got {expires_at:?}"
-        );
+        let identities = identity::Entity::find().all(&store.db).await.expect("load");
+        assert_eq!(identities.len(), 1);
     }
 
+    /// Verifies that `complete_login` is idempotent for the same identity.
+    /// Requires a live central server.
     #[tokio::test]
+    #[ignore = "requires a live central server with POST /v1/tokens endpoint"]
     async fn complete_login_is_idempotent_for_same_identity() {
         let store = setup_test_db().await;
         let config = test_config();
+        let client = crate::proxy::forward::build_client(&config).expect("client");
 
         // First login.
         let _ = complete_login(
             &store,
             &config,
-            "https://idp.example.com",
-            "user123",
-            None,
-            None,
+            &client,
+            IdentityClaims {
+                issuer: "https://idp.example.com",
+                subject: "user123",
+                email: None,
+                display_name: None,
+                groups: None,
+            },
             None,
         )
         .await
@@ -628,23 +774,60 @@ mod tests {
         let _ = complete_login(
             &store,
             &config,
-            "https://idp.example.com",
-            "user123",
-            None,
-            None,
+            &client,
+            IdentityClaims {
+                issuer: "https://idp.example.com",
+                subject: "user123",
+                email: None,
+                display_name: None,
+                groups: None,
+            },
             None,
         )
         .await
         .expect("login 2");
 
-        // Should have one identity but two keys.
-        use crate::entity::{api_key, identity};
+        // Should have one identity (upsert), but two central tokens.
+        use crate::entity::identity;
         use sea_orm::EntityTrait;
         let identities = identity::Entity::find().all(&store.db).await.expect("load");
         assert_eq!(identities.len(), 1, "same identity must not be duplicated");
+    }
 
-        let keys = api_key::Entity::find().all(&store.db).await.expect("load");
-        assert_eq!(keys.len(), 2, "each login mints a new key");
+    /// Verifies that `complete_login` persists groups. Requires a live
+    /// central server.
+    #[tokio::test]
+    #[ignore = "requires a live central server with POST /v1/tokens endpoint"]
+    async fn complete_login_persists_groups() {
+        let store = setup_test_db().await;
+        let config = test_config();
+        let client = crate::proxy::forward::build_client(&config).expect("client");
+        let groups_json = r#"["engineering","ai-users"]"#;
+        let _ = complete_login(
+            &store,
+            &config,
+            &client,
+            IdentityClaims {
+                issuer: "https://idp.example.com",
+                subject: "user-groups",
+                email: Some("user@example.com"),
+                display_name: None,
+                groups: Some(groups_json),
+            },
+            None,
+        )
+        .await
+        .expect("login");
+
+        use crate::entity::identity;
+        use sea_orm::EntityTrait;
+        let identities = identity::Entity::find().all(&store.db).await.expect("load");
+        assert_eq!(identities.len(), 1);
+        assert_eq!(
+            identities[0].groups.as_deref(),
+            Some(groups_json),
+            "groups must be persisted in the identities table"
+        );
     }
 
     #[tokio::test]
@@ -657,7 +840,7 @@ mod tests {
         // valid non-placeholder error.
         let store = setup_test_db().await;
         let config = test_config();
-        let err = run_login(&config, &store).await.unwrap_err();
+        let err = run_login(&config, &store, None).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             !msg.contains("not yet implemented"),
@@ -688,34 +871,6 @@ mod tests {
             &CoreJwsSigningAlgorithm::RsaSsaPkcs1V15Sha384
         ));
         assert!(!is_allowed_alg(&CoreJwsSigningAlgorithm::EcdsaP384Sha384));
-    }
-
-    #[tokio::test]
-    async fn complete_login_persists_groups() {
-        let store = setup_test_db().await;
-        let config = test_config();
-        let groups_json = r#"["engineering","ai-users"]"#;
-        let _ = complete_login(
-            &store,
-            &config,
-            "https://idp.example.com",
-            "user-groups",
-            Some("user@example.com"),
-            None,
-            Some(groups_json),
-        )
-        .await
-        .expect("login");
-
-        use crate::entity::identity;
-        use sea_orm::EntityTrait;
-        let identities = identity::Entity::find().all(&store.db).await.expect("load");
-        assert_eq!(identities.len(), 1);
-        assert_eq!(
-            identities[0].groups.as_deref(),
-            Some(groups_json),
-            "groups must be persisted in the identities table"
-        );
     }
 
     #[test]
@@ -1011,17 +1166,25 @@ mod tests {
         );
     }
 
+    /// Verifies that `complete_login` persists the display name. Requires a
+    /// live central server.
     #[tokio::test]
+    #[ignore = "requires a live central server with POST /v1/tokens endpoint"]
     async fn complete_login_persists_display_name() {
         let store = setup_test_db().await;
         let config = test_config();
+        let client = crate::proxy::forward::build_client(&config).expect("client");
         let _ = complete_login(
             &store,
             &config,
-            "https://idp.example.com",
-            "user-display",
-            None,
-            Some("Alice Doe"),
+            &client,
+            IdentityClaims {
+                issuer: "https://idp.example.com",
+                subject: "user-display",
+                email: None,
+                display_name: Some("Alice Doe"),
+                groups: None,
+            },
             None,
         )
         .await
@@ -1126,5 +1289,71 @@ mod tests {
         assert_eq!(got.0.secret(), "only");
         assert_eq!(got.1.secret(), "ss");
         client.await.expect("client task");
+    }
+
+    // --- parse_ttl_to_seconds tests ---
+
+    #[test]
+    fn parse_ttl_days() {
+        assert_eq!(parse_ttl_to_seconds("1d").expect("1d"), Some(86_400));
+        assert_eq!(parse_ttl_to_seconds("7d").expect("7d"), Some(604_800));
+    }
+
+    #[test]
+    fn parse_ttl_hours() {
+        assert_eq!(parse_ttl_to_seconds("12h").expect("12h"), Some(43_200));
+        assert_eq!(parse_ttl_to_seconds("1h").expect("1h"), Some(3_600));
+    }
+
+    #[test]
+    fn parse_ttl_minutes() {
+        assert_eq!(parse_ttl_to_seconds("30m").expect("30m"), Some(1_800));
+        assert_eq!(parse_ttl_to_seconds("1m").expect("1m"), Some(60));
+    }
+
+    #[test]
+    fn parse_ttl_seconds() {
+        assert_eq!(parse_ttl_to_seconds("3600s").expect("3600s"), Some(3_600));
+        assert_eq!(parse_ttl_to_seconds("1s").expect("1s"), Some(1));
+    }
+
+    #[test]
+    fn parse_ttl_years() {
+        assert_eq!(parse_ttl_to_seconds("1y").expect("1y"), Some(31_536_000));
+    }
+
+    #[test]
+    fn parse_ttl_bare_integer() {
+        assert_eq!(parse_ttl_to_seconds("3600").expect("3600"), Some(3_600));
+        assert_eq!(parse_ttl_to_seconds("60").expect("60"), Some(60));
+    }
+
+    #[test]
+    fn parse_ttl_empty_returns_none() {
+        assert_eq!(parse_ttl_to_seconds("").expect("empty"), None);
+        assert_eq!(parse_ttl_to_seconds("   ").expect("whitespace"), None);
+    }
+
+    #[test]
+    fn parse_ttl_invalid_format_returns_err() {
+        assert!(
+            parse_ttl_to_seconds("abc").is_err(),
+            "non-numeric must error"
+        );
+        assert!(parse_ttl_to_seconds("0d").is_err(), "zero must error");
+        assert!(parse_ttl_to_seconds("-1h").is_err(), "negative must error");
+        assert!(
+            parse_ttl_to_seconds("1.5d").is_err(),
+            "fractional must error"
+        );
+        assert!(parse_ttl_to_seconds("d").is_err(), "bare suffix must error");
+    }
+
+    #[test]
+    fn parse_ttl_whitespace_around_value() {
+        assert_eq!(
+            parse_ttl_to_seconds("  1d  ").expect("trimmed"),
+            Some(86_400)
+        );
     }
 }

@@ -22,7 +22,7 @@ command docs.
 ```rust
 pub struct AppState {
     pub config: CentralConfig,
-   pub provider_store: ProviderStore,
+    pub provider_store: ProviderStore,
     pub client: reqwest::Client,
     pub audit: AuditLogger,
     pub rate_limiter: Option<RateLimiter>,
@@ -31,6 +31,7 @@ pub struct AppState {
     pub usage_tracker: UsageTracker,
     pub price_table: PriceTable,
     pub mcp_manager: McpManager,
+    pub token_store: crate::token_store::TokenStore,
 }
 ```
 
@@ -40,7 +41,8 @@ pub struct AppState {
 - Loads the provider encryption key and opens the `ProviderStore`; provider
    API keys are decrypted into `Zeroizing` memory only for upstream requests.
 - Builds the `reqwest::Client` via `forward::build_client()`.
-- Creates `PolicyStore`, `DeviceStore`, `UsageTracker`, `PriceTable`.
+- Creates `PolicyStore`, `DeviceStore`, `UsageTracker`, `PriceTable`,
+   `TokenStore`.
 - If `[pricing]` is configured with a non-zero interval, refreshes model
    prices from each enabled provider (best-effort).
 - Binds:
@@ -55,7 +57,7 @@ Middleware order (outer → inner, as executed — in axum the last
 `.layer()` applied is outermost):
 
 1. `RequestBodyLimitLayer(10 MB)`.
-2. `auth::auth_middleware` — validates relay-forwarded identity headers.
+2. `auth::auth_middleware` — verifies bearer token via TokenStore.
 3. `rate_limit::rate_limit_middleware` — per-IP token bucket (prod only).
 4. `permissions::permissions_middleware` — group-based enforcement.
 5. Handler (`forward::proxy_handler`).
@@ -87,18 +89,25 @@ pub struct VerifiedRelayIdentity {
     pub subject: String,
     pub email: Option<String>,
     pub identity_id: Option<String>,
-    pub groups: Option<String>,      // JSON array string
+    pub groups: Option<String>,      // JSON array string (from token record)
     pub request_id: Option<String>,
+    pub token_id: Option<String>,    // for backstop enforcement
+    pub created_at: Option<time::PrimitiveDateTime>,  // for backstop check
 }
 ```
 
-`auth_middleware`:
+`auth_middleware` — verifies the bearer token via `TokenStore`:
 
 - Skips `/healthz`.
-- Extracts `x-oac-*` headers (from `identity` constants).
-- Returns `401` if `x-oac-user-subject` is missing/empty (unless
-  `dev_mode`, which logs a warning and allows through).
-- Inserts `VerifiedRelayIdentity` into extensions.
+- Extracts the bearer token from the `Authorization` header.
+- Verifies it via `state.token_store.verify_token()` (DB lookup,
+  constant-time hash comparison, no early return — CWE-208).
+- Missing/unverifiable → `401` (unless `dev_mode`, which allows through
+  with a warning).
+- `X-OAC-*` identity headers are **ignored** — identity comes from the
+  token record.
+- Inserts `VerifiedRelayIdentity` (with `token_id` and `created_at` for
+  backstop enforcement) into extensions.
 
 ## Permissions middleware (`proxy/permissions.rs`)
 
@@ -119,13 +128,16 @@ Enforcement order:
 3. Parse groups from JSON array string.
 4. `PolicyStore::resolve_policy(&groups)` — on error, **fails open**
    (logs loudly, allows through).
-5. **Device revocation check** — uses `identity_id` or `subject` as
+5. **Token-TTL backstop check** — if `max_token_ttl_seconds` is set and
+   the token is older than the limit (from `created_at`), the token row
+   is deleted and the request is rejected with `401`.
+6. **Device revocation check** — uses `identity_id` or `subject` as
    device ID. If revoked → `403` (`"device_revoked"`).
-6. **Endpoint check** — `policy.is_endpoint_allowed(&endpoint)`. Deny
+7. **Endpoint check** — `policy.is_endpoint_allowed(&endpoint)`. Deny
    `403` (`"endpoint_not_allowed"`).
-7. **Model check** (POST only) — reads body, extracts model, checks
+8. **Model check** (POST only) — reads body, extracts model, checks
    `policy.is_model_allowed`. Deny `403` (`"model_not_allowed"`).
-8. **Quota checks** (both pre-flight):
+9. **Quota checks** (both pre-flight):
    - **Token quota** — if `daily_token_quota` set and
      `usage.token_count >= quota` → `429` (`"token_quota_exceeded"`).
    - **Request quota** — an **atomic reservation** via
@@ -134,7 +146,7 @@ Enforcement order:
      decision (`request_reserved`) and **released if the upstream
      request ultimately fails**, so failed requests do not consume
      quota.
-9. On allow: inserts `PermissionDecision` into extensions.
+10. On allow: inserts `PermissionDecision` into extensions.
 
 Denial response:
 
@@ -194,6 +206,7 @@ pub struct ResolvedPolicy {
     pub daily_token_quota: Option<i64>,                 // None = unlimited
     pub daily_request_quota: Option<i64>,               // None = unlimited
     pub token_saver: TokenSaverConfig,                  // saver settings
+    pub max_token_ttl_seconds: Option<i64>,             // admin backstop
 }
 ```
 
@@ -409,14 +422,15 @@ pub struct AdminState {
     pub mcp_manager: McpManager,
     pub audit: AuditLogger,
     pub usage_tracker: UsageTracker,
+    pub token_store: crate::token_store::TokenStore,
     pub admin_group: String,
 }
 ```
 
 `admin_auth_middleware`:
 
-- Requires `x-oac-user-subject` (non-empty) → else `401`.
-- Parses `x-oac-user-groups` as JSON array → if `admin_group` not in
+- Verifies the bearer token via `TokenStore` → else `401`.
+- Parses groups from the token record → if `admin_group` not in
   groups → `403`.
 
 All mutations write to `admin_audit_log` (append-only).
@@ -440,5 +454,7 @@ All mutations write to `admin_audit_log` (append-only).
 8. `m000008_strip_ansi` — ANSI-strip toggle.
 9. `m000009_mcp` — `mcp_servers` (encrypted auth), `mcp_server_policies`,
    and MCP audit columns.
+10. `m0000010_tokens` — `tokens` table (central token store) +
+    `max_token_ttl_seconds` on `group_policies`.
 
 See [Persistence](./persistence.md) for full schemas.

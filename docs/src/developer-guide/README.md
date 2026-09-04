@@ -8,7 +8,7 @@ for the full file tree, see [Workspace Layout](./workspace-layout.md).
 
 ```
 Agent (Codex, Goose, etc.)
-  │  Authorization: Bearer <local key>
+  │  Authorization: Bearer *** token>
   ▼
 [127.0.0.1 relay]  ── mTLS (TLS 1.3) ──►  [central proxy]  ──►  [OpenAI-compatible backend]
   │                                        │
@@ -32,13 +32,13 @@ Agent (Codex, Goose, etc.)
 1. The **agent** sends an OpenAI-compatible request to `127.0.0.1:8787/v1`
    with `Authorization: Bearer <local-key>`.
 2. The **relay** validates the `Host` header (DNS rebinding defense),
-   verifies the local key (constant-time, SHA-256 hash lookup), extracts
-   the verified identity, replaces the `Authorization` header with
-   `x-oac-*` identity headers, and forwards over mTLS to the central
-   proxy.
-3. The **central proxy** validates the relay-forwarded identity headers,
-   resolves the user's group policy, checks device revocation and quotas,
-   resolves an encrypted provider key, and forwards to the backend.
+   checks for a non-empty `Authorization: Bearer ***` header (pass-through —
+   does not verify the token locally), and forwards the request unchanged
+   over mTLS to the central proxy.
+3. The **central proxy** verifies the bearer token via its TokenStore
+   (constant-time hash comparison), resolves the user's group policy,
+   checks the token-TTL backstop, device revocation and quotas, resolves
+   an encrypted provider key, and forwards to the backend.
 4. The **backend** responds (optionally with SSE streaming). The central
    proxy extracts token usage, computes cost, records an audit entry,
    increments usage counters, and streams the response back.
@@ -47,7 +47,7 @@ Agent (Codex, Goose, etc.)
 
 MCP traffic follows a parallel path: agents send MCP JSON-RPC to
 `127.0.0.1:8787/mcp/{server}` (or the combined `/mcp` hub); the relay
-byte-tunnels it to central with the same identity headers, and central
+byte-tunnels it to central with the `Authorization` header, and central
 enforces **per-tool allowlists** (see [MCP Support](../user-guide/mcp.md))
 before forwarding to the registered MCP server with its encrypted auth
 header.
@@ -68,7 +68,7 @@ For a detailed walkthrough with the header table, see
 
 - **Provider-key isolation** — provider keys are encrypted at rest and
   decrypted only in central proxy process memory; the relay never sees them.
-- **Defense in depth** — mTLS, OIDC, local key hashing, DNS rebinding
+- **Defense in depth** — mTLS, OIDC, central token verification, DNS rebinding
   defense, hop-by-hop header stripping, path sanitization, append-only
   audit logs.
 - **No `unsafe` code** — `#![forbid(unsafe_code)]` in every crate.

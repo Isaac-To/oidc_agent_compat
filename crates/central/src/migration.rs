@@ -180,6 +180,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migration0007CollapseRepeatedLines),
             Box::new(Migration0008StripAnsi),
             Box::new(Migration0009Mcp),
+            Box::new(Migration0010Tokens),
         ]
     }
 }
@@ -384,6 +385,124 @@ pub enum McpServerPolicy {
     /// Last-update timestamp.
     UpdatedAt,
 }
+
+/// Migration 0010: central token store + admin token-TTL backstop.
+///
+/// Creates the `tokens` table for central-minted opaque tokens (zero-trust
+/// architecture). Only the SHA-256 hash of the plaintext token is stored;
+/// the plaintext is returned to the relay at mint time and never persisted.
+///
+/// Adds `max_token_ttl_seconds` to `group_policies` — an admin-controlled
+/// backstop that rejects tokens older than the limit (from `created_at`) at
+/// request time, even if the token's own `expires_at` has not passed.
+/// `NULL` means no backstop. Merged least-permissive-wins (smallest cap).
+pub struct Migration0010Tokens;
+
+impl MigrationName for Migration0010Tokens {
+    fn name(&self) -> &str {
+        "m0000010_tokens"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0010Tokens {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Add the admin token-TTL backstop column to group_policies.
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "ALTER TABLE group_policies \
+                 ADD COLUMN max_token_ttl_seconds BIGINT NULL;",
+            )
+            .await?;
+
+        // Central token store: one row per minted opaque token.
+        manager
+            .create_table(
+                Table::create()
+                    .table(Token::Table)
+                    .col(ColumnDef::new(Token::Id).string().not_null().primary_key())
+                    .col(ColumnDef::new(Token::Subject).string().not_null())
+                    .col(ColumnDef::new(Token::Issuer).string().not_null())
+                    .col(ColumnDef::new(Token::Email).string().null())
+                    .col(ColumnDef::new(Token::DisplayName).string().null())
+                    .col(ColumnDef::new(Token::Groups).string().null())
+                    .col(ColumnDef::new(Token::IdentityId).string().null())
+                    .col(ColumnDef::new(Token::Label).string().not_null())
+                    // SHA-256 hash of the plaintext token (32 bytes).
+                    .col(ColumnDef::new(Token::TokenHash).blob().not_null())
+                    .col(
+                        ColumnDef::new(Token::CreatedAt)
+                            .timestamp_with_time_zone()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Token::ExpiresAt)
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(Token::LastUsedAt)
+                            .timestamp_with_time_zone()
+                            .null(),
+                    )
+                    .col(
+                        ColumnDef::new(Token::Revoked)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(Table::drop().table(Token::Table).to_owned())
+            .await?;
+        // The ALTERed max_token_ttl_seconds column cannot be dropped on
+        // SQLite (no DROP COLUMN); forward-only, no-op down (consistent
+        // with migrations 0006/0007/0008).
+        Ok(())
+    }
+}
+
+/// Iden for the `tokens` table.
+#[derive(Iden)]
+pub enum Token {
+    /// The table.
+    #[iden = "tokens"]
+    Table,
+    /// Primary key (UUID).
+    Id,
+    /// The user subject (from the IdP).
+    Subject,
+    /// The OIDC issuer.
+    Issuer,
+    /// The user email, if known.
+    Email,
+    /// The user display name, if known.
+    DisplayName,
+    /// The group/role memberships (JSON array string), if known.
+    Groups,
+    /// The relay-side identity database ID, if known.
+    IdentityId,
+    /// Human-readable label.
+    Label,
+    /// SHA-256 hash of the plaintext token (32 bytes).
+    TokenHash,
+    /// When the token was minted.
+    CreatedAt,
+    /// When the token expires (NULL = never).
+    ExpiresAt,
+    /// When the token was last used (NULL = never).
+    LastUsedAt,
+    /// Whether the token has been revoked.
+    Revoked,
+}
+
 /// endpoint, request-id, permission-decision, and cost columns.
 ///
 /// These columns support the permissions and user-activity-logging feature.
@@ -1105,6 +1224,7 @@ mod tests {
                 "m000007_collapse_repeated_lines",
                 "m000008_strip_ansi",
                 "m000009_mcp",
+                "m0000010_tokens",
             ],
             "migration order is part of the schema contract"
         );

@@ -80,7 +80,7 @@ required).
 ### Security notes
 
 - `dev_mode = false` in all prod configs. Central enforces mTLS and
-  rejects relay requests lacking valid identity headers.
+  rejects relay requests lacking a valid bearer token.
 - Provider encryption key supplied via Docker secret
   (`/run/secrets/provider-encryption-key`; the `OAC_PROVIDER_ENCRYPTION_KEY`
   env var is a fallback for non-Docker deployments), never baked into the
@@ -100,8 +100,9 @@ dev_mode = false
 
 [oidc]
 issuer = "https://idp.example.com/realms/your-realm"
-# Central does not log in/validate tokens itself — identity comes from the
-# relay over mTLS. client_id is not used at runtime; oac-relay is the RP.
+# Central verifies bearer tokens via its TokenStore. Identity comes from
+# the token record (originally extracted from the IdP-signed ID token at
+# login time). client_id is not used at runtime; oac-relay is the RP.
 client_id = "oac-central"
 client_secret_env = "OAC_OIDC_CLIENT_SECRET"
 redirect_uri = "http://127.0.0.1:0/callback"
@@ -175,7 +176,7 @@ client_key_path = "/home/you/.oac/certs/client.key"
 # Set the OIDC client secret:
 export OAC_OIDC_CLIENT_SECRET="your-secret"
 
-# Log in (opens browser, mints key, injects into agent config):
+# Log in (opens browser, requests central-minted token, injects into agent config):
 oac-relay --config ~/.oac/relay.toml login
 
 # Source the agent config (if using generic env format):
@@ -185,7 +186,7 @@ source ~/.oac/agent-env.sh
 oac-relay --config ~/.oac/relay.toml serve
 ```
 
-The agent points at `http://127.0.0.1:8787` with the minted API key. The
+The agent points at `http://127.0.0.1:8787` with the central-minted token. The
 relay forwards over mTLS to the central proxy.
 
 ## Provider-key encryption

@@ -26,4 +26,5 @@ pub mod policy;
 pub mod pricing;
 pub mod provider;
 pub mod proxy;
+pub mod token_store;
 pub mod usage;

@@ -51,22 +51,21 @@ crates/mcp/src/
 ```
 crates/relay/src/
 ├── lib.rs              # Lib exposed for integration tests
-├── main.rs             # Binary: CLI dispatch, serve(), seed_dev_key
+├── main.rs             # Binary: CLI dispatch, serve()
 ├── login.rs            # OIDC auth-code + PKCE flow, ID-token validation, agent config injection
-├── keystore.rs         # KeyStore: key minting, identity upsert, key verification
+├── keystore.rs         # KeyStore: OIDC identity upsert only (no key methods)
 ├── db.rs               # Relay DB setup
 ├── migration.rs        # SeaORM migrations (4 migrations)
 ├── activity.rs         # Relay-side activity logger (append-only)
 ├── agent_config.rs     # Agent config injection (Codex config.json / ~/.oac/agent-env.sh)
 ├── proxy/
-│   ├── mod.rs          # Router, AppState, serve()
-│   ├── auth.rs         # Local key auth middleware
+│   ├── mod.rs          # Router, AppState, serve() (includes token_store)
+│   ├── auth.rs         # Pass-through auth (checks Authorization header presence)
 │   ├── forward.rs      # Relay→central forwarding (mTLS client, SSE passthrough)
 │   ├── mcp_forward.rs  # MCP byte-tunnel (JSON-RPC → central with identity)
 │   └── host_guard.rs   # DNS rebinding defense (Host header validation)
 └── entity/
     ├── mod.rs
-    ├── api_key.rs          # api_key entity
     ├── identity.rs         # identity entity
     └── relay_activity_log.rs  # relay_activity_log entity
 
@@ -81,7 +80,7 @@ crates/central/src/
 ├── lib.rs              # Lib exposed for integration tests
 ├── main.rs             # Binary: serve and admin CLI
 ├── db.rs               # Central DB setup
-├── migration.rs        # SeaORM migrations (9 migrations)
+├── migration.rs        # SeaORM migrations (10 migrations)
 ├── crypto.rs           # encryption_key_from_hex + sha256 helpers (shared by provider/mcp)
 ├── admin.rs            # Admin API (/admin/v1/) router, handlers, auth middleware
 ├── policy.rs           # PolicyStore + resolve_policy (group→policy merge) + MCP tool policies
@@ -92,14 +91,16 @@ crates/central/src/
 ├── usage.rs            # UsageTracker (per-user daily token/request quotas)
 ├── pricing.rs          # PriceTable (model cost computation, auto-fetch from backend)
 ├── optimizer.rs        # Token saver (dedupe, empty-message pruning, budget drops, opt-in collapses)
+├── token_store.rs      # Central token store (zero-trust): mint, verify, revoke, list
 ├── proxy/
-│   ├── mod.rs          # Router, AppState, serve()
-│   ├── auth.rs         # Validates relay-forwarded identity headers
+│   ├── mod.rs          # Router, AppState, serve() (includes token_store)
+│   ├── auth.rs         # Verifies bearer token via TokenStore (zero-trust)
 │   ├── forward.rs      # Central→backend forwarding (SSE, provider-key injection)
 │   ├── permissions.rs  # Group-based model/endpoint/quota enforcement
 │   ├── mcp_forward.rs      # MCP forwarding (auth-header injection, SSE passthrough)
 │   ├── mcp_hub.rs          # Combined /mcp hub (aggregates all servers, prefixes tools)
 │   ├── mcp_permissions.rs  # Per-server/per-tool MCP enforcement
+│   ├── tokens.rs           # Token API: POST /v1/tokens, DELETE /v1/tokens/current, GET /v1/tokens
 │   └── rate_limit.rs   # Per-IP token bucket rate limiter
 └── entity/
     ├── mod.rs
@@ -112,7 +113,8 @@ crates/central/src/
     ├── provider_key.rs     # provider_key entity (AES-256-GCM ciphertext)
     ├── provider_key_access.rs # provider_key_access entity (group ACL on keys)
     ├── mcp_server.rs       # mcp_server entity (encrypted auth)
-    └── mcp_server_policy.rs# mcp_server_policy entity
+    ├── mcp_server_policy.rs# mcp_server_policy entity
+    └── token.rs              # token entity (central token store)
 
 crates/central/tests/
 ├── proxy_integration.rs    # 22 integration tests (dev + prod + mTLS modes)

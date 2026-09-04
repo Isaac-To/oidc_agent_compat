@@ -1602,4 +1602,89 @@ mod tests {
         assert!(!report.never_worse_reverted);
         assert_eq!(&out[..], &body[..]);
     }
+
+    // --- additional collapse_repeated_lines edge cases ---
+
+    #[test]
+    fn collapse_all_lines_identical_collapses_to_single_marker() {
+        let line = "a-very-long-line-for-folding";
+        let content = format!("{line}\n{line}\n{line}\n{line}");
+        let (collapsed, removed) = collapse_repeated_lines(&content);
+        assert_eq!(removed, 3);
+        assert_eq!(collapsed, format!("[×4] {line}"));
+    }
+
+    #[test]
+    fn collapse_preserves_trailing_newline_implicitly() {
+        // The pass works on lines, not trailing whitespace; a trailing
+        // newline does not create an extra empty line for matching purposes.
+        let line = "long-enough-line-for-fold";
+        let content = format!("{line}\n{line}\n");
+        let (collapsed, removed) = collapse_repeated_lines(&content);
+        assert!(removed > 0, "must collapse: {collapsed}");
+        assert!(collapsed.contains("[×2]"), "{collapsed}");
+    }
+
+    #[test]
+    fn collapse_mixed_long_and_short_runs() {
+        // Long lines fold; short lines are preserved verbatim (no-growth).
+        let long = "this-line-is-long-enough-to-fold-nicely";
+        let content = format!("a\na\n{long}\n{long}\n{long}\nb");
+        let (collapsed, removed) = collapse_repeated_lines(&content);
+        // The short "a\na" run is preserved (folding would grow it); the long
+        // run folds.
+        assert!(removed >= 2, "long run must fold: removed={removed}");
+        assert!(
+            collapsed.contains("[×3]"),
+            "long run collapsed: {collapsed}"
+        );
+        // The short run is preserved verbatim (not folded into a marker).
+        assert!(
+            collapsed.starts_with("a\na\n"),
+            "short run preserved at start: {collapsed}"
+        );
+    }
+
+    // --- additional strip_ansi edge cases ---
+
+    #[test]
+    fn strip_ansi_handles_cursor_commands() {
+        // Cursor movement codes (e.g. \x1b[2J clear, \x1b[H home) must be
+        // stripped just like colour codes.
+        assert_eq!(strip_ansi_escapes("\u{1b}[2J\u{1b}[Hcleared"), "cleared");
+    }
+
+    #[test]
+    fn strip_ansi_leaves_bare_escape_char() {
+        // A bare ESC without a following '[' is not a CSI sequence; it must
+        // be preserved (the scanner only strips ESC[ ... final_byte).
+        assert_eq!(strip_ansi_escapes("a\u{1b}b"), "a\u{1b}b");
+    }
+
+    #[test]
+    fn strip_ansi_handles_256_color_codes() {
+        // 256-colour and true-colour sequences use semicolons in the
+        // parameter bytes; the scanner must consume them up to the final
+        // byte.
+        assert_eq!(
+            strip_ansi_escapes("\u{1b}[38;5;196mred\u{1b}[0m text"),
+            "red text"
+        );
+    }
+
+    #[test]
+    fn strip_ansi_in_optimize_prompt_drops_noise_only_message() {
+        // A message that is ALL ANSI codes (including cursor clears) is
+        // reduced to empty and dropped as noise.
+        let body = json(
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"\u001b[2J\u001b[H"},{"role":"user","content":"real"}]}"#,
+        );
+        let (out, report) = optimize_prompt(&body, ansi_enabled());
+        assert!(report.applied);
+        assert_eq!(report.empty_messages_dropped, 1);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let messages = value["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "real");
+    }
 }

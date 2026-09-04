@@ -7,8 +7,9 @@
 //!
 //! - **Host header validation** (DNS rebinding defense): rejects requests
 //!   whose `Host` is not a loopback address.
-//! - **Auth middleware**: validates the local API key via constant-time
-//!   comparison.
+//! - **Auth middleware**: pass-through; checks that a bearer token is
+//!   present but does NOT verify it locally. Central is the sole token
+//!   verification authority (zero-trust).
 //! - **Hop-by-hop header stripping** (RFC 7230 §6.1) on forwarded requests.
 //! - **mTLS** to the central proxy (TLS 1.3).
 //! - **Raw byte SSE passthrough** for streaming responses.
@@ -23,16 +24,14 @@ use std::net::SocketAddr;
 use axum::Router;
 use oidc_agent_common::config::RelayConfig;
 use oidc_agent_common::error::Result;
+use sea_orm::DatabaseConnection;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::activity::ActivityLogger;
-use crate::keystore::KeyStore;
 
 /// The shared application state for the relay proxy.
 #[derive(Clone)]
 pub struct AppState {
-    /// The key store for validating local keys.
-    pub key_store: KeyStore,
     /// The relay configuration.
     pub config: RelayConfig,
     /// The HTTP client for forwarding to the central proxy.
@@ -94,13 +93,12 @@ pub fn router(state: AppState) -> Router {
 /// # Errors
 ///
 /// Returns [`Error`] if the server fails to bind or start.
-pub async fn serve(config: RelayConfig, key_store: KeyStore) -> Result<()> {
+pub async fn serve(config: RelayConfig, db: DatabaseConnection) -> Result<()> {
     let client = forward::build_client(&config)?;
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     let listen_addr = listener.local_addr()?;
-    let activity = ActivityLogger::new(key_store.db.clone());
+    let activity = ActivityLogger::new(db);
     let state = AppState {
-        key_store,
         config: config.clone(),
         client,
         listen_addr,

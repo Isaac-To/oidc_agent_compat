@@ -1,49 +1,73 @@
 //! Authentication middleware for the central proxy.
 //!
-//! The central proxy receives requests from relays over mTLS (transport-level
-//! auth). On top of that, the relay forwards the verified user identity as
-//! `X-OAC-User-Subject` / `X-OAC-User-Email` / `X-OAC-Identity-Id` headers.
-//! These headers are set by the relay ONLY from its auth-middleware-verified
-//! identity (never from the incoming request headers), so a client cannot
-//! spoof them over the mTLS channel.
+//! The central proxy authenticates each request by verifying the opaque
+//! bearer token from the `Authorization: Bearer <token>` header against the
+//! central token store (zero-trust). The token store performs a DB lookup
+//! with constant-time hash comparison and returns the verified identity
+//! from the token record. Relay-forwarded `X-OAC-*` identity headers are
+//! **ignored** for identity — the identity comes solely from the token
+//! store.
+//!
+//! The `X-OAC-Request-Id` header is still read (it is per-request
+//! correlation, not identity).
 //!
 //! # Security
 //!
-//! - Requires the `X-OAC-User-Subject` header on all non-healthz routes.
-//! - Rejects requests missing the identity header with `401 Unauthorized`.
-//! - Attaches the verified identity to the request extensions for downstream
-//!   audit logging.
-//! - In `dev_mode`, a missing identity is allowed (for the dev stack where
-//!   the relay auto-mints a dev key and forwards the dev identity).
+//! - Requires a valid `Authorization: Bearer <token>` header on all
+//!   non-healthz routes.
+//! - Rejects requests with a missing or unverifiable token with
+//!   `401 Unauthorized`.
+//! - Attaches the verified identity (from the token record) to the
+//!   request extensions for downstream audit logging and authorization.
+//! - In `dev_mode`, a missing `Authorization` header is allowed (for the
+//!   dev stack and manual curl testing); a warning is logged.
 
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use oidc_agent_common::identity;
+use oidc_agent_common::keys::extract_bearer;
 
 use super::AppState;
 
-/// The verified user identity attached to a central-proxy request after auth.
+/// The verified user identity attached to a central-proxy request after
+/// auth.
+///
+/// All identity fields (`subject`, `email`, `groups`, `identity_id`) come
+/// from the central token record — never from relay-forwarded headers.
+/// `request_id` is per-request and still read from the `X-OAC-Request-Id`
+/// header. `token_id` and `created_at` support the admin token-TTL
+/// backstop check in the permissions middleware.
 #[derive(Debug, Clone)]
 pub struct VerifiedRelayIdentity {
-    /// The user subject (from the IdP, forwarded by the relay).
+    /// The user subject (from the IdP, stored in the token record).
     pub subject: String,
     /// The user email, if provided.
     pub email: Option<String>,
-    /// The relay-side identity database ID.
+    /// The relay-side identity database ID, if known.
     pub identity_id: Option<String>,
     /// The group/role memberships (JSON array string), if provided.
     pub groups: Option<String>,
     /// The request ID for end-to-end correlation, if provided.
     pub request_id: Option<String>,
+    /// The central token row id (for backstop enforcement).
+    pub token_id: Option<String>,
+    /// When the token was minted (for the admin TTL backstop check).
+    pub created_at: Option<time::PrimitiveDateTime>,
 }
 
 /// The authentication middleware for the central proxy.
 ///
-/// Extracts the relay-forwarded identity headers and attaches them to the
-/// request extensions. Returns `401 Unauthorized` if the `X-OAC-User-Subject`
-/// header is missing (unless `dev_mode` is true).
+/// Extracts the bearer token from the `Authorization` header, verifies it
+/// via `state.token_store.verify_token`, and attaches the verified
+/// identity (from the token record) to the request extensions. Returns
+/// `401 Unauthorized` if the token is missing or unverifiable (unless
+/// `dev_mode` is true, in which case a missing header is allowed).
+///
+/// The `X-OAC-Request-Id` header is still read (per-request correlation).
+/// All other `X-OAC-*` identity headers are ignored — the identity comes
+/// from the token store, not from relay-forwarded headers.
 pub async fn auth_middleware(
     State(state): State<AppState>,
     mut request: Request<axum::body::Body>,
@@ -54,54 +78,64 @@ pub async fn auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    let headers = request.headers();
-    let subject = headers
-        .get(identity::HEADER_USER_SUBJECT)
+    // Extract the bearer token from the Authorization header.
+    let bearer = request
+        .headers()
+        .get("authorization")
         .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+        .and_then(extract_bearer);
 
-    let email = headers
-        .get(identity::HEADER_USER_EMAIL)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    let identity_id = headers
-        .get(identity::HEADER_IDENTITY_ID)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    let groups = headers
-        .get(identity::HEADER_USER_GROUPS)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
-    let request_id = headers
+    // The request ID is per-request, not per-token — still read it from
+    // the X-OAC-Request-Id header for end-to-end correlation.
+    let request_id = request
+        .headers()
         .get(identity::HEADER_REQUEST_ID)
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_string());
 
-    let subject = match subject {
-        Some(s) if !s.is_empty() => s,
-        _ => {
+    let bearer = match bearer {
+        Some(b) => b.to_string(),
+        None => {
             if state.config.dev_mode {
-                // In dev mode, allow requests without identity headers (the
-                // dev stack's relay forwards the dev identity, but be
-                // permissive for manual curl testing).
-                tracing::warn!("dev_mode: allowing central request without X-OAC-User-Subject");
+                // In dev mode, allow requests without an Authorization
+                // header (the dev stack's relay forwards a dev token, but
+                // be permissive for manual curl testing).
+                tracing::warn!(
+                    "dev_mode: allowing central request without Authorization bearer token"
+                );
                 return Ok(next.run(request).await);
             }
-            tracing::warn!("rejected central request without X-OAC-User-Subject");
+            tracing::warn!("rejected central request without Authorization bearer token");
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
 
-    // Attach the verified identity to the request extensions.
+    // Verify the bearer token against the central token store.
+    let verification = match state.token_store.verify_token(&bearer).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            tracing::warn!("rejected central request: token verification failed");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "token store verification error");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
+
+    let identity = verification.identity;
+
+    // Attach the verified identity to the request extensions. All
+    // identity fields come from the token record — X-OAC-* identity
+    // headers are intentionally ignored.
     request.extensions_mut().insert(VerifiedRelayIdentity {
-        subject,
-        email,
-        identity_id,
-        groups,
+        subject: identity.subject,
+        email: identity.email,
+        identity_id: identity.identity_id,
+        groups: identity.groups,
         request_id,
+        token_id: Some(identity.token_id),
+        created_at: Some(identity.created_at),
     });
 
     Ok(next.run(request).await)

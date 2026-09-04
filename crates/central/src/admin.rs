@@ -1,17 +1,18 @@
 //! Admin API for managing group policies, devices, and querying audit logs.
 //!
-//! The admin API is mounted at `/admin/v1/` and authenticated via the IdP
-//! through the relay — the same OIDC login flow used by regular users.
-//! Authorization is enforced by checking the caller's group memberships
-//! against the configured `admin_group` in `AdminConfig`. No static admin
-//! token is used; the admin's OIDC identity is the authentication.
+//! The admin API is mounted at `/admin/v1/` and authenticated via the central
+//! token store — the admin's bearer token is verified against the token
+//! store (zero-trust), and the group memberships from the token record are
+//! checked against the configured `admin_group` in `AdminConfig`. No static
+//! admin token is used; the admin's OIDC identity (minted at login and
+//! stored as a central token) is the authentication.
 //!
 //! # Request flow
 //!
 //! Admin requests flow through the relay (which authenticates the user via
-//! OIDC and forwards identity headers including `x-oac-user-groups`), so
-//! the central admin middleware can verify group membership without any
-//! separate credential.
+//! OIDC and forwards the bearer token), so the central admin middleware
+//! can verify the token and check group membership without any separate
+//! credential.
 //!
 //! # Endpoints
 //!
@@ -54,6 +55,8 @@ pub struct AdminState {
     pub usage_tracker: UsageTracker,
     /// The runtime MCP server registry.
     pub mcp_manager: McpManager,
+    /// The central token store (for verifying admin bearer tokens).
+    pub token_store: crate::token_store::TokenStore,
     /// The admin group name (from config). Users in this group may call
     /// the admin API.
     pub admin_group: String,
@@ -127,43 +130,59 @@ pub fn router(state: AdminState) -> Router {
 
 /// The admin auth middleware.
 ///
-/// Authenticates the caller via the relay-forwarded identity headers
-/// (`x-oac-user-subject`, `x-oac-user-groups`) — the same mechanism used by
-/// the proxy auth middleware. The caller must belong to the configured
-/// `admin_group`; otherwise the request is denied with 403.
+/// Authenticates the caller by verifying the bearer token from the
+/// `Authorization: Bearer <token>` header against the central token store
+/// (zero-trust). The caller's group memberships come from the token
+/// record (not from relay-forwarded headers). The caller must belong to
+/// the configured `admin_group`; otherwise the request is denied with
+/// 403.
 ///
 /// # Security
 ///
-/// - Identity headers are set by the relay ONLY from its auth-middleware-
-///   verified identity (never from the incoming request headers), so a
-///   client cannot spoof them over the mTLS channel.
-/// - Group membership comes from the IdP's signed ID token / TLS-protected
-///   userinfo response, extracted at login time.
+/// - Identity comes from the token record (verified by the central token
+///   store with constant-time hash comparison), not from `X-OAC-*`
+///   headers.
+/// - Group membership comes from the token record (originally extracted
+///   from the IdP's signed ID token at login time).
 /// - No static token is used; the admin's OIDC identity is the auth.
 async fn admin_auth_middleware(
     State(state): State<AdminState>,
     mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> std::result::Result<axum::response::Response, StatusCode> {
-    let headers = request.headers();
-
-    // Require the relay-forwarded user subject.
-    let subject = headers
-        .get("x-oac-user-subject")
+    // Extract the bearer token from the Authorization header.
+    let bearer = request
+        .headers()
+        .get("authorization")
         .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
+        .and_then(oidc_agent_common::keys::extract_bearer);
 
-    if subject.is_empty() {
-        tracing::warn!("admin API request without X-OAC-User-Subject");
-        return Err(StatusCode::UNAUTHORIZED);
-    }
+    let bearer = match bearer {
+        Some(b) => b.to_string(),
+        None => {
+            tracing::warn!("admin API request without Authorization bearer token");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
 
-    // Parse the user's groups (JSON array string).
-    let groups_json = headers
-        .get("x-oac-user-groups")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("[]");
+    // Verify the bearer token against the central token store.
+    let verification = match state.token_store.verify_token(&bearer).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            tracing::warn!("admin API request: token verification failed");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "admin auth: token store verification error");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
 
+    let identity = verification.identity;
+    let subject = identity.subject.clone();
+
+    // Parse the user's groups (JSON array string) from the token record.
+    let groups_json = identity.groups.as_deref().unwrap_or("[]");
     let groups: Vec<String> = serde_json::from_str(groups_json).unwrap_or_default();
 
     // Check group membership.
@@ -180,9 +199,8 @@ async fn admin_auth_middleware(
 
     // Attach the verified admin identity so handlers can attribute admin
     // audit entries to the actual caller instead of a generic label.
-    let admin_subject = subject.to_string();
     request.extensions_mut().insert(AdminIdentity {
-        subject: admin_subject,
+        subject: subject.clone(),
     });
 
     Ok(next.run(request).await)
@@ -688,6 +706,10 @@ pub struct GroupPolicyResponse {
     pub collapse_repeated_lines: bool,
     /// Whether ANSI escape sequences are stripped from message content.
     pub strip_ansi: bool,
+    /// Admin-controlled token-TTL backstop (seconds). When set, tokens older
+    /// than this (from `created_at`) are rejected at request time. `None`
+    /// means no backstop.
+    pub max_token_ttl_seconds: Option<i64>,
 }
 
 impl From<crate::entity::group_policy::Model> for GroupPolicyResponse {
@@ -708,6 +730,7 @@ impl From<crate::entity::group_policy::Model> for GroupPolicyResponse {
             max_input_tokens: m.max_input_tokens,
             collapse_repeated_lines: m.collapse_repeated_lines,
             strip_ansi: m.strip_ansi,
+            max_token_ttl_seconds: m.max_token_ttl_seconds,
         }
     }
 }
@@ -788,6 +811,11 @@ pub struct UpsertPolicyRequest {
     /// Whether ANSI escape sequences are stripped from message content.
     #[serde(default)]
     pub strip_ansi: bool,
+    /// Admin-controlled token-TTL backstop (seconds). When set, tokens older
+    /// than this (from `created_at`) are rejected at request time. `None`
+    /// means no backstop. Must be a positive integer when set.
+    #[serde(default)]
+    pub max_token_ttl_seconds: Option<i64>,
 }
 
 async fn upsert_policy(
@@ -813,6 +841,16 @@ async fn upsert_policy(
         ));
     }
 
+    // Validate: the token-TTL backstop must be a positive integer when set.
+    // A value of 0 or negative would reject all tokens immediately and is
+    // never the operator's intent.
+    if body.max_token_ttl_seconds.is_some_and(|v| v <= 0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "max_token_ttl_seconds must be a positive integer".into(),
+        ));
+    }
+
     let policy = state
         .policy_store
         .upsert_policy_full(
@@ -825,6 +863,7 @@ async fn upsert_policy(
             body.max_input_tokens,
             body.collapse_repeated_lines,
             body.strip_ansi,
+            body.max_token_ttl_seconds,
         )
         .await
         .map_err(internal_error)?;
@@ -1572,10 +1611,51 @@ mod tests {
             provider_store: ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32])),
             device_store: DeviceStore::new(db.clone()),
             audit: AuditLogger::new(db.clone()),
-            usage_tracker: UsageTracker::new(db),
+            usage_tracker: UsageTracker::new(db.clone()),
             mcp_manager: McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+            token_store: crate::token_store::TokenStore::new(db),
             admin_group: "oac-admins".into(),
         }
+    }
+
+    /// Mints an admin token (subject in the admin group) and returns the
+    /// plaintext bearer string.
+    async fn mint_admin_token(state: &AdminState) -> String {
+        let minted = state
+            .token_store
+            .mint_token(&crate::token_store::MintRequest {
+                subject: "alice".into(),
+                issuer: "https://idp.example.com".into(),
+                email: Some("alice@example.com".into()),
+                display_name: None,
+                groups: Some(r#"["oac-admins"]"#.into()),
+                identity_id: None,
+                label: "admin-test".into(),
+                expires_at: None,
+            })
+            .await
+            .expect("mint admin token");
+        minted.plaintext.to_string()
+    }
+
+    /// Mints a non-admin token (subject NOT in the admin group) and returns
+    /// the plaintext bearer string.
+    async fn mint_non_admin_token(state: &AdminState, subject: &str, groups: &str) -> String {
+        let minted = state
+            .token_store
+            .mint_token(&crate::token_store::MintRequest {
+                subject: subject.into(),
+                issuer: "https://idp.example.com".into(),
+                email: None,
+                display_name: None,
+                groups: Some(groups.into()),
+                identity_id: None,
+                label: "non-admin-test".into(),
+                expires_at: None,
+            })
+            .await
+            .expect("mint non-admin token");
+        minted.plaintext.to_string()
     }
 
     #[tokio::test]
@@ -1642,6 +1722,7 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state.clone());
 
         // Upsert a policy as alice (member of the admin group).
@@ -1649,8 +1730,7 @@ mod tests {
             .method(axum::http::Method::PUT)
             .uri("/admin/v1/group-policies/engineering")
             .header("content-type", "application/json")
-            .header("x-oac-user-subject", "alice")
-            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .header("authorization", format!("Bearer {admin_token}"))
             .body(axum::body::Body::from(
                 r#"{"allowed_models": ["gpt-4o"]}"#.to_string(),
             ))
@@ -1676,13 +1756,13 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let non_admin_token = mint_non_admin_token(&state, "mallory", r#"["engineering"]"#).await;
         let app = router(state);
 
         let request = axum::http::Request::builder()
             .method(axum::http::Method::GET)
             .uri("/admin/v1/group-policies")
-            .header("x-oac-user-subject", "mallory")
-            .header("x-oac-user-groups", r#"["engineering"]"#)
+            .header("authorization", format!("Bearer {non_admin_token}"))
             .body(axum::body::Body::empty())
             .expect("build request");
         let response = app.oneshot(request).await.expect("router run");
@@ -1789,6 +1869,8 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
+        let non_admin_token = mint_non_admin_token(&state, "mallory", r#"["engineering"]"#).await;
         state
             .policy_store
             .upsert_policy("engineering", None, None, Some(5000), Some(100))
@@ -1804,8 +1886,7 @@ mod tests {
         let request = axum::http::Request::builder()
             .method(axum::http::Method::GET)
             .uri("/admin/v1/quotas/route-target")
-            .header("x-oac-user-subject", "admin-user")
-            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .header("authorization", format!("Bearer {admin_token}"))
             .body(axum::body::Body::empty())
             .expect("build request");
         let response = app.oneshot(request).await.expect("router run");
@@ -1826,8 +1907,7 @@ mod tests {
         let request = axum::http::Request::builder()
             .method(axum::http::Method::GET)
             .uri("/admin/v1/quotas/route-target")
-            .header("x-oac-user-subject", "ordinary-user")
-            .header("x-oac-user-groups", r#"["engineering"]"#)
+            .header("authorization", format!("Bearer {non_admin_token}"))
             .body(axum::body::Body::empty())
             .expect("build request");
         let response = app.oneshot(request).await.expect("router run");
@@ -1906,6 +1986,7 @@ mod tests {
     async fn admin_can_enable_token_saver_via_api() {
         use tower::ServiceExt;
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state.clone());
 
         // Admin (alice) enables the token saver for `engineering` with a
@@ -1914,8 +1995,7 @@ mod tests {
             .method(axum::http::Method::PUT)
             .uri("/admin/v1/group-policies/engineering")
             .header("content-type", "application/json")
-            .header("x-oac-user-subject", "alice")
-            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .header("authorization", format!("Bearer {admin_token}"))
             .body(axum::body::Body::from(
                 r#"{"token_saver_enabled": true, "max_input_tokens": 8000}"#.to_string(),
             ))
@@ -1946,6 +2026,7 @@ mod tests {
     async fn admin_rejects_invalid_token_saver_budget() {
         use tower::ServiceExt;
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state.clone());
 
         // A non-positive budget must be rejected.
@@ -1953,8 +2034,7 @@ mod tests {
             .method(axum::http::Method::PUT)
             .uri("/admin/v1/group-policies/engineering")
             .header("content-type", "application/json")
-            .header("x-oac-user-subject", "alice")
-            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .header("authorization", format!("Bearer {admin_token}"))
             .body(axum::body::Body::from(
                 r#"{"token_saver_enabled": true, "max_input_tokens": -5}"#.to_string(),
             ))
@@ -1971,6 +2051,7 @@ mod tests {
     async fn admin_rejects_zero_token_saver_budget() {
         use tower::ServiceExt;
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state);
 
         // Zero would expire/trim everything immediately — reject with a
@@ -1979,8 +2060,7 @@ mod tests {
             .method(axum::http::Method::PUT)
             .uri("/admin/v1/group-policies/engineering")
             .header("content-type", "application/json")
-            .header("x-oac-user-subject", "alice")
-            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .header("authorization", format!("Bearer {admin_token}"))
             .body(axum::body::Body::from(
                 r#"{"token_saver_enabled": true, "max_input_tokens": 0}"#.to_string(),
             ))
@@ -2002,6 +2082,7 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let non_admin_token = mint_non_admin_token(&state, "mallory", r#"["engineering"]"#).await;
         let app = router(state);
 
         // A groups header that is not a JSON array must fail closed (403),
@@ -2009,8 +2090,7 @@ mod tests {
         let request = axum::http::Request::builder()
             .method(axum::http::Method::GET)
             .uri("/admin/v1/group-policies")
-            .header("x-oac-user-subject", "mallory")
-            .header("x-oac-user-groups", "not-json")
+            .header("authorization", format!("Bearer {non_admin_token}"))
             .body(axum::body::Body::empty())
             .expect("build request");
         let response = app.oneshot(request).await.expect("router run");
@@ -2031,8 +2111,6 @@ mod tests {
         let request = axum::http::Request::builder()
             .method(axum::http::Method::GET)
             .uri("/admin/v1/group-policies")
-            .header("x-oac-user-subject", "")
-            .header("x-oac-user-groups", r#"["oac-admins"]"#)
             .body(axum::body::Body::empty())
             .expect("build request");
         let response = app.oneshot(request).await.expect("router run");
@@ -2042,13 +2120,17 @@ mod tests {
     // --- Group policy CRUD via the router ---
 
     /// Builds an admin-authenticated JSON request with a body.
-    fn admin_json(method: &str, uri: &str, body: &str) -> axum::http::Request<axum::body::Body> {
+    fn admin_json(
+        method: &str,
+        uri: &str,
+        token: &str,
+        body: &str,
+    ) -> axum::http::Request<axum::body::Body> {
         axum::http::Request::builder()
             .method(method)
             .uri(uri)
             .header("content-type", "application/json")
-            .header("x-oac-user-subject", "alice")
-            .header("x-oac-user-groups", r#"["oac-admins"]"#)
+            .header("authorization", format!("Bearer {token}"))
             .body(axum::body::Body::from(body.to_string()))
             .expect("build request")
     }
@@ -2072,6 +2154,7 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state.clone());
 
         // Empty list first — an admin should see [] not an error.
@@ -2081,8 +2164,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/group-policies")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2100,10 +2182,11 @@ mod tests {
         let resp = app
             .clone()
             .oneshot(admin_json(
-                "PUT",
-                "/admin/v1/group-policies/engineering",
-                r#"{"allowed_models": ["gpt-4o"], "allowed_endpoints": ["/v1/chat/completions"], "daily_token_quota": 5000, "daily_request_quota": 100, "token_saver_enabled": true, "max_input_tokens": 8000, "collapse_repeated_lines": true}"#,
-            ))
+        "PUT",
+        "/admin/v1/group-policies/engineering",
+        &admin_token,
+        r#"{"allowed_models": ["gpt-4o"], "allowed_endpoints": ["/v1/chat/completions"], "daily_token_quota": 5000, "daily_request_quota": 100, "token_saver_enabled": true, "max_input_tokens": 8000, "collapse_repeated_lines": true}"#,
+    ))
             .await
             .expect("router run");
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
@@ -2127,8 +2210,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/group-policies/engineering")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2145,8 +2227,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/group-policies")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2176,8 +2257,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::DELETE)
                     .uri("/admin/v1/group-policies/engineering")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2192,8 +2272,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/group-policies/engineering")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2212,8 +2291,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::DELETE)
                     .uri("/admin/v1/group-policies/engineering")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2239,6 +2317,7 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         state
             .device_store
             .upsert_device("fp-admin-1", "laptop-alice", Some("alice@example.com"))
@@ -2253,8 +2332,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/devices")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2276,8 +2354,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::POST)
                     .uri("/admin/v1/devices/fp-admin-1/revoke")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2301,8 +2378,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::POST)
                     .uri("/admin/v1/devices/fp-admin-1/revoke")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2317,8 +2393,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::POST)
                     .uri("/admin/v1/devices/fp-ghost/revoke")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2338,8 +2413,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::POST)
                     .uri("/admin/v1/devices/fp-admin-1/reinstate")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2361,8 +2435,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::POST)
                     .uri("/admin/v1/devices/fp-ghost/reinstate")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2426,6 +2499,7 @@ mod tests {
                 .await
                 .expect("record");
         }
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state);
 
         let resp = app
@@ -2434,8 +2508,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/audit?subject=u-a")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2465,8 +2538,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/audit")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2633,6 +2705,7 @@ mod tests {
                 Some(8000),
                 true,
                 false,
+                None,
             )
             .await
             .expect("policy");
@@ -2648,18 +2721,19 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             )
             .await
             .expect("policy");
 
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state);
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/token-saver")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2724,14 +2798,14 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state);
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/token-saver")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2756,6 +2830,7 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         state
             .usage_tracker
             .increment("usage-a", Some(r#"["engineering"]"#), 2, 200, 0.5)
@@ -2776,8 +2851,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/usage?subject=usage-a")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2799,8 +2873,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/usage?subject=nobody")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2816,8 +2889,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/usage")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2870,14 +2942,14 @@ mod tests {
             .await
             .expect("key");
 
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state);
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri(format!("/admin/v1/providers/openai/keys/{}", key.id))
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2905,6 +2977,7 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state);
 
         // The provider-existence check runs before the key lookup, so the
@@ -2914,8 +2987,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::DELETE)
                     .uri("/admin/v1/providers/ghost/keys/whatever")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2934,16 +3006,18 @@ mod tests {
         use tower::ServiceExt;
 
         let state = setup_test_state().await;
+        let admin_token = mint_admin_token(&state).await;
         let app = router(state);
 
         // PUT on a provider that does not exist → 404 (never creates via PUT).
         let resp = app
             .clone()
             .oneshot(admin_json(
-                "PUT",
-                "/admin/v1/providers/ghost",
-                r#"{"name": "Ghost", "base_url": "https://ghost.example.com", "enabled": true, "is_default": false, "models": null}"#,
-            ))
+        "PUT",
+        "/admin/v1/providers/ghost",
+        &admin_token,
+        r#"{"name": "Ghost", "base_url": "https://ghost.example.com", "enabled": true, "is_default": false, "models": null}"#,
+    ))
             .await
             .expect("router run");
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
@@ -2955,8 +3029,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/admin/v1/providers/ghost/keys")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )
@@ -2971,8 +3044,7 @@ mod tests {
                 axum::http::Request::builder()
                     .method(axum::http::Method::POST)
                     .uri("/admin/v1/providers/ghost/default")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("build request"),
             )

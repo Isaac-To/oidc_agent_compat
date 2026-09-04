@@ -189,9 +189,9 @@ source ~/.oac/agent-env.sh
 oac-relay --config ~/.oac/relay.toml serve
 ```
 
-After `login`, the relay writes the base URL + local API key directly into
-the agent's config file (`~/.codex/config.json` or `~/.oac/agent-env.sh`).
-The employee never sees or copies a key.
+After `login`, the relay writes the base URL + central-minted token directly
+into the agent's config file (`~/.codex/config.json` or `~/.oac/agent-env.sh`).
+The employee never sees or copies a token.
 
 ## Step 7: Make a request
 

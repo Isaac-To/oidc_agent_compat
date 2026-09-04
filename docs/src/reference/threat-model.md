@@ -11,7 +11,7 @@ servers, and the agent.
 
 ```
 Agent (Codex, etc.)
-  │  Authorization: Bearer <local key>
+  │  Authorization: Bearer *** token>
   ▼
 [127.0.0.1 relay]  ── mTLS (TLS 1.3) ──►  [central proxy]  ──►  [OpenAI-compatible backend]
   │                                        │
@@ -36,8 +36,8 @@ Agent (Codex, etc.)
 |---|---|---|
 | Provider API keys | Central DB ciphertext → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop |
 | MCP server auth headers | Central DB ciphertext (`mcp_servers`) → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop, never returned by any API |
-| Local API keys (plaintext) | Agent config file (`0600`) | Medium — loopback-only, revocable |
-| Local API key hashes | Relay SQLite (`0600`) | Low — SHA-256 hashes |
+| Central-minted tokens (plaintext) | Agent config file (`0600`) | Medium — loopback-only, revocable at central |
+| Token hashes | Central DB | Low — SHA-256 hashes, constant-time compare |
 | OIDC ID tokens | In transit only (not stored in v1) | Medium — short-lived |
 | User identity (subject, email) | Relay + central DB, audit log | Medium — PII |
 | Audit log | Central DB (append-only) | Medium — tamper-evident |
@@ -48,11 +48,11 @@ Agent (Codex, etc.)
 
 | Threat | Control | Status |
 |---|---|---|
-| Attacker spoofs a local API key | 256-bit `OsRng` key, SHA-256 hash, constant-time compare (`subtle::ConstantTimeEq`) | ✅ Implemented |
+| Attacker spoofs a central token | 256-bit `OsRng` token, SHA-256 hash, constant-time compare (`subtle::ConstantTimeEq`), central DB lookup | ✅ Implemented |
 | Attacker spoofs the relay to the central proxy | mTLS with company CA (client cert required) | ✅ Implemented |
 | Attacker spoofs the IdP | OIDC discovery + JWKS signature verification + alg pin {RS256, ES256} | ✅ Implemented |
 | Attacker spoofs the central proxy to the relay | mTLS with company CA (server cert verification) | ✅ Implemented |
-| Attacker spoofs the user identity to the central proxy | `X-OAC-User-Subject` header set ONLY by relay auth middleware (never from incoming request headers) | ✅ Implemented |
+| Attacker spoofs the user identity to the central proxy | Identity extracted from the central token record (not from relay-forwarded headers); `X-OAC-*` identity headers ignored | ✅ Implemented |
 | Attacker spoofs the Host header (DNS rebinding) | Host header validation middleware (loopback only) | ✅ Implemented |
 | Attacker spoofs the OIDC redirect (mix-up) | `state` (CSRF) + `nonce` (replay) + loopback redirect only | ✅ Implemented |
 
@@ -62,7 +62,7 @@ Agent (Codex, etc.)
 |---|---|---|
 | Attacker tampers with the request in transit (relay → central) | mTLS (TLS 1.3 integrity) | ✅ Implemented |
 | Attacker tampers with the audit log | Append-only triggers (SQLite `BEFORE UPDATE/DELETE` → `RAISE(ABORT)`) | ✅ Implemented |
-| Attacker tampers with the local key store (SQLite) | `0600` file permissions, parameterized SQL (no injection) | ✅ Implemented |
+| Attacker tampers with the central token store | Parameterized SQL (no injection); relay no longer stores key hashes | ✅ Implemented |
 | Attacker tampers with the agent config file | `0600` permissions, written by relay only | ✅ Implemented |
 | Attacker tampers with the request path (SSRF/path traversal) | Path sanitization (rejects `..`, `//`, `\`, absolute URLs) | ✅ Implemented |
 
@@ -81,8 +81,8 @@ Agent (Codex, etc.)
 | Provider key leaks to laptop | Provider key never leaves central proxy process; relay never sees it | ✅ By design |
 | Provider key leaks in logs/responses | `Zeroizing` memory, never logged, never in error responses, redaction layer | ✅ Implemented |
 | Provider key leaks in relay response | E2E + dev-stack tests verify the provider key is not in relay responses | ✅ Tested |
-| Local key leaks to other local users | `0600` on SQLite + agent config | ✅ Implemented |
-| Local key leaks in logs | Never logged; `Zeroizing` wrapper | ✅ Implemented |
+| Token leaks to other local users | `0600` on agent config file (relay no longer stores hashes) | ✅ Implemented |
+| Token leaks in logs | Never logged; `Zeroizing` wrapper; secret redaction layer | ✅ Implemented |
 | PII (email, subject) leaks in logs | Structured logging, no body logging, redaction layer | ✅ Implemented |
 | Secrets in MCP tool-call arguments leak into audit log | `redact_args` replaces values for known-sensitive keys (`api_key`, `token`, `password`, `secret`, etc.) with `[REDACTED]` before serialization, then truncates to 512 chars as a second line of defense | ✅ Implemented |
 | Hop-by-hop header leakage | RFC 7230 §6.1 hop-by-hop stripping on forward + response | ✅ Implemented |
@@ -103,19 +103,19 @@ Agent (Codex, etc.)
 
 | Threat | Control | Status |
 |---|---|---|
-| Unauthenticated user accesses relay | Auth middleware (401 without valid key) | ✅ Implemented |
-| Unauthenticated request reaches backend | Central auth middleware (401 without `X-OAC-User-Subject` in prod mode) | ✅ Implemented |
+| Unauthenticated user accesses relay | Auth middleware (401 without Authorization header; central verifies token) | ✅ Implemented |
+| Unauthenticated request reaches backend | Central auth middleware (401 without valid bearer token; verifies via TokenStore) | ✅ Implemented |
 | Attacker bypasses auth via healthz | `/healthz` exempt from auth (returns only "ok", no data) | ✅ Implemented |
-| Attacker uses revoked key | Key deletion on logout; `verify_key` checks current keys only | ✅ Implemented |
+| Attacker uses revoked token | Token row deleted on logout/revoke; `verify_token` checks current tokens only | ✅ Implemented |
 | Attacker exploits `unsafe` code | `#![forbid(unsafe_code)]` across all crates | ✅ Implemented |
 | Authenticated user calls disallowed model | Permissions middleware enforces group-based model allowlists (403) | ✅ Implemented |
 | Authenticated user calls disallowed endpoint | Permissions middleware enforces group-based endpoint restrictions (403) | ✅ Implemented |
 | Authenticated user exceeds quota | Per-user daily request and token quotas enforced pre-flight against accumulated daily usage (429) | ✅ Implemented (a request may overshoot by its own completed usage) |
-| Attacker spoofs group membership | Groups extracted from IdP-signed ID token / TLS-protected userinfo; forwarded over mTLS | ✅ Implemented |
-| Admin API accessed without authorization | Admin auth middleware checks IdP group membership (via relay-forwarded `x-oac-user-groups`); 403 if not in admin group | ✅ Implemented |
+| Attacker spoofs group membership | Groups stored in central token record (originally extracted from IdP-signed ID token at login time) | ✅ Implemented |
+| Admin API accessed without authorization | Admin auth middleware verifies bearer token via TokenStore, checks group membership from token record; 403 if not in admin group | ✅ Implemented |
 | Admin API mutations go unlogged | All mutations recorded in append-only `admin_audit_log` | ✅ Implemented |
 | Revoked device continues to access | Devices auto-register on first verified request; revocation checked in `permissions_middleware` (uses `identity_id` or `subject` as device ID) | ✅ Implemented |
-| Expired local session continues to access | OIDC-login API keys expire after `session_ttl_hours` (24 hours by default); expired rows are deleted | ✅ Implemented |
+| Expired token continues to access | Central-minted tokens expire per `--ttl` flag (default: never); admin `max_token_ttl_seconds` backstop rejects old tokens at request time; expired rows deleted | ✅ Implemented |
 | MCP `tools/call` bypasses per-tool policy via JSON-RPC batch | Batches (arrays) are rejected at the proxy boundary with `BatchUnsupported`; per-server endpoint returns 403, hub returns `-32600` | ✅ Implemented |
 | MCP `tools/call` to denied tool via per-server endpoint | `mcp_permissions` middleware enforces per-tool allowlist (403 on denial, fail-closed on policy-store errors) | ✅ Implemented |
 | MCP `tools/call` to denied tool via hub endpoint | Hub splits prefixed tool name, enforces policy inline, routes only to allowed servers | ✅ Implemented |

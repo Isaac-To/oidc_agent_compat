@@ -23,40 +23,9 @@ pub struct Model {
     pub created_at: TimeDateTime,
 }
 
-/// Relations (none for v1).
+/// Relations (none for v1 — the relay no longer has an `api_keys` table
+/// entity).
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {
-    /// One identity has many API keys.
-    #[sea_orm(has_many = "super::api_key::Entity")]
-    ApiKeys,
-}
-
-impl Related<super::api_key::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::ApiKeys.def()
-    }
-}
+pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The identity → api_keys relation is what `verify_key` joins on; pin
-    /// that the relation resolves to the right table so a rename cannot
-    /// silently break key verification.
-    #[test]
-    fn api_keys_relation_targets_the_api_keys_table() {
-        let def = Relation::ApiKeys.def();
-        assert_eq!(
-            def.rel_type,
-            sea_orm::entity::RelationType::HasMany,
-            "one identity has many keys"
-        );
-        // The related entity must be the api_keys table.
-        let related = <Entity as sea_orm::EntityTrait>::find()
-            .find_also_related(crate::entity::api_key::Entity);
-        drop(related);
-    }
-}

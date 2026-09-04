@@ -45,11 +45,11 @@ the relay unless `dev_mode = true`. In production, always use
 If you see `Address already in use`, another process is bound to port
 8787. Either stop it or change `listen_addr` in the config.
 
-### Dev key not minted
+### Dev token not found
 
-The dev key `oac_test_key_alice` is only auto-minted when
-`dev_mode = true`. If you're running in production mode, you must run
-`oac-relay login` to get a key.
+The dev token is minted by `docker/dev.sh up` via `POST /v1/tokens` at
+central. If you're running in production mode, you must run `oac-relay
+login` to get a central-minted token.
 
 ## Central proxy
 
@@ -77,13 +77,13 @@ If the relay can't connect to the central proxy:
 
 ### `401 Unauthorized` from the central proxy (production)
 
-In production mode (`dev_mode = false`), the central proxy requires the
-`x-oac-user-subject` header, which is set by the relay's auth middleware.
-If you see 401:
+In production mode (`dev_mode = false`), the central proxy verifies the
+bearer token via its TokenStore. If you see 401:
 
 - Ensure the relay is running and the agent is pointing at
   `http://127.0.0.1:8787/v1`.
-- Ensure the relay has a valid local API key (run `oac-relay login`).
+- Ensure the relay has a valid central-minted token (run `oac-relay login`).
+- Ensure the token has not expired or been revoked.
 - Ensure the relay is forwarding to the correct central URL.
 
 ### `403 Forbidden` — model not allowed

@@ -8,15 +8,15 @@ are added, stripped, and transformed at each hop.
 ```
 Agent ──HTTP──► Relay ──mTLS──► Central ──HTTPS──► Backend
                   │                  │
-                  │                  ├─ Auth (identity headers)
+                  │                  ├─ Auth (token verification via TokenStore)
                   │                  ├─ Permissions (policy, device, quota)
                   │                  ├─ Provider-key injection
                   │                  ├─ Audit log
                   │                  └─ Usage tracking
                   │
                   ├─ Host guard (DNS rebinding)
-                  ├─ Auth (local key → identity)
-                  ├─ Identity header injection
+                  ├─ Auth (pass-through — checks Authorization header presence)
+                  ├─ Forwards Authorization header unchanged
                   └─ Activity log
 ```
 
@@ -43,12 +43,13 @@ User-Agent: codex/1.0
    - Mismatch → `400 Bad Request` (DNS rebinding defense).
 
 2. **Auth** (`auth_middleware`):
-   - Extracts `Authorization: Bearer oac_abc123...`.
-   - `KeyStore::verify_key()` — loads all key hashes, compares each via
-     `KeyHash::matches()` (constant-time, `subtle::ConstantTimeEq`, no
-     early return — prevents timing leaks, CWE-208).
-   - Missing/invalid → `401 Unauthorized`.
-   - On success: inserts `VerifiedIdentity` into request extensions.
+   - Extracts `Authorization: Bearer ***` header.
+   - Checks for a non-empty bearer (presence check only — the relay is a
+     dumb forwarder and does NOT verify the token). Central verifies it
+     via its TokenStore.
+   - Missing → `401 Unauthorized` (non-dev mode).
+   - On success: inserts a minimal `VerifiedIdentity` (all fields `None`)
+     into request extensions for the activity logger.
 
 3. **Forward** (`proxy_handler` → `forward_request`):
    - Generates `request_id = Uuid::new_v4()`.
@@ -58,14 +59,9 @@ User-Agent: codex/1.0
      URLs).
    - Builds upstream URL: `{config.central.url}{sanitized_path}`.
    - Builds forward headers (`build_forward_headers` — allowlist model,
-     strips hop-by-hop + `Authorization`).
-   - **Replaces** `Authorization` with identity headers (set only from
-     `VerifiedIdentity`, never from incoming request headers):
-     - `x-oac-user-subject`
-     - `x-oac-user-email`
-     - `x-oac-user-groups`
-     - `x-oac-identity-id`
-     - `x-oac-request-id`
+     strips hop-by-hop headers but **forwards the `Authorization` header
+     unchanged** — central verifies the token).
+   - Adds `x-oac-request-id` (per-request correlation UUID v4).
    - Sends over mTLS (production) or plain HTTP (dev).
 
 4. **Activity log** (best-effort, after response):
@@ -77,10 +73,7 @@ User-Agent: codex/1.0
 ```http
 POST /v1/chat/completions HTTP/1.1
 Host: central:8443
-x-oac-user-subject: alice@example.com
-x-oac-user-email: alice@example.com
-x-oac-user-groups: ["engineering"]
-x-oac-identity-id: 550e8400-e29b-41d4-a716-446655440000
+Authorization: Bearer oac_...
 x-oac-request-id: 660e8400-e29b-41d4-a716-446655440001
 Content-Type: application/json
 Accept: */*
@@ -89,17 +82,24 @@ User-Agent: codex/1.0
 {"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}
 ```
 
-> Note: `Authorization` is gone. Hop-by-hop headers are stripped. Identity
-> headers are added.
+> Note: The `Authorization` header (the agent's bearer token) is forwarded
+> unchanged. Hop-by-hop headers are stripped. The relay does not inject
+> identity headers — central extracts identity from the token record.
 
 ### Central processing
 
 1. **Auth** (`auth_middleware`):
    - Skips `/healthz`.
-   - Extracts `x-oac-*` headers.
-   - Requires `x-oac-user-subject` (non-empty) in production → else
-     `401`. (Dev mode: logs warning, allows through.)
-   - Inserts `VerifiedRelayIdentity` into extensions.
+   - Extracts the bearer token from the `Authorization` header.
+   - Verifies it via `TokenStore::verify_token()` (DB lookup,
+     constant-time hash comparison, no early return — prevents timing
+     leaks, CWE-208). Expired tokens are deleted.
+   - Missing/unverifiable → `401 Unauthorized` (unless `dev_mode`, which
+     allows through with a warning).
+   - `X-OAC-*` identity headers are **ignored** — identity comes from the
+     token record.
+   - Inserts `VerifiedRelayIdentity` (with `token_id` and `created_at` for
+     backstop enforcement) into extensions.
 
 2. **Rate limit** (`rate_limit_middleware`, production only):
    - Per-IP token bucket (60 req/min default).
@@ -109,8 +109,11 @@ User-Agent: codex/1.0
 
 3. **Permissions** (`permissions_middleware`):
    - Skip `/healthz`.
-   - Parse groups from `x-oac-user-groups` JSON array.
+   - Parse groups from the token record's `groups` field (JSON array).
    - `PolicyStore::resolve_policy(&groups)` — most-permissive-wins merge.
+   - **Token-TTL backstop check** — if `max_token_ttl_seconds` is set and
+     the token is older than the limit (from `created_at`), the token row
+     is deleted and the request is rejected with `401`.
    - **Device revocation check** — if `DeviceStore::is_revoked` → `403`
      (`"device_revoked"`).
    - **Endpoint check** — `policy.is_endpoint_allowed(&endpoint)` →
@@ -143,7 +146,7 @@ User-Agent: codex/1.0
      Records `OptimizationReport`.
    - Sanitizes path.
   - Builds upstream URL: `{provider.base_url}{sanitized_path}`.
-   - Builds forward headers (strips hop-by-hop + identity headers).
+   - Builds forward headers (strips hop-by-hop headers).
    - **Replaces** `Authorization` with the selected provider key (held in
      `Zeroizing<String>` memory).
    - Sends to backend.
@@ -201,12 +204,13 @@ MCP traffic rides a parallel path with per-tool enforcement:
 
 1. The agent POSTs JSON-RPC to `http://127.0.0.1:8787/mcp/{server}`
    (single server) or `/mcp` (combined hub).
-2. The relay authenticates the local key (same as `/v1`), best-effort
-   parses `mcp_server`/`mcp_tool`/`mcp_method` for its activity log, and
-   byte-tunnels the body to central with the `x-oac-*` identity headers.
+2. The relay checks for the `Authorization` header (same pass-through
+   as `/v1`), best-effort parses `mcp_server`/`mcp_tool`/`mcp_method` for
+   its activity log, and byte-tunnels the body (with the `Authorization`
+   header) to central.
    **Batches (JSON-RPC arrays) are rejected** — a batch could smuggle
    `tools/call` requests past per-tool enforcement.
-3. Central validates identity, then:
+3. Central verifies the bearer token via TokenStore, then:
    - **Per-server endpoint**: `mcp_permissions_middleware` classifies the
      method (`tools/call` vs other), resolves the caller's
      per-group/per-server/per-tool allowlist, and denies with `403`
@@ -232,12 +236,8 @@ error codes.
 
 | Header | Agent→Relay | Relay→Central | Central→Backend |
 |---|---|---|---|
-| `Authorization` | `Bearer oac_...` (local key) | **stripped** | `Bearer sk-...` (selected provider key) |
+| `Authorization` | `Bearer oac_...` (central token) | **forwarded unchanged** | `Bearer sk-...` (selected provider key) |
 | `Host` | `127.0.0.1:8787` | `central:8443` | `api.openai.com` |
-| `x-oac-user-subject` | — | **added** (from VerifiedIdentity) | **stripped** |
-| `x-oac-user-email` | — | **added** | **stripped** |
-| `x-oac-user-groups` | — | **added** | **stripped** |
-| `x-oac-identity-id` | — | **added** | **stripped** |
 | `x-oac-request-id` | — | **added** (UUID v4) | **stripped** |
 | `Content-Type` | forwarded | forwarded | forwarded |
 | `Accept` | forwarded | forwarded | forwarded |

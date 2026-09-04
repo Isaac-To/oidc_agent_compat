@@ -9,17 +9,17 @@ present in the central config.
 
 Admin API requests are authenticated via the **same OIDC flow as regular
 users** — there is no static admin token. The admin CLI sends requests
-through the relay, which authenticates the user via OIDC and forwards
-identity headers to the central proxy.
+through the relay, which forwards the `Authorization` header (the user's
+central-minted token) to the central proxy.
 
 Authorization is enforced by the `admin_auth_middleware`:
 
-1. Requires `x-oac-user-subject` header (non-empty) → else `401 Unauthorized`.
-2. Parses `x-oac-user-groups` as a JSON array → if the configured
+1. Verifies the bearer token via `TokenStore` → else `401 Unauthorized`.
+2. Parses the user's groups from the token record → if the configured
    `admin_group` is not in the user's groups → `403 Forbidden`.
 
 This means the user must:
-- Log in via `oac-relay login` (to get a local API key).
+- Log in via `oac-relay login` (to get a central-minted token).
 - Belong to the IdP group configured as `admin_group` (e.g. `oac-admins`).
 
 ## Endpoints
@@ -386,6 +386,74 @@ deny-by-default.
 
 ---
 
+## Token API
+
+Central exposes a token API for minting, revoking, and listing opaque
+bearer tokens. These endpoints are separate from the admin API and do not
+use the admin auth middleware.
+
+### `POST /v1/tokens`
+
+Mint a new opaque token. Called by the relay over mTLS during login.
+
+**Request body:**
+
+```json
+{
+  "subject": "user-123",
+  "issuer": "https://idp.example.com",
+  "email": "user@example.com",
+  "display_name": "User Name",
+  "groups": "[\"engineering\"]",
+  "identity_id": "uuid-from-relay",
+  "label": "default",
+  "ttl_seconds": null
+}
+```
+
+`subject`, `issuer`, and `label` are required. `ttl_seconds` is optional
+(`null` = never expires). The requested TTL is clamped to the admin
+`max_token_ttl_seconds` backstop if set. The plaintext token is returned
+once and never persisted or logged.
+
+**Response:** `201 Created`
+
+```json
+{
+  "token": "oac_...",
+  "token_id": "uuid",
+  "expires_at": "2026-09-05 12:00:00"
+}
+```
+
+### `DELETE /v1/tokens/current`
+
+Revoke the token in the `Authorization: Bearer ***` header. The token
+row is deleted from central's database.
+
+**Response:** `204 No Content` (or `404` if not found).
+
+### `GET /v1/tokens`
+
+List all tokens for the verified subject (from the `Authorization: Bearer`
+header). Returns metadata only — never the hash or plaintext.
+
+**Response:** `200` — JSON array of:
+
+```json
+[
+  {
+    "id": "uuid",
+    "label": "default",
+    "created_at": "2026-09-04 12:00:00",
+    "expires_at": null,
+    "last_used_at": "2026-09-04 14:30:00"
+  }
+]
+```
+
+---
+
 ## Response shapes
 
 ### `GroupPolicyResponse`
@@ -400,7 +468,8 @@ deny-by-default.
   "token_saver_enabled": false,
   "max_input_tokens": null,
   "collapse_repeated_lines": false,
-  "strip_ansi": false
+  "strip_ansi": false,
+  "max_token_ttl_seconds": null
 }
 ```
 
@@ -415,6 +484,7 @@ deny-by-default.
 | `max_input_tokens` | `i64` or `null` | Per-request budget; `null` = no trimming |
 | `collapse_repeated_lines` | `bool` | RTK-adapted repeated-line collapse; `false` = off |
 | `strip_ansi` | `bool` | ANSI colour/control-code stripping; `false` = off |
+| `max_token_ttl_seconds` | `i64` or `null` | Admin token-TTL backstop (seconds); `null` = no backstop |
 
 ### `UpsertPolicyRequest`
 
@@ -427,11 +497,13 @@ deny-by-default.
   "token_saver_enabled": true,
   "max_input_tokens": 8000,
   "collapse_repeated_lines": true,
-  "strip_ansi": true
+  "strip_ansi": true,
+  "max_token_ttl_seconds": 86400
 }
 ```
 
-All fields are optional (`null` = all/unlimited).
+All fields are optional (`null` = all/unlimited). `max_token_ttl_seconds`
+sets the admin backstop; `null` means no backstop.
 
 ### `DeviceResponse`
 

@@ -1,0 +1,775 @@
+//! Token API endpoints for the central proxy.
+//!
+//! These endpoints implement the zero-trust token lifecycle:
+//! - `POST /v1/tokens` — mint a token (called by the relay over mTLS during
+//!   login). The plaintext is returned to the relay and never persisted.
+//! - `DELETE /v1/tokens/current` — revoke the token in the `Authorization:
+//!   Bearer` header.
+//! - `GET /v1/tokens` — list tokens for the subject in the `Authorization:
+//!   Bearer` header (metadata only; never the hash or plaintext).
+//!
+//! # Security
+//!
+//! - The mint endpoint is authenticated at the transport layer (mTLS in
+//!   production). It does NOT use the existing auth middleware (which trusts
+//!   X-OAC-* headers); instead it resolves the group policy from the request
+//!   body to enforce the admin token-TTL backstop.
+//! - The revoke and list endpoints authenticate via the bearer token itself
+//!   (verified against the central token store with constant-time hash
+//!   comparison).
+//! - The plaintext token is never logged.
+
+use axum::Json;
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use serde::{Deserialize, Serialize};
+use time::Duration;
+
+use oidc_agent_common::keys::extract_bearer;
+use oidc_agent_common::time_util;
+
+use crate::token_store::MintRequest;
+
+use super::AppState;
+
+/// Request body for `POST /v1/tokens` (mint a token).
+#[derive(Debug, Deserialize)]
+pub struct MintTokenRequest {
+    /// The user subject (from the IdP). Required (validated in handler).
+    #[serde(default)]
+    pub subject: String,
+    /// The OIDC issuer. Required (validated in handler).
+    #[serde(default)]
+    pub issuer: String,
+    /// The user email, if known.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// The user display name, if known.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// The group/role memberships (JSON array string), if known.
+    #[serde(default)]
+    pub groups: Option<String>,
+    /// The relay-side identity database ID, if known.
+    #[serde(default)]
+    pub identity_id: Option<String>,
+    /// Human-readable label. Required (validated in handler).
+    #[serde(default)]
+    pub label: String,
+    /// Requested token lifetime in seconds. `None` = never expires. Clamped
+    /// to the admin token-TTL backstop (`max_token_ttl_seconds`) if set.
+    #[serde(default)]
+    pub ttl_seconds: Option<i64>,
+}
+
+/// Response body for `POST /v1/tokens`.
+#[derive(Debug, Serialize)]
+pub struct MintTokenResponse {
+    /// The plaintext opaque token (`oac_...`). Returned once; never persisted.
+    pub token: String,
+    /// The stored token row id (UUID).
+    pub token_id: String,
+    /// When the token expires (RFC 3339 / log format), or `null` for never.
+    pub expires_at: Option<String>,
+}
+
+/// A single token's metadata in the list response. Never includes the hash or
+/// plaintext.
+#[derive(Debug, Serialize)]
+pub struct TokenListItem {
+    /// The token row id (UUID).
+    pub id: String,
+    /// Human-readable label.
+    pub label: String,
+    /// When the token was minted (log format).
+    pub created_at: String,
+    /// When the token expires (log format), or `null` for never.
+    pub expires_at: Option<String>,
+    /// When the token was last used (log format), or `null`.
+    pub last_used_at: Option<String>,
+}
+
+/// `POST /v1/tokens` — mints a new opaque token.
+///
+/// Called by the relay over mTLS during login. Resolves the group policy for
+/// the given groups to enforce the admin token-TTL backstop, clamps the
+/// requested TTL, mints the token, and returns the plaintext. The plaintext
+/// is never logged.
+pub async fn mint_token_handler(
+    State(state): State<AppState>,
+    Json(body): Json<MintTokenRequest>,
+) -> Result<(StatusCode, Json<MintTokenResponse>), (StatusCode, String)> {
+    // Validate required fields.
+    if body.subject.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "subject is required".into()));
+    }
+    if body.issuer.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "issuer is required".into()));
+    }
+    if body.label.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "label is required".into()));
+    }
+    // Validate ttl_seconds if provided.
+    if body.ttl_seconds.is_some_and(|t| t <= 0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ttl_seconds must be a positive integer".into(),
+        ));
+    }
+
+    // Resolve the group policy to get the admin token-TTL backstop.
+    let groups: Vec<String> = body
+        .groups
+        .as_deref()
+        .and_then(|g| serde_json::from_str(g).ok())
+        .unwrap_or_default();
+    let policy = state
+        .policy_store
+        .resolve_policy(&groups)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Clamp the requested TTL to the backstop if it exists.
+    let effective_ttl: Option<i64> = match (body.ttl_seconds, policy.max_token_ttl_seconds) {
+        (None, None) => None,
+        (None, Some(cap)) => Some(cap),
+        (Some(req), None) => Some(req),
+        (Some(req), Some(cap)) => Some(req.min(cap)),
+    };
+
+    let expires_at = effective_ttl.map(|s| time_util::now_utc() + Duration::seconds(s));
+
+    let minted = state
+        .token_store
+        .mint_token(&MintRequest {
+            subject: body.subject.clone(),
+            issuer: body.issuer.clone(),
+            email: body.email.clone(),
+            display_name: body.display_name.clone(),
+            groups: body.groups.clone(),
+            identity_id: body.identity_id.clone(),
+            label: body.label.clone(),
+            expires_at,
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Return the plaintext to the relay. Never log it.
+    Ok((
+        StatusCode::CREATED,
+        Json(MintTokenResponse {
+            token: minted.plaintext.to_string(),
+            token_id: minted.token_id,
+            expires_at: minted.expires_at.map(|e| time_util::format_time(&e)),
+        }),
+    ))
+}
+
+/// `DELETE /v1/tokens/current` — revokes the token in the `Authorization:
+/// Bearer` header.
+///
+/// Returns 204 No Content on success, 401 if no bearer is present, 404 if the
+/// token is not found.
+pub async fn revoke_current_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    let bearer = extract_bearer_from_headers(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let revoked = state
+        .token_store
+        .revoke_by_token(bearer)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if revoked {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
+/// `GET /v1/tokens` — lists tokens for the subject in the `Authorization:
+/// Bearer` header.
+///
+/// Verifies the bearer, then lists all tokens for that subject. Returns
+/// metadata only (never the hash or plaintext). Returns 401 if the bearer is
+/// invalid.
+pub async fn list_tokens_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TokenListItem>>, StatusCode> {
+    let bearer = extract_bearer_from_headers(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let verification = state
+        .token_store
+        .verify_token(bearer)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    let tokens = state
+        .token_store
+        .list_for_subject(&verification.identity.subject)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let items: Vec<TokenListItem> = tokens
+        .into_iter()
+        .map(|t| TokenListItem {
+            id: t.id,
+            label: t.label,
+            created_at: time_util::format_time(&t.created_at),
+            expires_at: t.expires_at.as_ref().map(time_util::format_time),
+            last_used_at: t.last_used_at.as_ref().map(time_util::format_time),
+        })
+        .collect();
+
+    Ok(Json(items))
+}
+
+/// Extracts the bearer token from the `Authorization` header, if present.
+fn extract_bearer_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        .and_then(extract_bearer)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    use super::*;
+    use crate::proxy::AppState;
+    use crate::proxy::router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Builds a minimal dev-mode AppState for token-endpoint tests.
+    async fn test_state() -> AppState {
+        let url = oidc_agent_common::persistence::temp_sqlite_url("token-api");
+        let db = crate::db::setup(&url).await.expect("db setup");
+        let audit = crate::audit::AuditLogger::new(db.clone());
+        let mcp_db = db.clone();
+        AppState {
+            config: oidc_agent_common::config::CentralConfig {
+                listen_addr: "127.0.0.1:0".parse().expect("addr"),
+                database_url: "sqlite://test.db".into(),
+                oidc: oidc_agent_common::config::OidcConfig {
+                    issuer: "https://idp.example.com".into(),
+                    client_id: "test".into(),
+                    client_secret_env: "TEST".into(),
+                    redirect_uri: "http://127.0.0.1:0/callback".into(),
+                    scopes: vec!["openid".into()],
+                },
+                mtls: oidc_agent_common::config::MtlsServerConfig {
+                    ca_cert_path: "/ca.pem".into(),
+                    server_cert_path: "/server.pem".into(),
+                    server_key_path: "/server.key".into(),
+                },
+                admin: None,
+                pricing: None,
+                dev_mode: true,
+                rate_limit_requests: 60,
+                rate_limit_window_secs: 60,
+            },
+            provider_store: crate::provider::ProviderStore::new(
+                db.clone(),
+                zeroize::Zeroizing::new([7_u8; 32]),
+            ),
+            client: reqwest::Client::new(),
+            audit,
+            rate_limiter: None,
+            policy_store: crate::policy::PolicyStore::new(db.clone()),
+            device_store: crate::device_store::DeviceStore::new(db.clone()),
+            usage_tracker: crate::usage::UsageTracker::new(db.clone()),
+            price_table: crate::pricing::PriceTable::empty(),
+            mcp_manager: crate::mcp::McpManager::new(mcp_db, zeroize::Zeroizing::new([7_u8; 32])),
+            token_store: crate::token_store::TokenStore::new(db),
+        }
+    }
+
+    fn mint_body(subject: &str, label: &str, ttl: Option<i64>) -> String {
+        let ttl_field = match ttl {
+            Some(t) => format!(", \"ttl_seconds\": {t}"),
+            None => String::new(),
+        };
+        format!(
+            r#"{{"subject": "{subject}", "issuer": "https://idp.example.com", "groups": "[\"engineering\"]", "label": "{label}"{ttl_field}}}"#
+        )
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(resp.into_body(), 65536)
+            .await
+            .expect("body");
+        serde_json::from_slice(&body).expect("json")
+    }
+
+    #[tokio::test]
+    async fn post_tokens_mints_and_returns_plaintext_and_id() {
+        let state = test_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let token = json["token"].as_str().expect("token field");
+        assert!(token.starts_with("oac_"), "token must have oac_ prefix");
+        assert!(
+            json["token_id"].as_str().is_some(),
+            "token_id must be present"
+        );
+        assert!(
+            json["expires_at"].as_str().is_some(),
+            "expires_at must be present for a TTL token"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tokens_with_ttl_clamped_by_backstop() {
+        let state = test_state().await;
+        // Set a group policy with max_token_ttl_seconds = 100 for "engineering".
+        state
+            .policy_store
+            .upsert_policy_full(
+                "engineering",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(100),
+            )
+            .await
+            .expect("upsert policy");
+
+        let app = router(state.clone());
+        // Request a 3600s TTL; backstop is 100s → must clamp to 100s.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let token = json["token"].as_str().expect("token field");
+
+        // Verify the token was minted and check its expires_at reflects the
+        // clamped TTL (not 3600s).
+        let verify = state
+            .token_store
+            .verify_token(token)
+            .await
+            .expect("verify")
+            .expect("verified");
+        let now = time_util::now_utc();
+        let expires = verify.identity.expires_at.expect("expires_at set");
+        // The clamped TTL is 100s, so expires_at must be ~100s from now.
+        // Allow a small margin for scheduling latency between mint and now.
+        let age = expires - now;
+        assert!(
+            age <= Duration::seconds(101) && age >= Duration::seconds(98),
+            "expires_at must reflect the clamped 100s backstop, got age {age:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_tokens_current_revokes() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        // Mint a token.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let token = json["token"].as_str().expect("token").to_string();
+
+        // Revoke it via DELETE /v1/tokens/current with the bearer.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/tokens/current")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // The token must no longer verify.
+        let verify = state
+            .token_store
+            .verify_token(&token)
+            .await
+            .expect("verify");
+        assert!(verify.is_none(), "revoked token must not verify");
+    }
+
+    #[tokio::test]
+    async fn get_tokens_lists_for_verified_subject() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        // Mint two tokens for the same subject.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        let token = body_json(resp).await["token"]
+            .as_str()
+            .expect("token")
+            .to_string();
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "desktop", None)))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+
+        // GET /v1/tokens with the bearer.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/tokens")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let arr = body_json(resp).await;
+        let items = arr.as_array().expect("array");
+        assert_eq!(items.len(), 2, "both tokens for alice must be listed");
+        // Metadata only: no token hash or plaintext fields.
+        for item in items {
+            assert!(item["id"].as_str().is_some(), "id present");
+            assert!(item["label"].as_str().is_some(), "label present");
+            assert!(item.get("token_hash").is_none(), "no hash exposed");
+            assert!(item.get("token").is_none(), "no plaintext exposed");
+        }
+    }
+
+    #[tokio::test]
+    async fn post_tokens_without_required_fields_returns_400() {
+        let state = test_state().await;
+        let app = router(state);
+        // Missing subject.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"issuer": "https://idp.example.com", "label": "laptop"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Missing label.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"subject": "alice", "issuer": "https://idp.example.com"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn get_tokens_with_invalid_bearer_returns_401() {
+        let state = test_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/tokens")
+                    .header("authorization", "Bearer oac_nonexistent")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_tokens_without_bearer_returns_401() {
+        let state = test_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/tokens")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn delete_tokens_current_not_found_returns_404() {
+        let state = test_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/tokens/current")
+                    .header("authorization", "Bearer oac_nonexistent")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn post_tokens_with_non_positive_ttl_returns_400() {
+        let state = test_state().await;
+        let app = router(state);
+        // ttl_seconds = 0 is invalid.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(0))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_tokens_with_negative_ttl_returns_400() {
+        let state = test_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(-1))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_tokens_without_issuer_returns_400() {
+        let state = test_state().await;
+        let app = router(state);
+        // Missing issuer (empty string).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"subject": "alice", "issuer": "", "label": "laptop"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn post_tokens_with_no_ttl_and_no_backstop_never_expires() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", None)))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        // No TTL and no backstop → expires_at is null (never expires).
+        assert!(
+            json["expires_at"].is_null(),
+            "no TTL → never expires (null)"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tokens_backstop_applies_when_no_ttl_requested() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy_full(
+                "engineering",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(100),
+            )
+            .await
+            .expect("policy");
+        let app = router(state.clone());
+        // No ttl_seconds in the request, but the backstop is 100s → the
+        // token must expire in ~100s.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", None)))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        assert!(
+            json["expires_at"].as_str().is_some(),
+            "backstop must set expires_at even without a requested TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_tokens_current_without_bearer_returns_401() {
+        let state = test_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/tokens/current")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_tokens_with_revoked_bearer_returns_401() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        // Mint a token.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        let token = body_json(resp).await["token"]
+            .as_str()
+            .expect("token")
+            .to_string();
+        // Revoke it.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/tokens/current")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        // Now GET /v1/tokens with the revoked token → 401.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/tokens")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+}

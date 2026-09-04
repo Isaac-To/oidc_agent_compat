@@ -145,6 +145,7 @@ async fn setup_full_system() -> (
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let central_app = central_proxy::router(central_state);
     let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -168,7 +169,9 @@ async fn setup_full_system() -> (
     let relay_db = oac_relay::db::setup(&relay_url).await.expect("relay db");
     let key_store = KeyStore::new(relay_db);
 
-    // Mint a local key.
+    // Create the relay-side identity first so its database id can be
+    // carried in the central token record (the central proxy's audit log
+    // records the identity_id from the verified token, not from headers).
     let ident = key_store
         .upsert_identity(
             "https://idp.example.com",
@@ -179,11 +182,28 @@ async fn setup_full_system() -> (
         )
         .await
         .expect("identity");
-    let minted = key_store
-        .mint_key(&ident.id, "e2e-test", None)
+
+    // Mint a central token (carrying the relay identity id) and register
+    // it as a local relay key so both the relay (local auth) and the
+    // central proxy (token store) accept it.
+    let central_token_store = oac_central::token_store::TokenStore::new(audit.db().clone());
+    let minted_central = central_token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "e2e-user".into(),
+            issuer: "https://idp.example.com".into(),
+            email: Some("e2e@example.com".into()),
+            display_name: None,
+            groups: None,
+            identity_id: Some(ident.id.clone()),
+            label: "e2e-test".into(),
+            expires_at: None,
+        })
         .await
-        .expect("mint");
-    let local_key = minted.plaintext.to_string();
+        .expect("mint central token");
+    let local_key = minted_central.plaintext.to_string();
+
+    // The relay no longer registers the token as a local key — it forwards
+    // the bearer to central, which verifies it via its token store.
 
     let relay_config = oidc_agent_common::config::RelayConfig {
         listen_addr: "127.0.0.1:0".parse().expect("addr"),
@@ -202,7 +222,6 @@ async fn setup_full_system() -> (
             client_key_path: "/client.key".into(),
         },
         dev_mode: true,
-        session_ttl_hours: None,
     };
 
     let relay_client = relay_proxy::forward::build_client(&relay_config).expect("relay client");
@@ -211,7 +230,6 @@ async fn setup_full_system() -> (
         .expect("bind relay");
     let relay_addr = relay_listener.local_addr().expect("relay addr");
     let relay_state = relay_proxy::AppState {
-        key_store: key_store.clone(),
         config: relay_config.clone(),
         client: relay_client,
         listen_addr: relay_addr,
@@ -302,11 +320,15 @@ async fn e2e_post_embeddings_through_full_chain() {
 }
 
 #[tokio::test]
-async fn e2e_rejects_request_without_key() {
+async fn e2e_dev_mode_allows_request_without_key() {
+    // In dev_mode, both the relay and central allow requests without an
+    // Authorization header (for manual curl testing). The relay is a dumb
+    // forwarder; central is the sole verification authority. In production,
+    // both enforce auth.
     let (addr, client, _, _, _) = setup_full_system().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client.get(&url).send().await.expect("request");
-    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
 #[tokio::test]
@@ -520,12 +542,23 @@ async fn e2e_permissions_deny_disallowed_model() {
         .await
         .expect("upsert with groups");
 
-    // Mint a new key for this identity.
-    let minted = key_store
-        .mint_key(&ident.id, "e2e-perm-test", None)
+    // Mint a central token with groups and register it as a local key.
+    let central_token_store = oac_central::token_store::TokenStore::new(audit.db().clone());
+    let minted_central = central_token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "e2e-user-eng".into(),
+            issuer: "https://idp.example.com".into(),
+            email: Some("e2e-eng@example.com".into()),
+            display_name: None,
+            groups: Some(r#"["engineering"]"#.into()),
+            identity_id: Some(ident.id.clone()),
+            label: "e2e-perm-test".into(),
+            expires_at: None,
+        })
         .await
-        .expect("mint");
-    let key_with_groups = minted.plaintext.to_string();
+        .expect("mint central token with groups");
+    let key_with_groups = minted_central.plaintext.to_string();
+    // The relay forwards the bearer to central; no local key registration.
 
     // Create a policy allowing only "gpt-4o" for "engineering".
     let policy_store = oac_central::policy::PolicyStore::new(audit.db().clone());
@@ -601,11 +634,22 @@ async fn e2e_permissions_allow_allowed_model() {
         )
         .await
         .expect("upsert with groups");
-    let minted = key_store
-        .mint_key(&ident.id, "e2e-perm-allow", None)
+    let central_token_store = oac_central::token_store::TokenStore::new(audit.db().clone());
+    let minted_central = central_token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "e2e-user-allow".into(),
+            issuer: "https://idp.example.com".into(),
+            email: Some("e2e-allow@example.com".into()),
+            display_name: None,
+            groups: Some(r#"["engineering"]"#.into()),
+            identity_id: Some(ident.id.clone()),
+            label: "e2e-perm-allow".into(),
+            expires_at: None,
+        })
         .await
-        .expect("mint");
-    let key_with_groups = minted.plaintext.to_string();
+        .expect("mint central token with groups");
+    let key_with_groups = minted_central.plaintext.to_string();
+    // The relay forwards the bearer to central; no local key registration.
 
     let policy_store = oac_central::policy::PolicyStore::new(audit.db().clone());
     policy_store
@@ -645,11 +689,22 @@ async fn e2e_permissions_deny_disallowed_endpoint() {
         )
         .await
         .expect("upsert with groups");
-    let minted = key_store
-        .mint_key(&ident.id, "e2e-perm-endpoint", None)
+    let central_token_store = oac_central::token_store::TokenStore::new(audit.db().clone());
+    let minted_central = central_token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "e2e-user-restricted".into(),
+            issuer: "https://idp.example.com".into(),
+            email: Some("e2e-restricted@example.com".into()),
+            display_name: None,
+            groups: Some(r#"["restricted"]"#.into()),
+            identity_id: Some(ident.id.clone()),
+            label: "e2e-perm-endpoint".into(),
+            expires_at: None,
+        })
         .await
-        .expect("mint");
-    let key_with_groups = minted.plaintext.to_string();
+        .expect("mint central token with groups");
+    let key_with_groups = minted_central.plaintext.to_string();
+    // The relay forwards the bearer to central; no local key registration.
 
     let policy_store = oac_central::policy::PolicyStore::new(audit.db().clone());
     policy_store
@@ -717,11 +772,22 @@ async fn e2e_device_revocation_blocks_request() {
         )
         .await
         .expect("upsert");
-    let minted = key_store
-        .mint_key(&ident.id, "e2e-device-test", None)
+    let central_token_store = oac_central::token_store::TokenStore::new(audit.db().clone());
+    let minted_central = central_token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "e2e-user-device".into(),
+            issuer: "https://idp.example.com".into(),
+            email: Some("e2e-device@example.com".into()),
+            display_name: None,
+            groups: None,
+            identity_id: Some(ident.id.clone()),
+            label: "e2e-device-test".into(),
+            expires_at: None,
+        })
         .await
-        .expect("mint");
-    let key = minted.plaintext.to_string();
+        .expect("mint central token");
+    let key = minted_central.plaintext.to_string();
+    // The relay forwards the bearer to central; no local key registration.
 
     // Register the device using the identity_id as the device identifier.
     let device_store = oac_central::device_store::DeviceStore::new(audit.db().clone());

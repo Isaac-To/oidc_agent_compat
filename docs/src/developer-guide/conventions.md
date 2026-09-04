@@ -109,20 +109,21 @@ On Unix, security-sensitive files must have `0600` permissions:
 
 ## Identity headers
 
-The relay sets `x-oac-*` identity headers **only** from the
-auth-middleware-verified `VerifiedIdentity`, never from incoming request
-headers. This prevents identity spoofing. The central proxy trusts these
-headers after mTLS authentication.
+The relay sets only the `x-oac-request-id` header (per-request
+correlation). It forwards the agent's `Authorization` header unchanged —
+it does not inject identity headers. Central extracts identity from the
+token record (zero-trust). The other `X-OAC-*` header constants still
+exist for backward compatibility but are not set by the relay.
 
 Header constants are in `oidc_agent_common::identity`:
 
 | Header | Constant |
 |---|---|
-| `x-oac-user-subject` | `HEADER_USER_SUBJECT` |
-| `x-oac-user-email` | `HEADER_USER_EMAIL` |
-| `x-oac-user-groups` | `HEADER_USER_GROUPS` |
-| `x-oac-identity-id` | `HEADER_IDENTITY_ID` |
-| `x-oac-request-id` | `HEADER_REQUEST_ID` |
+| `x-oac-request-id` | `HEADER_REQUEST_ID` (actively used — per-request correlation) |
+| `x-oac-user-subject` | `HEADER_USER_SUBJECT` (unused — central extracts identity from token) |
+| `x-oac-user-email` | `HEADER_USER_EMAIL` (unused) |
+| `x-oac-user-groups` | `HEADER_USER_GROUPS` (unused) |
+| `x-oac-identity-id` | `HEADER_IDENTITY_ID` (unused) |
 
 ## Append-only logs
 

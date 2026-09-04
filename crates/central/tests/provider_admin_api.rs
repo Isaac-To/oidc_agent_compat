@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 
 const TEST_KEY_PLAINTEXT: &str = "sk-admin-test-secret-12345";
 
-async fn setup_router() -> (axum::Router, ProviderStore) {
+async fn setup_router() -> (axum::Router, ProviderStore, String, String) {
     let url = oidc_agent_common::persistence::temp_sqlite_url("admin-providers");
     let db = oac_central::db::setup(&url).await.expect("db setup");
     let audit = AuditLogger::new(db.clone());
@@ -32,24 +32,65 @@ async fn setup_router() -> (axum::Router, ProviderStore) {
         provider_store: provider_store.clone(),
         device_store: DeviceStore::new(db.clone()),
         audit,
-        usage_tracker: UsageTracker::new(db),
+        usage_tracker: UsageTracker::new(db.clone()),
         mcp_manager: oac_central::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+        token_store: oac_central::token_store::TokenStore::new(db),
         admin_group: "oac-admins".into(),
     };
-    (admin::router(state), provider_store)
+    let admin_token = mint_admin_token(&state).await;
+    let non_admin_token = state
+        .token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "regular-user".into(),
+            issuer: "https://idp.example.com".into(),
+            email: None,
+            display_name: None,
+            groups: Some(r#"["engineering"]"#.into()),
+            identity_id: None,
+            label: "non-admin".into(),
+            expires_at: None,
+        })
+        .await
+        .expect("mint non-admin token");
+    let non_admin_token = non_admin_token.plaintext.to_string();
+    (
+        admin::router(state),
+        provider_store,
+        admin_token,
+        non_admin_token,
+    )
+}
+
+/// Mints an admin token via the token store and returns the plaintext.
+async fn mint_admin_token(state: &AdminState) -> String {
+    let minted = state
+        .token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "admin-user".into(),
+            issuer: "https://idp.example.com".into(),
+            email: None,
+            display_name: None,
+            groups: Some(r#"["oac-admins"]"#.into()),
+            identity_id: None,
+            label: "test".into(),
+            expires_at: None,
+        })
+        .await
+        .expect("mint admin token");
+    minted.plaintext.to_string()
 }
 
 /// Builds an admin-authenticated JSON request with an axum body.
 fn admin_request(
     method: &str,
     uri: &str,
+    token: &str,
     body: Option<serde_json::Value>,
 ) -> Request<axum::body::Body> {
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header("x-oac-user-subject", "admin-user")
-        .header("x-oac-user-groups", r#"["oac-admins"]"#);
+        .header("authorization", format!("Bearer {token}"));
     if let Some(body) = body {
         builder = builder.header("content-type", "application/json");
         builder
@@ -82,7 +123,7 @@ fn provider_body() -> serde_json::Value {
 
 #[tokio::test]
 async fn admin_requires_identity_headers() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, _token, _non_admin_token) = setup_router().await;
     let resp = router
         .oneshot(
             Request::get("/admin/v1/providers")
@@ -96,12 +137,11 @@ async fn admin_requires_identity_headers() {
 
 #[tokio::test]
 async fn admin_rejects_non_admin_group() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, _token, non_admin_token) = setup_router().await;
     let resp = router
         .oneshot(
             Request::get("/admin/v1/providers")
-                .header("x-oac-user-subject", "regular-user")
-                .header("x-oac-user-groups", r#"["engineering"]"#)
+                .header("authorization", format!("Bearer {non_admin_token}"))
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
@@ -112,9 +152,9 @@ async fn admin_rejects_non_admin_group() {
 
 #[tokio::test]
 async fn admin_accepts_admin_group_member() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, token, _non_admin_token) = setup_router().await;
     let resp = router
-        .oneshot(admin_request("GET", "/admin/v1/providers", None))
+        .oneshot(admin_request("GET", "/admin/v1/providers", &token, None))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -124,7 +164,7 @@ async fn admin_accepts_admin_group_member() {
 
 #[tokio::test]
 async fn provider_crud_round_trip() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, token, _non_admin_token) = setup_router().await;
 
     // Create.
     let resp = router
@@ -132,6 +172,7 @@ async fn provider_crud_round_trip() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers",
+            &token,
             Some(provider_body()),
         ))
         .await
@@ -145,7 +186,12 @@ async fn provider_crud_round_trip() {
     // Get.
     let resp = router
         .clone()
-        .oneshot(admin_request("GET", "/admin/v1/providers/openai", None))
+        .oneshot(admin_request(
+            "GET",
+            "/admin/v1/providers/openai",
+            &token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -156,7 +202,7 @@ async fn provider_crud_round_trip() {
     // List.
     let resp = router
         .clone()
-        .oneshot(admin_request("GET", "/admin/v1/providers", None))
+        .oneshot(admin_request("GET", "/admin/v1/providers", &token, None))
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_str(&body_string(resp).await).expect("json");
@@ -172,6 +218,7 @@ async fn provider_crud_round_trip() {
         .oneshot(admin_request(
             "PUT",
             "/admin/v1/providers/openai",
+            &token,
             Some(updated),
         ))
         .await
@@ -184,14 +231,24 @@ async fn provider_crud_round_trip() {
     // Delete.
     let resp = router
         .clone()
-        .oneshot(admin_request("DELETE", "/admin/v1/providers/openai", None))
+        .oneshot(admin_request(
+            "DELETE",
+            "/admin/v1/providers/openai",
+            &token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // Gone.
     let resp = router
-        .oneshot(admin_request("GET", "/admin/v1/providers/openai", None))
+        .oneshot(admin_request(
+            "GET",
+            "/admin/v1/providers/openai",
+            &token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -199,13 +256,18 @@ async fn provider_crud_round_trip() {
 
 #[tokio::test]
 async fn provider_crud_rejects_invalid_payloads() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, token, _non_admin_token) = setup_router().await;
 
     let mut bad_url = provider_body();
     bad_url["base_url"] = serde_json::json!("ftp://nope");
     let resp = router
         .clone()
-        .oneshot(admin_request("POST", "/admin/v1/providers", Some(bad_url)))
+        .oneshot(admin_request(
+            "POST",
+            "/admin/v1/providers",
+            &token,
+            Some(bad_url),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -214,7 +276,12 @@ async fn provider_crud_rejects_invalid_payloads() {
     missing["id"] = serde_json::json!("");
     let resp = router
         .clone()
-        .oneshot(admin_request("POST", "/admin/v1/providers", Some(missing)))
+        .oneshot(admin_request(
+            "POST",
+            "/admin/v1/providers",
+            &token,
+            Some(missing),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -222,16 +289,26 @@ async fn provider_crud_rejects_invalid_payloads() {
 
 #[tokio::test]
 async fn get_and_delete_missing_provider_return_404() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, token, _non_admin_token) = setup_router().await;
     let resp = router
         .clone()
-        .oneshot(admin_request("GET", "/admin/v1/providers/ghost", None))
+        .oneshot(admin_request(
+            "GET",
+            "/admin/v1/providers/ghost",
+            &token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let resp = router
-        .oneshot(admin_request("DELETE", "/admin/v1/providers/ghost", None))
+        .oneshot(admin_request(
+            "DELETE",
+            "/admin/v1/providers/ghost",
+            &token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -239,12 +316,13 @@ async fn get_and_delete_missing_provider_return_404() {
 
 #[tokio::test]
 async fn set_default_marks_exactly_one_provider() {
-    let (router, store) = setup_router().await;
+    let (router, store, token, _non_admin_token) = setup_router().await;
     router
         .clone()
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers",
+            &token,
             Some(provider_body()),
         ))
         .await
@@ -256,7 +334,12 @@ async fn set_default_marks_exactly_one_provider() {
     second["is_default"] = serde_json::json!(false);
     router
         .clone()
-        .oneshot(admin_request("POST", "/admin/v1/providers", Some(second)))
+        .oneshot(admin_request(
+            "POST",
+            "/admin/v1/providers",
+            &token,
+            Some(second),
+        ))
         .await
         .unwrap();
 
@@ -264,6 +347,7 @@ async fn set_default_marks_exactly_one_provider() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers/anthropic/default",
+            &token,
             None,
         ))
         .await
@@ -288,12 +372,13 @@ async fn set_default_marks_exactly_one_provider() {
 
 #[tokio::test]
 async fn key_endpoints_return_metadata_only() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, token, _non_admin_token) = setup_router().await;
     router
         .clone()
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers",
+            &token,
             Some(provider_body()),
         ))
         .await
@@ -305,6 +390,7 @@ async fn key_endpoints_return_metadata_only() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers/openai/keys",
+            &token,
             Some(serde_json::json!({
                 "key": TEST_KEY_PLAINTEXT,
                 "label": "production",
@@ -331,6 +417,7 @@ async fn key_endpoints_return_metadata_only() {
         .oneshot(admin_request(
             "GET",
             "/admin/v1/providers/openai/keys",
+            &token,
             None,
         ))
         .await
@@ -352,6 +439,7 @@ async fn key_endpoints_return_metadata_only() {
         .oneshot(admin_request(
             "PUT",
             &format!("/admin/v1/providers/openai/keys/{key_id}"),
+            &token,
             Some(serde_json::json!({
                 "label": "production-v2",
                 "priority": 5,
@@ -374,6 +462,7 @@ async fn key_endpoints_return_metadata_only() {
         .oneshot(admin_request(
             "DELETE",
             &format!("/admin/v1/providers/openai/keys/{key_id}"),
+            &token,
             None,
         ))
         .await
@@ -385,6 +474,7 @@ async fn key_endpoints_return_metadata_only() {
         .oneshot(admin_request(
             "GET",
             "/admin/v1/providers/openai/keys",
+            &token,
             None,
         ))
         .await
@@ -395,13 +485,14 @@ async fn key_endpoints_return_metadata_only() {
 
 #[tokio::test]
 async fn key_endpoints_return_404_for_missing_provider_or_key() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, token, _non_admin_token) = setup_router().await;
 
     let resp = router
         .clone()
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers/ghost/keys",
+            &token,
             Some(serde_json::json!({
                 "key": TEST_KEY_PLAINTEXT,
                 "label": "x",
@@ -416,6 +507,7 @@ async fn key_endpoints_return_404_for_missing_provider_or_key() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers",
+            &token,
             Some(provider_body()),
         ))
         .await
@@ -426,6 +518,7 @@ async fn key_endpoints_return_404_for_missing_provider_or_key() {
         .oneshot(admin_request(
             "GET",
             "/admin/v1/providers/openai/keys/missing",
+            &token,
             None,
         ))
         .await
@@ -437,6 +530,7 @@ async fn key_endpoints_return_404_for_missing_provider_or_key() {
         .oneshot(admin_request(
             "PUT",
             "/admin/v1/providers/openai/keys/missing",
+            &token,
             Some(serde_json::json!({
                 "label": "x",
                 "priority": 0,
@@ -451,6 +545,7 @@ async fn key_endpoints_return_404_for_missing_provider_or_key() {
         .oneshot(admin_request(
             "DELETE",
             "/admin/v1/providers/openai/keys/missing",
+            &token,
             None,
         ))
         .await
@@ -460,12 +555,13 @@ async fn key_endpoints_return_404_for_missing_provider_or_key() {
 
 #[tokio::test]
 async fn key_add_rejects_invalid_bodies() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, token, _non_admin_token) = setup_router().await;
     router
         .clone()
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers",
+            &token,
             Some(provider_body()),
         ))
         .await
@@ -476,6 +572,7 @@ async fn key_add_rejects_invalid_bodies() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers/openai/keys",
+            &token,
             Some(serde_json::json!({ "key": "", "label": "x" })),
         ))
         .await
@@ -487,6 +584,7 @@ async fn key_add_rejects_invalid_bodies() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers/openai/keys",
+            &token,
             Some(serde_json::json!({
                 "key": TEST_KEY_PLAINTEXT,
                 "label": "x",
@@ -500,12 +598,13 @@ async fn key_add_rejects_invalid_bodies() {
 
 #[tokio::test]
 async fn deleting_provider_removes_its_keys() {
-    let (router, store) = setup_router().await;
+    let (router, store, token, _non_admin_token) = setup_router().await;
     router
         .clone()
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers",
+            &token,
             Some(provider_body()),
         ))
         .await
@@ -515,6 +614,7 @@ async fn deleting_provider_removes_its_keys() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers/openai/keys",
+            &token,
             Some(serde_json::json!({
                 "key": TEST_KEY_PLAINTEXT,
                 "label": "production",
@@ -524,7 +624,12 @@ async fn deleting_provider_removes_its_keys() {
         .unwrap();
 
     router
-        .oneshot(admin_request("DELETE", "/admin/v1/providers/openai", None))
+        .oneshot(admin_request(
+            "DELETE",
+            "/admin/v1/providers/openai",
+            &token,
+            None,
+        ))
         .await
         .unwrap();
 
@@ -539,11 +644,12 @@ async fn deleting_provider_removes_its_keys() {
 
 #[tokio::test]
 async fn admin_mutations_are_recorded_in_the_admin_audit_log() {
-    let (router, store) = setup_router().await;
+    let (router, store, token, _non_admin_token) = setup_router().await;
     router
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers",
+            &token,
             Some(provider_body()),
         ))
         .await
@@ -568,12 +674,13 @@ async fn admin_mutations_are_recorded_in_the_admin_audit_log() {
 
 #[tokio::test]
 async fn blank_group_entries_are_rejected_with_a_clear_error() {
-    let (router, _store) = setup_router().await;
+    let (router, _store, token, _non_admin_token) = setup_router().await;
     router
         .clone()
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers",
+            &token,
             Some(provider_body()),
         ))
         .await
@@ -592,6 +699,7 @@ async fn blank_group_entries_are_rejected_with_a_clear_error() {
             .oneshot(admin_request(
                 "POST",
                 "/admin/v1/providers/openai/keys",
+                &token,
                 Some(serde_json::json!({
                     "key": TEST_KEY_PLAINTEXT,
                     "label": "primary",
@@ -617,6 +725,7 @@ async fn blank_group_entries_are_rejected_with_a_clear_error() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/providers/openai/keys",
+            &token,
             Some(serde_json::json!({
                 "key": TEST_KEY_PLAINTEXT,
                 "label": "primary",

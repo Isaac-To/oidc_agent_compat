@@ -22,8 +22,7 @@ All configs are parsed and validated by
 | `database_url` | `String` | yes | — | SQLite URL, e.g. `sqlite://~/.oac/relay.db` (`~` is expanded in `sqlite://` URLs) |
 | `oidc` | table | yes | — | See [OIDC](#oidc) below |
 | `central` | table | yes | — | See [Central connection](#central-connection) below |
-| `dev_mode` | `bool` | no | `false` | When `true`: allows non-loopback bind, HTTP central URL, auto-mints dev key |
-| `session_ttl_hours` | `u64` | no | `24` | Lifetime of OIDC-login API keys in hours; after expiry, run `oac-relay login` again. Valid range `1..=876000`; expiry cannot be disabled |
+| `dev_mode` | `bool` | no | `false` | When `true`: allows non-loopback bind, HTTP central URL, skips auth checks |
 
 ### OIDC
 
@@ -57,7 +56,6 @@ All configs are parsed and validated by
 listen_addr = "127.0.0.1:8787"
 database_url = "sqlite://~/.oac/relay.db"
 dev_mode = false
-session_ttl_hours = 24
 
 [oidc]
 issuer = "https://idp.example.com"

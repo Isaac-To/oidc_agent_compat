@@ -9,13 +9,14 @@ documents the internal architecture. For full type signatures, run
 Entry point: `oac-relay [OPTIONS] [COMMAND]`. Built with `clap` derive.
 
 - If no subcommand is given, `serve` is assumed.
-- `serve` calls `db::setup()`, creates a `KeyStore`, and if `dev_mode`
-  is true, calls `seed_dev_key()` (idempotently mints
-  `oac_test_key_alice`).
+- `serve` calls `db::setup()` and starts the proxy. The relay is a dumb
+  forwarder — it does not seed a dev key. `dev_mode` skips auth checks
+  (central rejects unauthenticated requests via its token store).
 - `login` calls `login::run_login()`.
-- `logout`, `print-key`, `list-keys`, `revoke-key` are straightforward
-  DB/key operations (`print-key` reads the agent config file and needs no
-  config file loaded).
+- `logout` calls `DELETE {central}/v1/tokens/current` (revokes at central).
+  `list-keys` calls `GET {central}/v1/tokens` (lists tokens at central).
+  `print-key` reads the agent config file and needs no config file loaded.
+  The `revoke-key` command is removed (central manages tokens).
 - `activity { --limit }` prints recent `relay_activity_log` entries
   (newest first; default 20, capped at 1000).
 
@@ -59,8 +60,8 @@ See [OIDC Security](./oidc-security.md) for the RFC citations.
 ### `complete_login()`
 
 1. `key_store.upsert_identity(issuer, subject, email, display_name, groups)`.
-2. `key_store.mint_key(&identity.id, "default")`.
-3. Builds `AgentConfig { base_url, api_key }`.
+2. `POST {central}/v1/tokens` — mints a central token.
+3. Builds `AgentConfig { base_url, api_key }` with the minted token.
 4. `agent_config::inject(&agent_config)` — writes with `0600` perms.
 
 ### `wait_for_callback()`
@@ -79,7 +80,7 @@ Middleware order (outer → inner):
 
 1. `RequestBodyLimitLayer(10 MB)` — `MAX_BODY_SIZE`.
 2. `host_guard_middleware` — DNS rebinding defense.
-3. `auth_middleware` — local key verification.
+3. `auth_middleware` — pass-through (checks Authorization header presence).
 4. Handler (`forward::proxy_handler`).
 
 Routes:
@@ -163,10 +164,8 @@ pub struct VerifiedIdentity {
 - Sanitizes path via `http_util::sanitize_path`.
 - Builds upstream URL: `{config.central.url}{sanitized_path}`.
 - Builds forward headers via `http_util::build_forward_headers`.
-- **Replaces** `Authorization` with identity headers (set only from
-  `VerifiedIdentity`, never from incoming request headers):
-  - `x-oac-user-subject`, `x-oac-user-email`, `x-oac-user-groups`,
-    `x-oac-identity-id`, `x-oac-request-id`.
+- Forwards the `Authorization` header unchanged (central verifies the
+  token). Adds `x-oac-request-id` (per-request correlation UUID).
 - Sends request; on response:
   - Strips hop-by-hop + `content-length` headers.
   - If SSE: streams via `bytes_stream()` → `Body::from_stream`.
@@ -178,8 +177,8 @@ MCP requests arrive on `/mcp` (the combined hub) and `/mcp/{server}` (a
 single server), shown to the agent as `http://127.0.0.1:<relay>/mcp...`. The
 relay treats MCP as a raw byte tunnel: it reads the JSON-RPC body once,
 best-effort parses the MCP server/tool/method for the activity log, then
-forwards the bytes to central with the identity headers, exactly like the
-OpenAI path. **The relay never inspects JSON-RPC for policy** — per-tool
+forwards the bytes to central with the `Authorization` header, exactly like
+the OpenAI path. **The relay never inspects JSON-RPC for policy** — per-tool
 enforcement happens on the central proxy. SSE responses pass through
 unchanged.
 
@@ -189,24 +188,20 @@ unchanged.
 pub struct KeyStore { pub db: DatabaseConnection }
 ```
 
+Despite the historical name, this type no longer manages API keys. It
+persists OIDC identities and exposes the underlying `DatabaseConnection`.
+
 Methods:
 
 - `new(db)` — creates a store.
 - `upsert_identity(issuer, subject, email, display_name, groups)` —
   finds by (issuer, subject); inserts with UUID id if absent.
-- `mint_key(identity_id, label)` — `LocalKey::generate()` (256-bit
-  OsRng); stores only SHA-256 hash.
-- `mint_dev_key(identity_id, label, plaintext)` — caller-supplied
-  plaintext (dev only).
-- `verify_key(bearer_token)` — loads all keys, compares each via
-  `KeyHash::matches` (constant-time, **no early return** — prevents
-  timing leaks, CWE-208). Updates `last_used_at` on match. Enforces
-  session expiry: a key past its `expires_at` returns
-  `KeyVerification::Expired` **and is deleted** (the caller surfaces a
-  `session_expired` error; the user must re-run `login`). The dev-mode
-  seeded key is exempt.
-- `revoke_all_keys(identity_id)` — `delete_many`.
-- `revoke_key(key_id)` — `delete_by_id`.
+
+Key minting, verification, and revocation are handled by central's
+`TokenStore` (`crates/central/src/token_store.rs`). The relay's `login`
+flow calls `POST {central}/v1/tokens` to mint a token; `logout` calls
+`DELETE {central}/v1/tokens/current`; `list-keys` calls
+`GET {central}/v1/tokens`.
 
 ## Activity logger (`activity.rs`)
 
@@ -274,11 +269,12 @@ file to `0600`.
 
 Four migrations:
 
-- `m000001_initial_schema` — creates `identities` and `api_keys` tables
-  (FK `ON DELETE CASCADE`).
+- `m000001_initial_schema` — creates the `identities` table. (The
+  `api_keys` table has been removed — central manages tokens.)
 - `m000002_relay_activity_log` — creates `relay_activity_log` + two
   append-only triggers.
-- `m000003_api_key_expiry` — adds nullable `expires_at` to `api_keys`.
+- `m000003_api_key_expiry` — historical migration (added `expires_at` to
+  `api_keys`; the table is now removed).
 - `m000004_mcp_activity` — adds nullable `mcp_server`, `mcp_tool`,
   `mcp_method` columns to `relay_activity_log`.
 
@@ -286,8 +282,6 @@ Four migrations:
 
 - `identity::Model` — `id`, `issuer`, `subject`, `email`, `display_name`,
   `groups`, `created_at`.
-- `api_key::Model` — `id`, `identity_id`, `key_hash` (Binary(32)), `label`,
-  `created_at`, `last_used_at`, `expires_at`.
 - `relay_activity_log::Model` — `id`, `identity_id`, `key_id`, `method`,
   `endpoint`, `model`, `central_status`, `latency_ms`, `request_id`,
   `mcp_server`, `mcp_tool`, `mcp_method`, `created_at`.

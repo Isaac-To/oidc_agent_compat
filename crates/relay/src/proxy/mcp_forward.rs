@@ -1,16 +1,15 @@
 //! MCP forward handler for the relay proxy.
 //!
 //! Receives authenticated MCP Streamable-HTTP requests from the agent and
-//! forwards them to the central proxy over mTLS, injecting the verified user
-//! identity as `X-OAC-*` headers (the same security boundary as the OpenAI
-//! path). MCP JSON-RPC bodies are forwarded verbatim; the local API key is
-//! never forwarded.
+//! forwards them to the central proxy over mTLS, forwarding the incoming
+//! `Authorization` header unchanged. MCP JSON-RPC bodies are forwarded
+//! verbatim; the relay does not verify the token (central does, zero-trust).
 //!
 //! # Security
 //!
 //! - Hop-by-hop header stripping (RFC 7230 §6.1).
 //! - Path sanitization (SSRF defense) via `http_util::sanitize_path`.
-//! - Identity injection from the auth-middleware-verified identity only.
+//! - The `Authorization` header is forwarded unchanged; central verifies it.
 //! - Raw-byte SSE passthrough for streaming MCP responses.
 //! - Relay-side activity logging with MCP server/tool/method correlation.
 
@@ -28,7 +27,7 @@ use super::AppState;
 /// The relay MCP forward handler for `POST /mcp/{server}`.
 ///
 /// The `{server}` is a url-encoded MCP server id. Central resolves it from
-/// its registry; the relay merely tunnels the request with identity headers.
+/// its registry; the relay merely tunnels the request with the bearer token.
 pub async fn mcp_handler(
     State(state): State<AppState>,
     axum::extract::Path(server): axum::extract::Path<String>,
@@ -50,7 +49,7 @@ pub async fn mcp_hub_handler(
 }
 
 /// Shared relay MCP tunnel: reads the body, records activity metadata, and
-/// forwards to central with the verified identity headers.
+/// forwards to central with the bearer token.
 async fn run_handler(
     state: AppState,
     server_label: &str,
@@ -84,7 +83,7 @@ async fn run_handler(
 
     let (mcp_tool, mcp_method) = parse_mcp_meta(&body_bytes, server_label);
 
-    let result = forward_request(&state, &parts, body_bytes, identity.as_ref(), &request_id).await;
+    let result = forward_request(&state, &parts, body_bytes, &request_id).await;
 
     let latency_ms = start.elapsed().as_millis() as i64;
     let central_status = match &result {
@@ -93,8 +92,8 @@ async fn run_handler(
     };
     if let Some(ident) = &identity {
         let entry = crate::activity::RelayActivityEntry {
-            identity_id: ident.identity_id.clone(),
-            key_id: ident.key_id.clone(),
+            identity_id: ident.identity_id.clone().unwrap_or_default(),
+            key_id: ident.key_id.clone().unwrap_or_default(),
             method,
             endpoint,
             model: None,
@@ -156,7 +155,6 @@ async fn forward_request(
     state: &AppState,
     parts: &axum::http::request::Parts,
     body_bytes: axum::body::Bytes,
-    identity: Option<&super::auth::VerifiedIdentity>,
     request_id: &str,
 ) -> Result<Response<Body>> {
     // Build the upstream URL from the request path (sanitized).
@@ -174,25 +172,14 @@ async fn forward_request(
         upstream = upstream.header(name, value);
     }
 
-    // Inject verified identity headers (never from client-supplied headers).
-    if let Some(ident) = identity {
-        if let Ok(v) = HeaderValue::from_str(&ident.subject) {
-            upstream = upstream.header(identity::HEADER_USER_SUBJECT, v);
-        }
-        if let Some(email) = &ident.email {
-            if let Ok(v) = HeaderValue::from_str(email) {
-                upstream = upstream.header(identity::HEADER_USER_EMAIL, v);
-            }
-        }
-        if let Some(groups) = &ident.groups {
-            if let Ok(v) = HeaderValue::from_str(groups) {
-                upstream = upstream.header(identity::HEADER_USER_GROUPS, v);
-            }
-        }
-        if let Ok(v) = HeaderValue::from_str(&ident.identity_id) {
-            upstream = upstream.header(identity::HEADER_IDENTITY_ID, v);
-        }
+    // Forward the incoming Authorization header (the agent's bearer token) to
+    // the central proxy. The central proxy verifies it via its token store
+    // (zero-trust). The relay does not verify the token locally.
+    if let Some(auth) = parts.headers.get("authorization") {
+        upstream = upstream.header("authorization", auth);
     }
+
+    // Forward the request ID for end-to-end correlation.
     if let Ok(v) = HeaderValue::from_str(request_id) {
         upstream = upstream.header(identity::HEADER_REQUEST_ID, v);
     }
@@ -233,5 +220,212 @@ async fn forward_request(
             .body(Body::from(bytes))
             .map_err(|e| Error::Http(format!("build MCP response: {e}")))?;
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::auth::VerifiedIdentity;
+    use crate::proxy::{AppState, router};
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use oidc_agent_common::config::{CentralConnectionConfig, OidcConfig, RelayConfig};
+    use tower::ServiceExt;
+
+    async fn test_state(dev_mode: bool) -> AppState {
+        let url = oidc_agent_common::persistence::temp_sqlite_url("relay-mcp-fwd");
+        let db = crate::db::setup(&url).await.expect("db");
+        let config = RelayConfig {
+            listen_addr: "127.0.0.1:0".parse().expect("addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "t".into(),
+                client_secret_env: "T".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            central: CentralConnectionConfig {
+                url: "http://127.0.0.1:1".into(),
+                ca_cert_path: "/ca.pem".into(),
+                client_cert_path: "/c.pem".into(),
+                client_key_path: "/c.key".into(),
+            },
+            dev_mode,
+        };
+        AppState {
+            config: config.clone(),
+            // Use a plain client to avoid mTLS cert loading in non-dev mode.
+            client: reqwest::Client::new(),
+            listen_addr: "127.0.0.1:8787".parse().expect("addr"),
+            activity: crate::activity::ActivityLogger::new(db),
+        }
+    }
+
+    fn mcp_request_with_auth() -> axum::http::Request<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        })
+        .to_string();
+        axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/mcp/fs")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer oac_test_token")
+            .header("host", "127.0.0.1:8787")
+            .body(Body::from(body))
+            .expect("build request")
+    }
+
+    fn mcp_request_no_auth() -> axum::http::Request<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        })
+        .to_string();
+        axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/mcp/fs")
+            .header("content-type", "application/json")
+            .header("host", "127.0.0.1:8787")
+            .body(Body::from(body))
+            .expect("build request")
+    }
+
+    #[tokio::test]
+    async fn missing_auth_in_non_dev_mode_returns_401() {
+        // In non-dev mode, the auth middleware rejects requests without
+        // an Authorization header before they reach the MCP handler.
+        let state = test_state(false).await;
+        let app = router(state);
+        let resp = app.oneshot(mcp_request_no_auth()).await.expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "missing Authorization in non-dev mode must get 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_forward_upstream_failure_returns_bad_gateway() {
+        // In dev mode, auth is skipped. The MCP handler forwards to
+        // central at 127.0.0.1:1 (unreachable) → 502 Bad Gateway.
+        let state = test_state(true).await;
+        let app = router(state);
+        let resp = app.oneshot(mcp_request_with_auth()).await.expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "upstream connection failure must return 502"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_hub_forward_upstream_failure_returns_bad_gateway() {
+        let state = test_state(true).await;
+        let app = router(state);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer oac_test_token")
+                    .header("host", "127.0.0.1:8787")
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn parse_mcp_meta_returns_none_for_invalid_json() {
+        let (tool, method) = parse_mcp_meta(b"not json", "fs");
+        assert!(tool.is_none());
+        assert!(method.is_none());
+    }
+
+    #[test]
+    fn parse_mcp_meta_extracts_tool_and_method() {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "read_file", "arguments": {} },
+        })
+        .to_string();
+        let (tool, method) = parse_mcp_meta(body.as_bytes(), "fs");
+        assert_eq!(tool.as_deref(), Some("read_file"));
+        assert_eq!(method.as_deref(), Some("tools/call"));
+    }
+
+    #[test]
+    fn parse_mcp_meta_empty_tool_name_returns_none_for_both() {
+        // tools/call with an empty name → Err(Malformed) from extract_tool_call,
+        // so parse_mcp_meta returns (None, None) for both.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "", "arguments": {} },
+        })
+        .to_string();
+        let (tool, method) = parse_mcp_meta(body.as_bytes(), "fs");
+        assert!(tool.is_none(), "empty tool name → None");
+        assert!(
+            method.is_none(),
+            "malformed tools/call → method is also None"
+        );
+    }
+
+    #[test]
+    fn verified_identity_minimal_all_none() {
+        let id = VerifiedIdentity::minimal();
+        assert!(id.identity_id.is_none());
+        assert!(id.subject.is_none());
+        assert!(id.email.is_none());
+        assert!(id.groups.is_none());
+        assert!(id.key_id.is_none());
+    }
+
+    #[test]
+    fn parse_mcp_meta_extracts_method_for_non_tool_call() {
+        // For tools/list (not tools/call), the tool is None but the method
+        // is surfaced for activity logging.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        })
+        .to_string();
+        let (tool, method) = parse_mcp_meta(body.as_bytes(), "fs");
+        assert!(tool.is_none(), "non-tools/call → no tool");
+        assert_eq!(method.as_deref(), Some("tools/list"));
+    }
+
+    #[test]
+    fn parse_mcp_meta_handles_notification() {
+        // A notification (no id) is not a tool target — returns (None, None)
+        // because extract_tool_call returns Ok(None).
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        })
+        .to_string();
+        let (tool, method) = parse_mcp_meta(body.as_bytes(), "fs");
+        assert!(tool.is_none());
+        assert!(method.is_none(), "notification → not an enforcement target");
     }
 }

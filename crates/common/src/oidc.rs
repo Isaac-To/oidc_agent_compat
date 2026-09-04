@@ -427,4 +427,72 @@ mod tests {
         assert!(claims.groups.is_none());
         assert!(claims.roles.is_none());
     }
+
+    #[test]
+    fn validate_loopback_redirect_accepts_no_port() {
+        // A loopback URL without an explicit port is still valid.
+        assert!(validate_loopback_redirect("http://127.0.0.1/callback").is_ok());
+    }
+
+    #[test]
+    fn validate_loopback_redirect_accepts_127_0_0_1_through_127_255_255_254() {
+        // The entire 127.0.0.0/8 range is loopback (RFC 8252).
+        assert!(validate_loopback_redirect("http://127.1.2.3:8787/cb").is_ok());
+        assert!(validate_loopback_redirect("http://127.255.255.254:80/cb").is_ok());
+    }
+
+    #[test]
+    fn validate_loopback_redirect_rejects_unparseable_url() {
+        // A string that is not a valid URL must error, not panic.
+        assert!(validate_loopback_redirect("not a url at all").is_err());
+    }
+
+    #[test]
+    fn validate_loopback_redirect_rejects_ftp_scheme() {
+        // Only http is allowed for loopback redirects.
+        assert!(validate_loopback_redirect("ftp://127.0.0.1:21/cb").is_err());
+    }
+
+    #[test]
+    fn validate_loopback_redirect_rejects_non_loopback_ipv4() {
+        assert!(validate_loopback_redirect("http://10.0.0.1:8787/cb").is_err());
+        assert!(validate_loopback_redirect("http://169.254.0.1:8787/cb").is_err());
+    }
+
+    #[test]
+    fn validate_loopback_redirect_rejects_domain_in_brackets() {
+        // [::1] is loopback; a domain in brackets is a parse error / non-loopback.
+        assert!(validate_loopback_redirect("http://[example.com]/cb").is_err());
+    }
+
+    #[test]
+    fn union_groups_roles_groups_only_with_empty_roles() {
+        let claims = CustomAdditionalClaims {
+            groups: Some(vec!["a".into(), "b".into()]),
+            roles: Some(vec![]),
+        };
+        assert_eq!(union_groups_roles(&claims), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn union_groups_roles_roles_only() {
+        let claims = CustomAdditionalClaims {
+            groups: None,
+            roles: Some(vec!["dev".into(), "ops".into()]),
+        };
+        assert_eq!(union_groups_roles(&claims), vec!["dev", "ops"]);
+    }
+
+    #[test]
+    fn custom_additional_claims_ignores_unknown_fields() {
+        // Unknown additional claims must be silently ignored (only groups/
+        // roles are extracted).
+        let json = r#"{"groups":["g1"],"unknown_field":"value","extra":123}"#;
+        let claims: CustomAdditionalClaims = serde_json::from_str(json).expect("parse");
+        assert_eq!(
+            claims.groups.as_deref(),
+            Some(["g1".to_string()].as_slice())
+        );
+        assert!(claims.roles.is_none());
+    }
 }

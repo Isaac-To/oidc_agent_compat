@@ -27,9 +27,9 @@ pub const FORWARDABLE_HEADERS: &[&str] = &[
 ```
 
 Only these headers are forwarded upstream. `Authorization` is intentionally
-**not** in this list — it is replaced by upstream auth (local key →
-identity headers at the relay; identity headers → selected provider key at
-central).
+**not** in this list — it is forwarded unchanged by the relay to central (which verifies the
+token via its TokenStore); at central it is replaced by the selected
+provider key.
 
 ### `MAX_BODY_SIZE`
 
@@ -81,21 +81,19 @@ Returns `true` for:
 
 ## Identity headers (`identity` module)
 
-The relay sets these headers **only** from the auth-middleware-verified
-`VerifiedIdentity`, never from incoming request headers. This prevents
-identity spoofing.
+The relay sets only the `x-oac-request-id` header (per-request correlation
+UUID v4). The relay forwards the agent's `Authorization` header unchanged —
+it does not inject identity headers. Central extracts identity from the
+token record (zero-trust).
 
 | Header | Constant | Set by |
 |---|---|---|
-| `x-oac-user-subject` | `HEADER_USER_SUBJECT` | Relay auth middleware |
-| `x-oac-user-email` | `HEADER_USER_EMAIL` | Relay auth middleware |
-| `x-oac-user-groups` | `HEADER_USER_GROUPS` | Relay auth middleware |
-| `x-oac-identity-id` | `HEADER_IDENTITY_ID` | Relay auth middleware |
 | `x-oac-request-id` | `HEADER_REQUEST_ID` | Relay proxy handler (UUID v4) |
 
-The central proxy trusts these headers after mTLS authentication (in
-production mode). In dev mode, the central auth middleware allows requests
-without identity headers (with a warning).
+The other `X-OAC-*` header constants (`HEADER_USER_SUBJECT`,
+`HEADER_USER_EMAIL`, `HEADER_USER_GROUPS`, `HEADER_IDENTITY_ID`) still
+exist in the common crate for backward compatibility but are **not set** by
+the relay. Central ignores them — identity comes from the token store.
 
 ## Request lifecycle (header transformation)
 
@@ -114,22 +112,14 @@ Host: 127.0.0.1:8787
 The relay:
 
 1. Validates `Host` header (DNS rebinding defense — loopback only).
-2. Verifies `Authorization: Bearer <local-key>` (constant-time, SHA-256
-   hash lookup).
-3. Strips `Authorization` and hop-by-hop headers.
-4. Adds identity headers from `VerifiedIdentity`:
-   - `x-oac-user-subject: alice@example.com`
-   - `x-oac-user-email: alice@example.com`
-   - `x-oac-user-groups: ["engineering","oac-admins"]`
-   - `x-oac-identity-id: <uuid>`
-   - `x-oac-request-id: <uuid-v4>`
-5. Forwards over mTLS.
+2. Checks for a non-empty `Authorization: Bearer ***` header (presence
+   check only — does not verify the token locally).
+3. Strips hop-by-hop headers.
+4. Adds `x-oac-request-id: <uuid-v4>` (per-request correlation).
+5. Forwards over mTLS with the `Authorization` header unchanged.
 
 ```
-x-oac-user-subject: alice@example.com
-x-oac-user-email: alice@example.com
-x-oac-user-groups: ["engineering"]
-x-oac-identity-id: 550e8400-e29b-41d4-a716-446655440000
+Authorization: Bearer oac_...
 x-oac-request-id: 660e8400-e29b-41d4-a716-446655440001
 Content-Type: application/json
 Accept: */*
@@ -140,10 +130,11 @@ User-Agent: codex/1.0
 
 The central proxy:
 
-1. Validates `x-oac-user-subject` (present, non-empty).
+1. Verifies the bearer token via `TokenStore` (DB lookup, constant-time
+   hash compare).
 2. Resolves group policy.
-3. Checks device revocation, endpoint, model, quota.
-4. Strips identity headers and hop-by-hop headers.
+3. Checks token-TTL backstop, device revocation, endpoint, model, quota.
+4. Strips hop-by-hop headers.
 5. Adds `Authorization: Bearer <master-key>` (from `Zeroizing` memory).
 6. Forwards to backend.
 

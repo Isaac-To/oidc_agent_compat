@@ -24,7 +24,7 @@ endpoints this server exposes support different method sets:
 
 ```
 Agent ── MCP JSON-RPC over HTTP ──> relay (:8787) /mcp
-  relay authenticates the user, adds identity headers
+  relay checks the Authorization header (pass-through), forwards it
   ── mTLS ──> central proxy (:8443)
     central resolves the caller's group policy, fans out to the enabled
     upstream MCP servers it may reach, aggregates/prefixes tools, enforces
@@ -32,7 +32,8 @@ Agent ── MCP JSON-RPC over HTTP ──> relay (:8787) /mcp
     ──> upstream MCP servers (configured in central)
 ```
 
-- The relay simply tunnels the JSON-RPC bytes with verified identity headers.
+- The relay simply tunnels the JSON-RPC bytes with the forwarded Authorization
+  header.
 - The central proxy **combines every centrally-hosted MCP server into one
   namespace**, enforces the per-team per-tool policy, and records an audit
   entry with the server, tool, method, and a redacted argument preview.
@@ -82,12 +83,12 @@ Then configure your agent to use **one** MCP server:
 
 ```
 URL:      http://127.0.0.1:<relay-port>/mcp
-Auth:     Authorization: Bearer <local key>
+Auth:     Authorization: Bearer *** token>
 ```
 
-The local key is the same `Authorization: Bearer <local key>` obtained from
-`oac-relay login`. Tool names shown by your agent will carry the
-`server__` prefix.
+The token is the same `Authorization: Bearer *** token>` obtained from
+`oac-relay login`. Central verifies it via its TokenStore. Tool names shown by
+your agent will carry the `server__` prefix.
 
 ## Permission model
 
@@ -138,7 +139,7 @@ with `-32600` "invalid request".
 
 - **Deny by default**: a group with no MCP policy — and any caller with no
   groups at all — cannot call any tool.
-- **Enforced on the central proxy** after mTLS + identity auth, so a
+- **Enforced on the central proxy** after mTLS + token verification, so a
   compromised relay cannot bypass it.
 - **Auth headers encrypted at rest** (AES-256-GCM with the provider
   encryption key, `OAC_PROVIDER_ENCRYPTION_KEY`), decrypted into `Zeroizing`
