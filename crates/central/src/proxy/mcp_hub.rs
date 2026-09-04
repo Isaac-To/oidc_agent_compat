@@ -719,6 +719,7 @@ mod tests {
                 identity_id: Some(format!("{subject}-id")),
                 label: "test".into(),
                 expires_at: None,
+                device_fingerprint: None,
             })
             .await
             .expect("mint");

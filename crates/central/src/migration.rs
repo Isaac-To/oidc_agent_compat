@@ -181,6 +181,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migration0008StripAnsi),
             Box::new(Migration0009Mcp),
             Box::new(Migration0010Tokens),
+            Box::new(Migration0011DeviceFingerprint),
         ]
     }
 }
@@ -501,6 +502,37 @@ pub enum Token {
     LastUsedAt,
     /// Whether the token has been revoked.
     Revoked,
+}
+
+/// Migration 0011: add the `device_fingerprint` column to `tokens`.
+///
+/// Each token is bound to the relay's mTLS client cert fingerprint. A token
+/// minted on relay A cannot be used from relay B. The fingerprint is
+/// `NULL` in dev mode (no mTLS) — no binding is enforced.
+pub struct Migration0011DeviceFingerprint;
+
+impl MigrationName for Migration0011DeviceFingerprint {
+    fn name(&self) -> &str {
+        "m0000011_device_fingerprint"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0011DeviceFingerprint {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared("ALTER TABLE tokens ADD COLUMN device_fingerprint TEXT NULL;")
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // SQLite does not support DROP COLUMN; forward-only, no-op down
+        // (consistent with migrations 0006/0007/0008).
+        let _ = manager;
+        Ok(())
+    }
 }
 
 /// endpoint, request-id, permission-decision, and cost columns.
@@ -1225,6 +1257,7 @@ mod tests {
                 "m000008_strip_ansi",
                 "m000009_mcp",
                 "m0000010_tokens",
+                "m0000011_device_fingerprint",
             ],
             "migration order is part of the schema contract"
         );

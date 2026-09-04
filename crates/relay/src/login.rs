@@ -202,9 +202,20 @@ pub async fn complete_login(
         ttl_seconds,
     };
     let url = format!("{}/v1/tokens", config.central.url);
-    let resp = client
-        .post(&url)
-        .json(&mint_request)
+
+    // Compute the device fingerprint from the mTLS client cert (if available).
+    // In dev mode, this is None — no device binding.
+    let device_fingerprint = if config.dev_mode {
+        None
+    } else {
+        oidc_agent_common::mtls::cert_fingerprint(&config.central.client_cert_path)
+    };
+
+    let mut req = client.post(&url).json(&mint_request);
+    if let Some(ref fp) = device_fingerprint {
+        req = req.header(oidc_agent_common::identity::HEADER_DEVICE_FINGERPRINT, fp);
+    }
+    let resp = req
         .send()
         .await
         .map_err(|e| Error::http(format!("failed to mint token from central: {e}")))?;

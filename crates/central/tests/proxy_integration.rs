@@ -336,6 +336,7 @@ async fn streaming_response_records_token_usage_after_stream_completes() {
             identity_id: Some("stream-user-1-identity".into()),
             label: "stream-test".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint");

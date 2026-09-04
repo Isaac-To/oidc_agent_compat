@@ -125,6 +125,31 @@ pub async fn auth_middleware(
 
     let identity = verification.identity;
 
+    // Device binding enforcement: if the token has a stored device
+    // fingerprint, the request must carry a matching X-OAC-Device-Fingerprint
+    // header. A mismatch (or missing header) means the token is being used
+    // from a different relay than the one that minted it → 401.
+    // If the token has no stored fingerprint (None, dev mode), skip the check.
+    if let Some(ref stored_fp) = identity.device_fingerprint {
+        let header_fp = request
+            .headers()
+            .get(identity::HEADER_DEVICE_FINGERPRINT)
+            .and_then(|h| h.to_str().ok());
+        match header_fp {
+            Some(fp) if fp == stored_fp => { /* match — allowed */ }
+            Some(_) => {
+                tracing::warn!("device fingerprint mismatch — token bound to a different relay");
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            None => {
+                tracing::warn!(
+                    "device fingerprint header missing but token has a stored fingerprint"
+                );
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+        }
+    }
+
     // Attach the verified identity to the request extensions. All
     // identity fields come from the token record — X-OAC-* identity
     // headers are intentionally ignored.

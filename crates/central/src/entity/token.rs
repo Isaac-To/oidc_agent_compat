@@ -43,6 +43,10 @@ pub struct Model {
     pub last_used_at: Option<TimeDateTime>,
     /// Whether the token has been revoked.
     pub revoked: bool,
+    /// The SHA-256 fingerprint of the relay's mTLS cert that minted this token.
+    /// None in dev mode. Used for device binding: a token minted on relay A
+    /// cannot be used from relay B.
+    pub device_fingerprint: Option<String>,
 }
 
 /// Relations (none for v1).

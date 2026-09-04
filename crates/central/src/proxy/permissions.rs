@@ -425,6 +425,7 @@ mod tests {
                 identity_id: Some(format!("{subject}-identity")),
                 label: "test".into(),
                 expires_at: None,
+                device_fingerprint: None,
             })
             .await
             .expect("mint token");
@@ -1091,6 +1092,7 @@ mod tests {
                 identity_id: Some(format!("{subject}-identity")),
                 label: "test".into(),
                 expires_at: None,
+                device_fingerprint: None,
             })
             .await
             .expect("mint token");
@@ -1304,6 +1306,141 @@ mod tests {
             response.status(),
             StatusCode::OK,
             "None models allowlist means all models allowed"
+        );
+    }
+
+    // --- device fingerprint binding enforcement ---
+
+    /// Mints a token with a device fingerprint, returns the plaintext.
+    async fn mint_test_token_with_fingerprint(
+        state: &AppState,
+        subject: &str,
+        groups: &str,
+        fingerprint: &str,
+    ) -> String {
+        let minted = state
+            .token_store
+            .mint_token(&crate::token_store::MintRequest {
+                subject: subject.into(),
+                issuer: "https://idp.example.com".into(),
+                email: None,
+                display_name: None,
+                groups: Some(groups.into()),
+                identity_id: Some(format!("{subject}-identity")),
+                label: "test".into(),
+                expires_at: None,
+                device_fingerprint: Some(fingerprint.into()),
+            })
+            .await
+            .expect("mint token");
+        minted.plaintext.to_string()
+    }
+
+    #[tokio::test]
+    async fn device_fingerprint_match_allows_request() {
+        let state = test_state().await;
+        let token =
+            mint_test_token_with_fingerprint(&state, "alice", r#"["engineering"]"#, "fp-aabb1122")
+                .await;
+        let app = test_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-oac-device-fingerprint", "fp-aabb1122")
+                    .body(Body::from(r#"{"model":"gpt-4","messages":[]}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "matching device fingerprint must allow the request"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_fingerprint_mismatch_rejects_request() {
+        let state = test_state().await;
+        let token =
+            mint_test_token_with_fingerprint(&state, "alice", r#"["engineering"]"#, "fp-correct")
+                .await;
+        let app = test_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("x-oac-device-fingerprint", "fp-wrong")
+                    .body(Body::from(r#"{"model":"gpt-4","messages":[]}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "device fingerprint mismatch must reject with 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_fingerprint_missing_when_stored_rejects_request() {
+        let state = test_state().await;
+        let token =
+            mint_test_token_with_fingerprint(&state, "alice", r#"["engineering"]"#, "fp-stored")
+                .await;
+        let app = test_router(state);
+        // No x-oac-device-fingerprint header on the request.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(r#"{"model":"gpt-4","messages":[]}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "missing fingerprint header with stored fingerprint must reject with 401"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_fingerprint_none_skips_check() {
+        let state = test_state().await;
+        // Mint a token WITHOUT a device fingerprint (dev mode).
+        let token = mint_test_token(&state, "alice", r#"["engineering"]"#).await;
+        let app = test_router(state);
+        // No fingerprint header — should be allowed because the token has no
+        // stored fingerprint (dev mode).
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(r#"{"model":"gpt-4","messages":[]}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "no stored fingerprint → skip device binding check"
         );
     }
 }

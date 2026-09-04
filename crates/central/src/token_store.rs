@@ -44,6 +44,9 @@ pub struct MintRequest {
     pub label: String,
     /// When the token expires (`None` = never).
     pub expires_at: Option<time::PrimitiveDateTime>,
+    /// The SHA-256 fingerprint of the relay's mTLS client cert (device binding).
+    /// `None` in dev mode (no mTLS).
+    pub device_fingerprint: Option<String>,
 }
 
 /// A freshly minted token: the plaintext (returned to the relay, never
@@ -77,6 +80,9 @@ pub struct TokenIdentity {
     pub created_at: time::PrimitiveDateTime,
     /// When the token expires (`None` = never).
     pub expires_at: Option<time::PrimitiveDateTime>,
+    /// The SHA-256 fingerprint of the relay's mTLS client cert (device binding).
+    /// `None` in dev mode.
+    pub device_fingerprint: Option<String>,
 }
 
 /// The result of verifying a bearer token.
@@ -137,11 +143,17 @@ impl TokenStore {
             .as_ref()
             .map(|e| Value::String(Some(Box::new(e.clone()))))
             .unwrap_or(Value::String(None));
+        let device_fingerprint_val = req
+            .device_fingerprint
+            .as_ref()
+            .map(|f| Value::String(Some(Box::new(f.clone()))))
+            .unwrap_or(Value::String(None));
 
         let sql = "INSERT INTO tokens \
              (id, subject, issuer, email, display_name, groups, identity_id, \
-             label, token_hash, created_at, expires_at, last_used_at, revoked) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12)";
+             label, token_hash, created_at, expires_at, last_used_at, revoked, \
+             device_fingerprint) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL, $12, $13)";
         self.db
             .execute(Statement::from_sql_and_values(
                 self.db.get_database_backend(),
@@ -159,6 +171,7 @@ impl TokenStore {
                     now_str.into(),
                     expires_val,
                     Value::Bool(Some(false)),
+                    device_fingerprint_val,
                 ],
             ))
             .await
@@ -186,7 +199,7 @@ impl TokenStore {
         let now = time_util::now_utc();
 
         let sql = "SELECT id, subject, issuer, email, groups, identity_id, token_hash, \
-             created_at, expires_at, revoked FROM tokens";
+             created_at, expires_at, revoked, device_fingerprint FROM tokens";
         let rows = self
             .db
             .query_all(Statement::from_sql_and_values(
@@ -205,6 +218,7 @@ impl TokenStore {
         let mut matched_identity_id: Option<String> = None;
         let mut matched_created: Option<time::PrimitiveDateTime> = None;
         let mut matched_expires: Option<time::PrimitiveDateTime> = None;
+        let mut matched_device_fingerprint: Option<String> = None;
         let mut expired_ids: Vec<String> = Vec::new();
 
         for row in rows {
@@ -218,6 +232,7 @@ impl TokenStore {
             let row_created: time::PrimitiveDateTime = row.try_get("", "created_at").unwrap_or(now);
             let row_expires: Option<time::PrimitiveDateTime> = row.try_get("", "expires_at").ok();
             let row_revoked: bool = row.try_get("", "revoked").unwrap_or(true);
+            let row_device_fingerprint: Option<String> = row.try_get("", "device_fingerprint").ok();
 
             // Constant-time comparison against the candidate hash.
             let stored = KeyHash::from_hash_bytes(&row_hash);
@@ -235,6 +250,7 @@ impl TokenStore {
                     matched_identity_id = row_identity_id;
                     matched_created = Some(row_created);
                     matched_expires = row_expires;
+                    matched_device_fingerprint = row_device_fingerprint;
                 }
             }
         }
@@ -261,6 +277,7 @@ impl TokenStore {
                 identity_id: matched_identity_id,
                 created_at: matched_created.unwrap_or(now),
                 expires_at: matched_expires,
+                device_fingerprint: matched_device_fingerprint,
             },
         }))
     }
@@ -394,6 +411,7 @@ mod tests {
             identity_id: None,
             label: label.into(),
             expires_at,
+            device_fingerprint: None,
         }
     }
 
@@ -512,5 +530,43 @@ mod tests {
         assert!(check_backstop(now - Duration::seconds(1000), Some(500)));
         // Token minted 100s ago; cap is 500s -> OK.
         assert!(!check_backstop(now - Duration::seconds(100), Some(500)));
+    }
+
+    #[tokio::test]
+    async fn device_fingerprint_stored_and_returned_on_verify() {
+        let store = setup_store().await;
+        let mut req = mint_req("alice", "laptop", Some(3600));
+        req.device_fingerprint = Some("aa1122ff".into());
+        let minted = store.mint_token(&req).await.expect("mint");
+        let plaintext = minted.plaintext.to_string();
+        let verify = store
+            .verify_token(&plaintext)
+            .await
+            .expect("verify")
+            .expect("verified");
+        assert_eq!(
+            verify.identity.device_fingerprint.as_deref(),
+            Some("aa1122ff"),
+            "device fingerprint must be stored and returned on verify"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_fingerprint_none_by_default() {
+        let store = setup_store().await;
+        let minted = store
+            .mint_token(&mint_req("alice", "laptop", Some(3600)))
+            .await
+            .expect("mint");
+        let plaintext = minted.plaintext.to_string();
+        let verify = store
+            .verify_token(&plaintext)
+            .await
+            .expect("verify")
+            .expect("verified");
+        assert!(
+            verify.identity.device_fingerprint.is_none(),
+            "device fingerprint must be None when not set"
+        );
     }
 }

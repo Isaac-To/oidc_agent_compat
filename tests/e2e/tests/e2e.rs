@@ -197,6 +197,7 @@ async fn setup_full_system() -> (
             identity_id: Some(ident.id.clone()),
             label: "e2e-test".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint central token");
@@ -234,6 +235,7 @@ async fn setup_full_system() -> (
         client: relay_client,
         listen_addr: relay_addr,
         activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
+        device_fingerprint: None,
     };
     let relay_app = relay_proxy::router(relay_state);
     tokio::spawn(async {
@@ -554,6 +556,7 @@ async fn e2e_permissions_deny_disallowed_model() {
             identity_id: Some(ident.id.clone()),
             label: "e2e-perm-test".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint central token with groups");
@@ -645,6 +648,7 @@ async fn e2e_permissions_allow_allowed_model() {
             identity_id: Some(ident.id.clone()),
             label: "e2e-perm-allow".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint central token with groups");
@@ -700,6 +704,7 @@ async fn e2e_permissions_deny_disallowed_endpoint() {
             identity_id: Some(ident.id.clone()),
             label: "e2e-perm-endpoint".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint central token with groups");
@@ -783,6 +788,7 @@ async fn e2e_device_revocation_blocks_request() {
             identity_id: Some(ident.id.clone()),
             label: "e2e-device-test".into(),
             expires_at: None,
+            device_fingerprint: None,
         })
         .await
         .expect("mint central token");

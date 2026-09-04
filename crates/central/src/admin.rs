@@ -1632,6 +1632,7 @@ mod tests {
                 identity_id: None,
                 label: "admin-test".into(),
                 expires_at: None,
+                device_fingerprint: None,
             })
             .await
             .expect("mint admin token");
@@ -1652,6 +1653,7 @@ mod tests {
                 identity_id: None,
                 label: "non-admin-test".into(),
                 expires_at: None,
+                device_fingerprint: None,
             })
             .await
             .expect("mint non-admin token");

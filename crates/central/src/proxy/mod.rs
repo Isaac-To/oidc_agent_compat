@@ -368,6 +368,7 @@ mod tests {
                 identity_id: None,
                 label: "test".into(),
                 expires_at: None,
+                device_fingerprint: None,
             })
             .await
             .expect("mint token");

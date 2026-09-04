@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use sha2::Digest;
 
 use crate::error::{Error, Result};
 
@@ -175,6 +176,29 @@ pub fn build_server_config(
         .map_err(|e| Error::Tls(format!("build server config: {e}")))
 }
 
+/// Computes the SHA-256 fingerprint (hex) of the first certificate in the
+/// given PEM file. Returns `None` if the file cannot be read or has no certs.
+///
+/// This is used for device binding: the relay computes the fingerprint of
+/// its mTLS client cert at startup and sends it to central on every request.
+/// Central stores it on the token record and verifies it on every subsequent
+/// request, so a token minted on relay A cannot be used from relay B.
+pub fn cert_fingerprint(cert_path: &Path) -> Option<String> {
+    let certs = load_certs(cert_path).ok()?;
+    let first = certs.first()?;
+    let digest = sha2::Sha256::digest(first.as_ref());
+    Some(hex_encode(&digest))
+}
+
+/// Encodes a byte slice as a lowercase hex string.
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +247,53 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(enforce_secure_perms(&tmp).is_ok());
+    }
+
+    #[test]
+    fn cert_fingerprint_returns_none_for_missing_file() {
+        let fp = cert_fingerprint(Path::new("/nonexistent/cert.pem"));
+        assert!(fp.is_none(), "missing file must return None");
+    }
+
+    #[cfg(feature = "test-certs")]
+    #[test]
+    fn cert_fingerprint_returns_some_for_valid_cert() {
+        let certs = crate::test_certs::generate_test_certs();
+        let tmp = tempfile_in_memory_from_bytes(&certs.client_cert);
+        let fp = cert_fingerprint(&tmp);
+        assert!(fp.is_some(), "valid cert must return a fingerprint");
+        let fp = fp.expect("fingerprint");
+        // SHA-256 hex = 64 chars.
+        assert_eq!(fp.len(), 64, "SHA-256 hex fingerprint must be 64 chars");
+        assert!(
+            fp.chars().all(|c| c.is_ascii_hexdigit()),
+            "fingerprint must be lowercase hex"
+        );
+    }
+
+    #[cfg(feature = "test-certs")]
+    #[test]
+    fn cert_fingerprint_is_deterministic() {
+        let certs = crate::test_certs::generate_test_certs();
+        let tmp = tempfile_in_memory_from_bytes(&certs.client_cert);
+        let fp1 = cert_fingerprint(&tmp).expect("fp1");
+        let fp2 = cert_fingerprint(&tmp).expect("fp2");
+        assert_eq!(fp1, fp2, "same cert must produce the same fingerprint");
+    }
+
+    /// Creates a temp file with the given binary content and returns its path.
+    fn tempfile_in_memory_from_bytes(content: &[u8]) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "oac-test-{}-{}.pem",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&path, content).expect("write temp file");
+        path
     }
 
     /// Creates a temp file with the given content and returns its path.

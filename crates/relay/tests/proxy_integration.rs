@@ -101,6 +101,7 @@ async fn setup_test_relay() -> (
         client,
         listen_addr: relay_addr,
         activity: oac_relay::activity::ActivityLogger::new(db.clone()),
+        device_fingerprint: None,
     };
     let app = proxy::router(state);
     tokio::spawn(async {
@@ -249,6 +250,7 @@ async fn forwards_authorization_header_to_central() {
         client: proxy::forward::build_client(&config).expect("client"),
         listen_addr: relay_addr,
         activity: oac_relay::activity::ActivityLogger::new(db),
+        device_fingerprint: None,
     };
     let app = proxy::router(state);
     tokio::spawn(async {
@@ -340,6 +342,7 @@ async fn streams_sse_response_unchanged() {
         client: proxy::forward::build_client(&config).expect("client"),
         listen_addr: relay_addr,
         activity: oac_relay::activity::ActivityLogger::new(db),
+        device_fingerprint: None,
     };
     let app = proxy::router(state);
     tokio::spawn(async {
@@ -419,6 +422,7 @@ async fn unreachable_central_returns_typed_502_json() {
         client: proxy::forward::build_client(&config).expect("client"),
         listen_addr: relay_addr,
         activity: oac_relay::activity::ActivityLogger::new(db.clone()),
+        device_fingerprint: None,
     };
     let app = proxy::router(state);
     tokio::spawn(async {
