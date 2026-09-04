@@ -1,10 +1,15 @@
 //! Token API endpoints for the central proxy.
 //!
 //! These endpoints implement the zero-trust token lifecycle:
-//! - `POST /v1/tokens` — mint a token (called by the relay over mTLS during
-//!   login). The plaintext is returned to the relay and never persisted.
+//! - `POST /v1/tokens` — mint a token. In the login flow (no `Authorization`
+//!   header), the identity is carried in the body. In the token-create flow
+//!   (`oac-relay token create`), a valid bearer is present and the identity
+//!   is taken from the verified token record (body carries only `label`
+//!   and `ttl_seconds`).
 //! - `DELETE /v1/tokens/current` — revoke the token in the `Authorization:
 //!   Bearer` header.
+//! - `DELETE /v1/tokens/{id}` — revoke a specific token by its row id
+//!   (bearer-authenticated; lets a user revoke any of their tokens).
 //! - `GET /v1/tokens` — list tokens for the subject in the `Authorization:
 //!   Bearer` header (metadata only; never the hash or plaintext).
 //!
@@ -96,18 +101,72 @@ pub struct TokenListItem {
 /// the given groups to enforce the admin token-TTL backstop, clamps the
 /// requested TTL, mints the token, and returns the plaintext. The plaintext
 /// is never logged.
+///
+/// # Dual authentication modes
+///
+/// This endpoint serves two callers:
+///
+/// 1. **Login flow** (relay during OIDC login): no `Authorization` header is
+///    present. The identity (subject, issuer, email, groups, identity_id)
+///    is carried in the request body fields.
+/// 2. **Token-create flow** (`oac-relay token create`): a valid bearer token
+///    is present in the `Authorization` header. The identity is taken from
+///    the verified token record (subject, issuer, email, groups,
+///    identity_id), and the body fields are used only for `label` and
+///    `ttl_seconds`. This lets an authenticated user mint additional labeled
+///    tokens for themselves without re-running the OIDC flow.
 pub async fn mint_token_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<MintTokenRequest>,
 ) -> Result<(StatusCode, Json<MintTokenResponse>), (StatusCode, String)> {
-    // Validate required fields.
-    if body.subject.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "subject is required".into()));
-    }
-    if body.issuer.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "issuer is required".into()));
-    }
+    // Read the device fingerprint from the X-OAC-Device-Fingerprint header
+    // (set by the relay from its mTLS client cert). None in dev mode.
+    let device_fingerprint = headers
+        .get(identity::HEADER_DEVICE_FINGERPRINT)
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Determine the identity source: if a valid bearer is present, use the
+    // verified token record's identity; otherwise fall back to the body
+    // fields (the login flow).
+    let (subject, issuer, email, groups, identity_id) = match extract_bearer_from_headers(&headers)
+    {
+        Some(bearer) => {
+            let verification = state
+                .token_store
+                .verify_token(bearer)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+                .ok_or((StatusCode::UNAUTHORIZED, "invalid bearer token".into()))?;
+            let id = &verification.identity;
+            (
+                id.subject.clone(),
+                id.issuer.clone(),
+                id.email.clone(),
+                id.groups.clone(),
+                id.identity_id.clone(),
+            )
+        }
+        None => {
+            // Login flow: identity comes from the body fields.
+            if body.subject.trim().is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "subject is required".into()));
+            }
+            if body.issuer.trim().is_empty() {
+                return Err((StatusCode::BAD_REQUEST, "issuer is required".into()));
+            }
+            (
+                body.subject.clone(),
+                body.issuer.clone(),
+                body.email.clone(),
+                body.groups.clone(),
+                body.identity_id.clone(),
+            )
+        }
+    };
+
+    // Validate label (always required, from the body).
     if body.label.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "label is required".into()));
     }
@@ -120,14 +179,13 @@ pub async fn mint_token_handler(
     }
 
     // Resolve the group policy to get the admin token-TTL backstop.
-    let groups: Vec<String> = body
-        .groups
+    let groups_vec: Vec<String> = groups
         .as_deref()
         .and_then(|g| serde_json::from_str(g).ok())
         .unwrap_or_default();
     let policy = state
         .policy_store
-        .resolve_policy(&groups)
+        .resolve_policy(&groups_vec)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
@@ -141,22 +199,15 @@ pub async fn mint_token_handler(
 
     let expires_at = effective_ttl.map(|s| time_util::now_utc() + Duration::seconds(s));
 
-    // Read the device fingerprint from the X-OAC-Device-Fingerprint header
-    // (set by the relay from its mTLS client cert). None in dev mode.
-    let device_fingerprint = headers
-        .get(identity::HEADER_DEVICE_FINGERPRINT)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
-
     let minted = state
         .token_store
         .mint_token(&MintRequest {
-            subject: body.subject.clone(),
-            issuer: body.issuer.clone(),
-            email: body.email.clone(),
+            subject,
+            issuer,
+            email,
             display_name: body.display_name.clone(),
-            groups: body.groups.clone(),
-            identity_id: body.identity_id.clone(),
+            groups,
+            identity_id,
             label: body.label.clone(),
             expires_at,
             device_fingerprint,
@@ -233,6 +284,37 @@ pub async fn list_tokens_handler(
         .collect();
 
     Ok(Json(items))
+}
+
+/// `DELETE /v1/tokens/{id}` — revokes a specific token by its row id.
+///
+/// Authenticates via the bearer in the `Authorization` header (same as
+/// [`list_tokens_handler`]), then revokes the token with the given id. This
+/// allows a user to revoke **any** of their tokens (not just the current
+/// one), as long as they hold a valid token for authentication.
+///
+/// Returns 204 No Content on success, 401 if the bearer is invalid, 500 if
+/// the revocation fails.
+pub async fn revoke_by_id_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    let bearer = extract_bearer_from_headers(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
+    let _verification = state
+        .token_store
+        .verify_token(bearer)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    state
+        .token_store
+        .revoke_by_token_id(&id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Extracts the bearer token from the `Authorization` header, if present.
@@ -846,5 +928,211 @@ mod tests {
             verify.identity.device_fingerprint.is_none(),
             "missing fingerprint header must store None"
         );
+    }
+
+    #[tokio::test]
+    async fn post_tokens_with_authorization_uses_identity_from_token() {
+        let state = test_state().await;
+        let app = router(state.clone());
+        // Mint a token for "alice" via the login flow (no auth header).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let alice_token = json["token"].as_str().expect("token").to_string();
+
+        // Mint a second token using alice's bearer — body has only label + ttl.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {alice_token}"))
+                    .body(Body::from(
+                        serde_json::json!({
+                            "label": "codex",
+                            "ttl_seconds": 3600,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let json = body_json(resp).await;
+        let new_token = json["token"].as_str().expect("new token").to_string();
+
+        // Verify the new token has alice's identity (subject = alice), even
+        // though the body did not include subject/issuer/email/groups.
+        let verify = state
+            .token_store
+            .verify_token(&new_token)
+            .await
+            .expect("verify")
+            .expect("verified");
+        assert_eq!(
+            verify.identity.subject, "alice",
+            "identity must come from the verified bearer, not the body"
+        );
+        assert_eq!(verify.identity.issuer, "https://idp.example.com");
+        assert_eq!(
+            verify.identity.groups.as_deref(),
+            Some(r#"["engineering"]"#),
+            "groups must come from the verified bearer"
+        );
+
+        // The new token must verify independently.
+        let verify2 = state
+            .token_store
+            .verify_token(&new_token)
+            .await
+            .expect("verify2")
+            .expect("verified2");
+        assert_eq!(verify2.identity.subject, "alice");
+    }
+
+    #[tokio::test]
+    async fn post_tokens_with_invalid_bearer_returns_401() {
+        let state = test_state().await;
+        let app = router(state);
+        // An invalid bearer → 401 even if body has label.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer oac_invalid_token")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "label": "codex",
+                            "ttl_seconds": 3600,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn delete_tokens_by_id_revokes_specific_token() {
+        let state = test_state().await;
+        let app = router(state.clone());
+
+        // Mint two tokens for alice.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        let json1 = body_json(resp).await;
+        let token1 = json1["token"].as_str().expect("token1").to_string();
+        let id1 = json1["token_id"].as_str().expect("id1").to_string();
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "desktop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        let json2 = body_json(resp).await;
+        let token2 = json2["token"].as_str().expect("token2").to_string();
+        let id2 = json2["token_id"].as_str().expect("id2").to_string();
+
+        // Use token1's bearer to revoke token2 by id.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/tokens/{id2}"))
+                    .header("authorization", format!("Bearer {token1}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // token2 must no longer verify.
+        let verify2 = state
+            .token_store
+            .verify_token(&token2)
+            .await
+            .expect("verify2");
+        assert!(verify2.is_none(), "revoked-by-id token must not verify");
+
+        // token1 must still verify (only the targeted id was revoked).
+        let verify1 = state
+            .token_store
+            .verify_token(&token1)
+            .await
+            .expect("verify1")
+            .expect("verified1");
+        assert_eq!(verify1.identity.token_id, id1);
+    }
+
+    #[tokio::test]
+    async fn delete_tokens_by_id_without_bearer_returns_401() {
+        let state = test_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/tokens/some-uuid")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn delete_tokens_by_id_with_invalid_bearer_returns_401() {
+        let state = test_state().await;
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/tokens/some-uuid")
+                    .header("authorization", "Bearer oac_nonexistent")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 }

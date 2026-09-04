@@ -105,6 +105,52 @@ Entries are displayed newest first. `--limit` defaults to `20` and is capped
 at `1000`. The output contains request metadata only; API keys and provider
 key material are never printed.
 
+#### `token`
+
+Manage central tokens: create a new labeled token, list all tokens, or
+revoke a specific token by ID. This subcommand group requires a valid
+current token (from `oac-relay login`) for authentication.
+
+##### `token create`
+
+Mint a new labeled token using the current token as authentication. The
+identity is inherited from the verified bearer — the body carries only
+`label` and `ttl_seconds`. The returned plaintext token is printed for
+manual copy into an agent config file.
+
+```sh
+oac-relay --config config.toml token create --label codex --ttl 1y
+```
+
+- `--label` (required): human-readable label for the token (e.g. `codex`).
+- `--ttl` (optional): token lifetime (e.g. `1d`, `12h`, `1y`, `3600s`).
+  If omitted, the token never expires (unless the admin `max_token_ttl_seconds`
+  backstop clamps it).
+
+Calls `POST /v1/tokens` at central with `Authorization: Bearer <current token>`.
+The response includes the new token plaintext, token ID, label, and expiry.
+
+##### `token list`
+
+List all tokens for the current user. Same as [`list-keys`](#list-keys).
+
+```sh
+oac-relay --config config.toml token list
+```
+
+##### `token revoke`
+
+Revoke a specific token by its row ID (UUID). The current token is used
+for authentication; any of the user's tokens can be revoked (including the
+current one).
+
+```sh
+oac-relay --config config.toml token revoke <token-id>
+```
+
+Calls `DELETE /v1/tokens/{id}` at central with `Authorization: Bearer`.
+Returns success (204) or an error message.
+
 ---
 
 ## `oac-central`

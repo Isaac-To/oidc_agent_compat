@@ -56,6 +56,34 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: u32,
     },
+    /// Manage central tokens (create, list, revoke).
+    Token {
+        /// The token subcommand.
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+}
+
+/// Subcommands for `oac-relay token`.
+#[derive(Subcommand, Debug)]
+enum TokenCommand {
+    /// Mint a new labeled token using the current token for authentication.
+    Create {
+        /// Human-readable label for the new token (e.g. "codex").
+        #[arg(long)]
+        label: String,
+        /// Optional token lifetime (e.g. '1d', '12h', '1y', '3600s').
+        /// If omitted, the token never expires (unless the admin backstop clamps it).
+        #[arg(long)]
+        ttl: Option<String>,
+    },
+    /// List all tokens for the current user (same as `list-keys`).
+    List,
+    /// Revoke a specific token by its ID.
+    Revoke {
+        /// The token row ID (UUID) to revoke.
+        token_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -81,6 +109,7 @@ fn main() -> Result<()> {
             Command::PrintKey => print_key_cmd().await,
             Command::ListKeys => list_keys_cmd(config).await,
             Command::Activity { limit } => activity_cmd(config, limit).await,
+            Command::Token { command } => token_cmd(config, command).await,
         }
     })
 }
@@ -267,4 +296,147 @@ async fn activity_cmd(config: RelayConfig, limit: u32) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Dispatches `oac-relay token` subcommands.
+///
+/// - `Create` → [`token_create_cmd`]: mints a new labeled token.
+/// - `List` → [`list_keys_cmd`]: reuses the existing list-keys flow.
+/// - `Revoke` → [`token_revoke_cmd`]: revokes a token by ID.
+async fn token_cmd(config: RelayConfig, command: TokenCommand) -> Result<()> {
+    match command {
+        TokenCommand::Create { label, ttl } => {
+            token_create_cmd(config, &label, ttl.as_deref()).await
+        }
+        TokenCommand::List => list_keys_cmd(config).await,
+        TokenCommand::Revoke { token_id } => token_revoke_cmd(config, &token_id).await,
+    }
+}
+
+/// Mints a new labeled token via `POST /v1/tokens` using the current token
+/// for authentication.
+///
+/// The current token (from the agent config file) is sent as the `Authorization:
+/// Bearer` header. The central proxy verifies it and uses the identity from
+/// the token record — the body carries only `label` and `ttl_seconds`. The
+/// returned plaintext token is printed for the user to copy into their agent
+/// config manually.
+async fn token_create_cmd(config: RelayConfig, label: &str, ttl: Option<&str>) -> Result<()> {
+    // 1. Read the current token from the agent config file.
+    let agent_config = oac_relay::agent_config::read().map_err(|e| {
+        oidc_agent_common::error::Error::Config(format!(
+            "not logged in — run oac-relay login first ({e})"
+        ))
+    })?;
+
+    // 2. Parse the TTL.
+    let ttl_seconds = match ttl {
+        Some(t) => login::parse_ttl_to_seconds(t)?,
+        None => None,
+    };
+
+    // 3. Build the central HTTP client (handles mTLS in production).
+    let client = proxy::forward::build_client(&config)?;
+
+    // 4. Compute the device fingerprint from the config client cert (if not
+    //    dev mode).
+    let device_fingerprint = if config.dev_mode {
+        None
+    } else {
+        oidc_agent_common::mtls::cert_fingerprint(&config.central.client_cert_path)
+    };
+
+    // 5. POST to /v1/tokens with the current token as Bearer auth.
+    let url = format!("{}/v1/tokens", config.central.url);
+    let body = serde_json::json!({
+        "label": label,
+        "ttl_seconds": ttl_seconds,
+    });
+
+    let mut req = client
+        .post(&url)
+        .header("authorization", format!("Bearer {}", agent_config.api_key))
+        .json(&body);
+
+    if let Some(ref fp) = device_fingerprint {
+        req = req.header(oidc_agent_common::identity::HEADER_DEVICE_FINGERPRINT, fp);
+    }
+
+    let resp = req.send().await.map_err(|e| {
+        oidc_agent_common::error::Error::Http(format!("failed to mint token at central: {e}"))
+    })?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(oidc_agent_common::error::Error::Http(format!(
+            "failed to mint token at central: {status} {body}"
+        )));
+    }
+
+    // 6. Parse and print the returned token plaintext.
+    let minted: serde_json::Value = resp.json().await.map_err(|e| {
+        oidc_agent_common::error::Error::Http(format!("failed to parse token response: {e}"))
+    })?;
+
+    let token = minted
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| oidc_agent_common::error::Error::Http("missing token in response".into()))?;
+    let token_id = minted
+        .get("token_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    let expires_at = minted
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .unwrap_or("never");
+
+    println!("oac-relay: token created");
+    println!("  token_id  = {token_id}");
+    println!("  label     = {label}");
+    println!("  expires   = {expires_at}");
+    println!("  token     = {token}");
+    println!();
+    println!("Copy this token into your agent config (api_key field).");
+
+    Ok(())
+}
+
+/// Revokes a specific token by its ID via `DELETE /v1/tokens/{id}`.
+///
+/// Reads the current token from the agent config file for authentication,
+/// then calls the central proxy's revoke-by-id endpoint.
+async fn token_revoke_cmd(config: RelayConfig, token_id: &str) -> Result<()> {
+    // 1. Read the current token from the agent config file.
+    let agent_config = oac_relay::agent_config::read().map_err(|e| {
+        oidc_agent_common::error::Error::Config(format!(
+            "not logged in — run oac-relay login first ({e})"
+        ))
+    })?;
+
+    // 2. Build the central HTTP client (handles mTLS in production).
+    let client = proxy::forward::build_client(&config)?;
+
+    // 3. DELETE /v1/tokens/{id} with Authorization Bearer.
+    let url = format!("{}/v1/tokens/{token_id}", config.central.url);
+    let resp = client
+        .delete(&url)
+        .header("authorization", format!("Bearer {}", agent_config.api_key))
+        .send()
+        .await
+        .map_err(|e| {
+            oidc_agent_common::error::Error::Http(format!("failed to revoke token at central: {e}"))
+        })?;
+
+    let status = resp.status();
+    if status == axum::http::StatusCode::NO_CONTENT {
+        println!("oac-relay: token {token_id} revoked at central");
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(oidc_agent_common::error::Error::Http(format!(
+            "failed to revoke token at central: {status} {body}"
+        )))
+    }
 }
