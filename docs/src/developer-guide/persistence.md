@@ -10,7 +10,8 @@ migrations, and append-only enforcement.
 
 #### `m000001_initial_schema`
 
-Creates two tables:
+Creates the `identities` table (the `api_keys` table has been removed —
+central manages tokens via the `tokens` table):
 
 **`identities`**
 
@@ -23,19 +24,6 @@ Creates two tables:
 | `display_name` | string | yes |
 | `groups` | string | yes |
 | `created_at` | timestamptz | no |
-
-**`api_keys`**
-
-| Column | Type | Null |
-|---|---|---|
-| `id` | string PK | no |
-| `identity_id` | string | no |
-| `key_hash` | binary(32) | no |
-| `label` | string | no |
-| `created_at` | timestamptz | no |
-| `last_used_at` | timestamptz | yes |
-
-FK `fk_api_keys_identity_id` → `identities.id` `ON DELETE CASCADE`.
 
 #### `m000002_relay_activity_log`
 
@@ -75,10 +63,9 @@ END;
 
 #### `m000003_api_key_expiry`
 
-Adds nullable `expires_at` (timestamptz) to `api_keys`. Keys minted by
-`oac-relay login` expire per `session_ttl_hours` (default 24h); an expired
-key is rejected with `session_expired` and deleted on first use. The
-dev-mode seeded key is exempt (`NULL` = no expiry).
+Historical migration that added nullable `expires_at` to `api_keys`. The
+`api_keys` table is now removed — central manages tokens via the `tokens`
+table (migration 0010).
 
 #### `m000004_mcp_activity`
 
@@ -88,8 +75,8 @@ Adds nullable MCP columns `mcp_server`, `mcp_tool`, `mcp_method` to
 ### File permissions
 
 On Unix, the SQLite file is tightened to `0600` via
-`persistence::enforce_db_perms` so other local users can't read key
-hashes.
+`persistence::enforce_db_perms` so other local users can't read identity
+data.
 
 ---
 
@@ -232,6 +219,36 @@ Creates the MCP registry and policies:
 - Adds MCP columns to `audit_log` (`mcp_server`, `mcp_tool`, `mcp_method`,
   `mcp_args_preview`).
 
+#### `m0000010_tokens`
+
+Creates the central token store and adds the admin TTL backstop:
+
+- Adds `max_token_ttl_seconds` (nullable `BIGINT`) to `group_policies` —
+  an admin-controlled backstop that rejects tokens older than the limit
+  (from `created_at`) at request time, even if the token's own
+  `expires_at` has not passed. `NULL` means no backstop. Merged
+  least-permissive-wins (smallest cap) across groups.
+- Creates **`tokens`** table:
+
+| Column | Type | Null |
+|---|---|---|
+| `id` | string PK | no |
+| `subject` | string | no |
+| `issuer` | string | no |
+| `email` | string | yes |
+| `display_name` | string | yes |
+| `groups` | string | yes |
+| `identity_id` | string | yes |
+| `label` | string | no |
+| `token_hash` | blob | no |
+| `created_at` | timestamptz | no |
+| `expires_at` | timestamptz | yes |
+| `last_used_at` | timestamptz | yes |
+| `revoked` | boolean | no (default false) |
+
+Only the SHA-256 hash is stored; the plaintext token is returned to the
+relay at mint time and never persisted.
+
 ---
 
 ## Append-only enforcement
@@ -252,7 +269,6 @@ without dropping the triggers first.
 ### Relay entities (`crates/relay/src/entity/`)
 
 - `identity::Model` — `identities` table.
-- `api_key::Model` — `api_keys` table. `key_hash` is `Binary(32)`.
 - `relay_activity_log::Model` — `relay_activity_log` table.
 
 ### Central entities (`crates/central/src/entity/`)
@@ -267,6 +283,7 @@ without dropping the triggers first.
 - `provider_key_access::Model` — `provider_key_access` table (group ACL).
 - `mcp_server::Model` — `mcp_servers` table (encrypted auth header).
 - `mcp_server_policy::Model` — `mcp_server_policies` table.
+- `token::Model` — `tokens` table (central token store).
 
-All entities derive `DeriveEntityModel`, have no relations (except
-relay's `api_key` → `identity`), and use default `ActiveModelBehavior`.
+All entities derive `DeriveEntityModel`, have no relations, and use
+default `ActiveModelBehavior`.

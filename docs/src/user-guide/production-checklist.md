@@ -72,9 +72,10 @@ you handle real provider keys.
 ## Ongoing operations
 
 - [ ] **Re-login windows are intentional.**
-      v1 stores no OIDC refresh tokens; keys expire per
-      `session_ttl_hours` (default 24h). Users re-run `oac-relay login`.
-      Choose a TTL that matches your risk appetite.
+      v1 stores no OIDC refresh tokens; central-minted tokens expire per
+      the `--ttl` flag (default: never expires). Set
+      `max_token_ttl_seconds` on group policies as an admin backstop.
+      Users re-run `oac-relay login` when their token expires.
 - [ ] **Audit dependency advisories.**
       `cargo audit` flags known transitive advisories (`rsa`,
       `rustls-pemfile`); track them in your own vulnerability process — do

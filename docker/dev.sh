@@ -53,20 +53,32 @@ cmd_up() {
     wait_for "http://localhost:8443/healthz" 30 "Central proxy"
     wait_for "http://127.0.0.1:8787/healthz" 30 "Relay"
 
+    info "Minting a dev token at central..."
+    # Mint a dev token via the central token API (POST /v1/tokens).
+    # The relay is a dumb forwarder — it does not mint keys locally.
+    # This token is used for Goose and for admin API calls in the dev stack.
+    DEV_TOKEN=$(curl -sfS -X POST http://localhost:8443/v1/tokens \
+        -H 'Content-Type: application/json' \
+        -d '{"subject":"dev-alice","issuer":"dev","email":"alice@example.com","groups":["oac-admins"],"label":"dev-stack","ttl_seconds":null}' \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+    ok "Dev token minted"
+
     info "Registering the mock provider and test key..."
     curl -sfS -X POST http://localhost:8443/admin/v1/providers \
         -H 'Content-Type: application/json' \
-        -H 'X-OAC-User-Subject: dev-admin' \
-        -H 'X-OAC-User-Groups: ["oac-admins"]' \
+        -H "Authorization: Bearer $DEV_TOKEN" \
         -d '{"id":"mock-backend","name":"mock-backend","base_url":"http://mock-backend:8080","enabled":true,"is_default":true,"models":["mock-gpt-4"]}' \
         >/dev/null
     curl -sfS -X POST http://localhost:8443/admin/v1/providers/mock-backend/keys \
         -H 'Content-Type: application/json' \
-        -H 'X-OAC-User-Subject: dev-admin' \
-        -H 'X-OAC-User-Groups: ["oac-admins"]' \
-        -d '{"key":"sk-mock-backend-master-key","label":"dev-mock-key","priority":0}' \
+        -H "Authorization: Bearer $DEV_TOKEN" \
+        -d '{"key":"sk-moc...-key","label":"dev-mock-key","priority":0}' \
         >/dev/null
     ok "Mock provider and test key registered"
+
+    info "Writing dev token for manual curl..."
+    echo "$DEV_TOKEN" > /tmp/oac-dev-token
+    ok "Dev token written to /tmp/oac-dev-token"
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════════════"
@@ -117,7 +129,8 @@ cmd_goose() {
     echo "  docker compose -f docker/dev/docker-compose.yml run --rm goose session"
     echo ""
     echo "  # Goose is configured to use the relay at http://relay:8787"
-    echo "  # with the test key 'oac_test_key_alice' and model 'mock-gpt-4'."
+    echo "  # with a central-minted dev token and model 'mock-gpt-4'.
+  # The dev token is minted by 'dev.sh up' via POST /v1/tokens at central."
     echo ""
     echo "  # To use a different key, edit the OPENAI_API_KEY env var in"
     echo "  # docker/dev/docker-compose.yml under the 'goose' service."
@@ -136,9 +149,16 @@ cmd_test() {
     info "Sending test requests through the full chain..."
     info "  Goose → relay (127.0.0.1:8787) → central (8443) → mock-backend (8090)"
 
-    # In dev mode the relay auto-mints the dev key `oac_test_key_alice`;
-    # the tests below exercise the full relay → central → backend chain
-    # with that key, plus the security negative paths (401/400).
+    # Read the dev token minted by 'dev.sh up'.
+    if [ ! -f /tmp/oac-dev-token ]; then
+        err "Dev token not found. Run './docker/dev.sh up' first."
+        exit 1
+    fi
+    DEV_TOKEN=$(cat /tmp/oac-dev-token)
+
+    # The dev token is minted by 'dev.sh up' via POST /v1/tokens at central.
+    # The tests below exercise the full relay → central → backend chain
+    # with that token, plus the security negative paths (401/400).
 
     info "Testing relay healthz..."
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8787/healthz)
@@ -198,16 +218,16 @@ cmd_test() {
         exit 1
     fi
 
-    info "Testing full chain: GET /v1/models with dev key..."
+    info "Testing full chain: GET /v1/models with dev token..."
     BODY=$(curl -s -w "\n%{http_code}" \
-        -H "Authorization: Bearer oac_test_key_alice" \
+        -H "Authorization: Bearer $DEV_TOKEN" \
         http://127.0.0.1:8787/v1/models)
     HTTP_CODE=$(echo "$BODY" | tail -n1)
     RESP_BODY=$(echo "$BODY" | sed '$d')
     if [ "$HTTP_CODE" = "200" ]; then
-        ok "Relay /v1/models with dev key → 200"
+        ok "Relay /v1/models with dev token → 200"
     else
-        err "Relay /v1/models with dev key → $HTTP_CODE (expected 200)"
+        err "Relay /v1/models with dev token → $HTTP_CODE (expected 200)"
         exit 1
     fi
     if echo "$RESP_BODY" | grep -q "mock-gpt-4"; then
@@ -219,7 +239,7 @@ cmd_test() {
 
     info "Testing full chain: POST /v1/chat/completions (non-streaming)..."
     BODY=$(curl -s -w "\n%{http_code}" \
-        -H "Authorization: Bearer oac_test_key_alice" \
+        -H "Authorization: Bearer $DEV_TOKEN" \
         -H "Content-Type: application/json" \
         -X POST http://127.0.0.1:8787/v1/chat/completions \
         -d '{"model":"mock-gpt-4","messages":[{"role":"user","content":"hello"}]}')
@@ -241,7 +261,7 @@ cmd_test() {
     info "Testing full chain: POST /v1/chat/completions (SSE streaming)..."
     # For streaming, capture headers + body together.
     OUT=$(curl -s -D - \
-        -H "Authorization: Bearer oac_test_key_alice" \
+        -H "Authorization: Bearer $DEV_TOKEN" \
         -H "Content-Type: application/json" \
         -X POST http://127.0.0.1:8787/v1/chat/completions \
         -d '{"model":"mock-gpt-4","stream":true,"messages":[{"role":"user","content":"hello"}]}')
@@ -264,7 +284,7 @@ cmd_test() {
     info "Verifying master key never leaks into relay responses..."
     # Any response from the relay must not contain the master key.
     LEAK=$(curl -s \
-        -H "Authorization: Bearer oac_test_key_alice" \
+        -H "Authorization: Bearer $DEV_TOKEN" \
         http://127.0.0.1:8787/v1/models)
     if echo "$LEAK" | grep -q "sk-mock-backend-master-key"; then
         err "Master key leaked into relay /v1/models response!"
@@ -276,10 +296,9 @@ cmd_test() {
     echo ""
     ok "All tests passed (infrastructure + full chain + SSE)!"
     echo ""
-    info "The dev API key 'oac_test_key_alice' is auto-minted by the relay"
-    info "when dev_mode=true (see crates/relay/src/main.rs). Use it for"
-    info "manual curl, e.g.:"
-    echo "  curl -H 'Authorization: Bearer oac_test_key_alice' http://127.0.0.1:8787/v1/models"
+    info "The dev token was minted by 'dev.sh up' via POST /v1/tokens at"
+    info "central. Use it for manual curl, e.g.:"
+    echo "  curl -H \"Authorization: Bearer $DEV_TOKEN\" http://127.0.0.1:8787/v1/models"
 }
 
 # ─── Helpers ─────────────────────────────────────────────────────────────

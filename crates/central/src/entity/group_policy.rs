@@ -38,6 +38,11 @@ pub struct Model {
     /// are dropped (never truncated) until the request fits. `None` disables
     /// budget trimming.
     pub max_input_tokens: Option<i64>,
+    /// Admin-controlled token-TTL backstop (seconds). When set, tokens
+    /// older than this (from `created_at`) are rejected at request time,
+    /// even if the token's own `expires_at` has not passed. `None` means no
+    /// backstop. Merged least-permissive-wins (smallest cap) across groups.
+    pub max_token_ttl_seconds: Option<i64>,
     /// When this policy was created.
     pub created_at: TimeDateTime,
     /// When this policy was last updated.

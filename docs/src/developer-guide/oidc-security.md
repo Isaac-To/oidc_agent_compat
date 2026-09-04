@@ -13,7 +13,7 @@ controls and RFC compliance.
 | RFC 9700 (OAuth Security BCP) | S256 mandatory, state, exact redirect, no token storage v1 | ✅ S256 only, `state` verified, loopback redirect, no token storage |
 | OIDC Core §3.1.3.7 | ID token validation (iss, aud, exp, nonce, sig, alg pin) | ✅ All steps implemented |
 | NIST SP 800-90A | OS CSPRNG for key generation | ✅ `OsRng` via `rand` |
-| NIST SP 800-131A | 256-bit minimum key length | ✅ 256-bit local API keys |
+| NIST SP 800-131A | 256-bit minimum key length | ✅ 256-bit central-minted tokens |
 | OWASP ASVS V2/V3 | Auth, session, federated auth controls | ✅ |
 | CWE-208 | Constant-time comparison (timing attack prevention) | ✅ `subtle::ConstantTimeEq`, no early return |
 
@@ -91,9 +91,10 @@ controls and RFC compliance.
     - `groups` (via `union_groups_roles` + `groups_to_json_string`).
 
 15. **Complete login** — `complete_login()`:
-    - `key_store.upsert_identity(...)`.
-    - `key_store.mint_key(...)`.
-    - `agent_config::inject(...)`.
+    - `key_store.upsert_identity(...)` — stores OIDC identity locally.
+    - `POST {central}/v1/tokens` — mints a central token (the `--ttl` flag
+      sets the lifetime; default: never expires).
+    - `agent_config::inject(...)` — writes the token into the agent config.
 
 ## Allowed signing algorithms
 
@@ -120,7 +121,8 @@ pub struct CustomAdditionalClaims {
 
 `union_groups_roles()` deduplicates and sorts groups + roles into a single
 list. `groups_to_json_string()` serializes as a JSON array string for the
-`x-oac-user-groups` header.
+token record's `groups` field (originally extracted from the IdP at
+login time and stored in the central token record).
 
 > **Note:** Groups extraction from userinfo is not a standard OIDC claim.
 > The `groups` scope must be requested in the relay's OIDC config.

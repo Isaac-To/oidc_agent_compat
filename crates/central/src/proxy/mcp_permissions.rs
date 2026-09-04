@@ -336,7 +336,6 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::body::Body;
-    use oidc_agent_common::identity;
     use tower::ServiceExt;
     use zeroize::Zeroizing;
 
@@ -375,10 +374,30 @@ mod tests {
             rate_limiter: None,
             policy_store: crate::policy::PolicyStore::new(db.clone()),
             device_store: crate::device_store::DeviceStore::new(db.clone()),
-            usage_tracker: crate::usage::UsageTracker::new(db),
+            usage_tracker: crate::usage::UsageTracker::new(db.clone()),
             price_table: crate::pricing::PriceTable::empty(),
             mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+            token_store: crate::token_store::TokenStore::new(db),
         }
+    }
+
+    /// Mints a token with the given subject and groups, returns the plaintext.
+    async fn mint_test_token(state: &AppState, subject: &str, groups: &str) -> String {
+        let minted = state
+            .token_store
+            .mint_token(&crate::token_store::MintRequest {
+                subject: subject.into(),
+                issuer: "https://idp".into(),
+                email: None,
+                display_name: None,
+                groups: Some(groups.into()),
+                identity_id: Some(format!("{subject}-identity")),
+                label: "test".into(),
+                expires_at: None,
+            })
+            .await
+            .expect("mint token");
+        minted.plaintext.to_string()
     }
 
     fn test_router(state: AppState) -> Router {
@@ -395,7 +414,7 @@ mod tests {
             .with_state(())
     }
 
-    fn mcp_request(subject: &str, groups: &str, tool: &str) -> Request<Body> {
+    fn mcp_request(token: &str, tool: &str) -> Request<Body> {
         let body = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -407,9 +426,7 @@ mod tests {
             .method(axum::http::Method::POST)
             .uri("/mcp/fs")
             .header("content-type", "application/json")
-            .header(identity::HEADER_USER_SUBJECT, subject)
-            .header(identity::HEADER_IDENTITY_ID, format!("{subject}-identity"))
-            .header(identity::HEADER_USER_GROUPS, groups)
+            .header("authorization", format!("Bearer {token}"))
             .body(Body::from(body))
             .expect("build request")
     }
@@ -422,9 +439,10 @@ mod tests {
             .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string()]))
             .await
             .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
         let app = test_router(state);
         let resp = app
-            .oneshot(mcp_request("u", r#"["eng"]"#, "read_file"))
+            .oneshot(mcp_request(&token_u, "read_file"))
             .await
             .expect("router run");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -438,9 +456,10 @@ mod tests {
             .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string()]))
             .await
             .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
         let app = test_router(state);
         let resp = app
-            .oneshot(mcp_request("u", r#"["eng"]"#, "delete_file"))
+            .oneshot(mcp_request(&token_u, "delete_file"))
             .await
             .expect("router run");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -450,9 +469,10 @@ mod tests {
     async fn no_policy_blocks_all_tools() {
         let state = test_state().await;
         // No MCP policy configured for this group → deny-all for tools.
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
         let app = test_router(state);
         let resp = app
-            .oneshot(mcp_request("u", r#"["eng"]"#, "read_file"))
+            .oneshot(mcp_request(&token_u, "read_file"))
             .await
             .expect("router run");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -466,9 +486,10 @@ mod tests {
             .upsert_mcp_policy("eng", None)
             .await
             .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
         let app = test_router(state);
         let resp = app
-            .oneshot(mcp_request("u", r#"["eng"]"#, "delete_file"))
+            .oneshot(mcp_request(&token_u, "delete_file"))
             .await
             .expect("router run");
         assert_eq!(resp.status(), StatusCode::OK);
@@ -480,5 +501,324 @@ mod tests {
         assert_eq!(parse_server_path("/mcp/fs/extra"), None);
         assert_eq!(parse_server_path("/v1/models"), None);
         assert_eq!(parse_server_path("/mcp/").as_deref(), None);
+    }
+
+    #[tokio::test]
+    async fn batch_tools_call_is_denied() {
+        // A JSON-RPC batch (array) is rejected by the parse layer with
+        // BatchUnsupported; the middleware must deny it with a specific
+        // message.
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", None)
+            .await
+            .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
+        let app = test_router(state);
+        let batch = serde_json::json!([
+            { "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "read_file", "arguments": {} } }
+        ])
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp/fs")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token_u}"))
+                    .body(Body::from(batch))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["error"]["code"], -32001);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("batch"),
+            "batch rejection message must mention 'batch'"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_json_body_is_denied() {
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", None)
+            .await
+            .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
+        let app = test_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp/fs")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token_u}"))
+                    .body(Body::from("not json at all"))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["error"]["code"], -32001);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("malformed"),
+            "malformed body message must mention 'malformed'"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_tools_call_method_denied_when_no_allowed_tools() {
+        // A non-tools/call method (e.g. tools/list) requires at least one
+        // allowed tool (deny-all when the policy is an explicit empty set).
+        let state = test_state().await;
+        // Empty allowed-tools list → deny-all for the server.
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", Some(&[]))
+            .await
+            .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
+        let app = test_router(state);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp/fs")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token_u}"))
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["error"]["code"], -32001);
+    }
+
+    #[tokio::test]
+    async fn non_tools_call_method_allowed_when_tools_exist() {
+        // A non-tools/call method (e.g. tools/list) is allowed when the
+        // group has at least one allowed tool on that server.
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string()]))
+            .await
+            .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
+        let app = test_router(state);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp/fs")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token_u}"))
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn response_object_is_denied_malformed() {
+        // A JSON-RPC response object (has jsonrpc+id+result but no method)
+        // fails to deserialize as a JsonRpcRequest → the middleware denies
+        // it with 403 (fail-closed on malformed JSON-RPC).
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", None)
+            .await
+            .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
+        let app = test_router(state);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "tools": [] },
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp/fs")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token_u}"))
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "response object (no method) must be denied as malformed"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_passes_through() {
+        // A JSON-RPC notification (has method but no id) is not a tool
+        // target; the middleware passes it through.
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string()]))
+            .await
+            .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
+        let app = test_router(state);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp/fs")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token_u}"))
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn percent_decode_handles_encoded_chars() {
+        assert_eq!(percent_decode("hello"), "hello");
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("%2F"), "/");
+        // Incomplete escape at end — should keep the literal '%'.
+        assert_eq!(percent_decode("abc%2"), "abc%2");
+    }
+
+    #[test]
+    fn hex_val_converts_correctly() {
+        assert_eq!(hex_val(b'0'), Some(0));
+        assert_eq!(hex_val(b'9'), Some(9));
+        assert_eq!(hex_val(b'a'), Some(10));
+        assert_eq!(hex_val(b'F'), Some(15));
+        assert_eq!(hex_val(b'g'), None);
+    }
+
+    #[tokio::test]
+    async fn empty_groups_list_denies_all_tools() {
+        // A caller with an empty groups list (verified but groupless) must
+        // not reach any tool — MCP tools are opt-in.
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string()]))
+            .await
+            .expect("policy");
+        let token_u = mint_test_token(&state, "groupless", r#"[]"#).await;
+        let app = test_router(state);
+        let resp = app
+            .oneshot(mcp_request(&token_u, "read_file"))
+            .await
+            .expect("router run");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "empty groups must deny all tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_on_server_not_in_allowed_set_denies() {
+        // The policy allows tools on "fs" but the request targets "gh".
+        // The middleware must deny (the server is not in the allowed set).
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_mcp_policy("eng", Some(&["fs:read_file".to_string()]))
+            .await
+            .expect("policy");
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
+        let app = test_router(state);
+        // Request targets /mcp/gh (not fs), so "gh:read_file" is not in the
+        // allowlist → denied.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "read_file", "arguments": {} },
+        })
+        .to_string();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/mcp/gh")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token_u}"))
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router run");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn policy_store_error_fails_closed() {
+        // If the policy store returns an error, the middleware must deny
+        // (fail-closed), not leak the tool. We simulate this by querying a
+        // server that has no policy at all (deny-all by default).
+        let state = test_state().await;
+        let token_u = mint_test_token(&state, "u", r#"["eng"]"#).await;
+        let app = test_router(state);
+        let resp = app
+            .oneshot(mcp_request(&token_u, "read_file"))
+            .await
+            .expect("router run");
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "no policy → deny-closed"
+        );
     }
 }

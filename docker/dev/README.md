@@ -12,7 +12,7 @@ itself.
 |---|---|---|---|
 | Keycloak | `keycloak` | `localhost:8080` | OIDC IdP (realm `oac-dev`) |
 | Mock backend | `mock-backend` | `localhost:8090` | OpenAI-compatible Flask server |
-| Central proxy | `central` | `localhost:8443` | Holds the master key |
+| Central proxy | `central` | `localhost:8443` | Mints/verifies tokens, holds the encrypted provider key |
 | Relay | `relay` | `127.0.0.1:8787` | Forwards to central |
 | Goose | `goose` | — | AI agent (headless) |
 

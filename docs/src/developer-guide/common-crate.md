@@ -17,8 +17,8 @@ TOML config schemas + validation for both components.
 - `CentralConfig` — central config; `from_toml()` + `validate()`.
 - Sub-configs: `OidcConfig`, `CentralConnectionConfig`, `MtlsServerConfig`,
   `AdminConfig`, `PricingConfig`, and `ModelPriceConfig`.
-- `RelayConfig` includes the validated `session_ttl_hours` setting; the
-  default is 24 hours and `null` explicitly disables expiry.
+- `RelayConfig` no longer includes `session_ttl_hours` (removed in favor of
+  the `--ttl` CLI flag on `oac-relay login`).
 - `CentralConfig` includes validated per-IP rate-limit settings and optional
   pricing configuration.
 
@@ -104,13 +104,17 @@ Shared HTTP forwarding utilities.
 
 ### `identity`
 
-`X-OAC-*` identity header constants:
+`X-OAC-*` header constants. Only `HEADER_REQUEST_ID` is actively used
+(per-request correlation). The identity headers (`HEADER_USER_SUBJECT`,
+`HEADER_USER_EMAIL`, `HEADER_USER_GROUPS`, `HEADER_IDENTITY_ID`) still
+exist for backward compatibility but are **not set** by the relay — central
+extracts identity from the token record (zero-trust):
 
-- `HEADER_USER_SUBJECT` = `"x-oac-user-subject"`
-- `HEADER_USER_EMAIL` = `"x-oac-user-email"`
-- `HEADER_USER_GROUPS` = `"x-oac-user-groups"`
-- `HEADER_IDENTITY_ID` = `"x-oac-identity-id"`
-- `HEADER_REQUEST_ID` = `"x-oac-request-id"`
+- `HEADER_REQUEST_ID` = `"x-oac-request-id"` (actively used)
+- `HEADER_USER_SUBJECT` = `"x-oac-user-subject"` (unused — central ignores)
+- `HEADER_USER_EMAIL` = `"x-oac-user-email"` (unused — central ignores)
+- `HEADER_USER_GROUPS` = `"x-oac-user-groups"` (unused — central ignores)
+- `HEADER_IDENTITY_ID` = `"x-oac-identity-id"` (unused — central ignores)
 
 ### `persistence`
 

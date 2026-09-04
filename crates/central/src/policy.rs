@@ -41,6 +41,11 @@ pub struct ResolvedPolicy {
     pub daily_request_quota: Option<i64>,
     /// The admin-controlled token-saver configuration. Defaults to disabled.
     pub token_saver: TokenSaverConfig,
+    /// Admin-controlled token-TTL backstop (seconds). When set, tokens
+    /// older than this (from `created_at`) are rejected at request time.
+    /// `None` means no backstop. Merged least-permissive-wins (smallest
+    /// cap) across groups — a `None` row does NOT override a numeric cap.
+    pub max_token_ttl_seconds: Option<i64>,
 }
 
 impl ResolvedPolicy {
@@ -108,7 +113,7 @@ impl PolicyStore {
             "SELECT group_name, allowed_models, allowed_endpoints, \
              daily_token_quota, daily_request_quota, \
              token_saver_enabled, max_input_tokens, collapse_repeated_lines, \
-             strip_ansi \
+             strip_ansi, max_token_ttl_seconds \
              FROM group_policies WHERE group_name IN ({placeholder_str})"
         );
 
@@ -145,6 +150,10 @@ impl PolicyStore {
         let mut collapse_repeated_lines = false;
         // ANSI stripping: enabled if ANY group enables it (most permissive).
         let mut strip_ansi = false;
+        // Token-TTL backstop: least-permissive-wins (smallest cap). A `None`
+        // row (no backstop) does NOT override a numeric cap from another
+        // group — only numeric values compete.
+        let mut max_token_ttl_seconds: Option<i64> = None;
 
         for row in rows {
             let row_models: Option<String> = row.try_get("", "allowed_models").ok();
@@ -155,6 +164,7 @@ impl PolicyStore {
             let row_max_input: Option<i64> = row.try_get("", "max_input_tokens").ok();
             let row_collapse: Option<bool> = row.try_get("", "collapse_repeated_lines").ok();
             let row_strip_ansi: Option<bool> = row.try_get("", "strip_ansi").ok();
+            let row_max_ttl: Option<i64> = row.try_get("", "max_token_ttl_seconds").ok();
 
             // Models: union. None = all allowed.
             match (row_models, &mut allowed_models) {
@@ -219,6 +229,17 @@ impl PolicyStore {
                     Some(acc) => max_input_tokens = Some(acc.max(row_budget)),
                 }
             }
+
+            // Token-TTL backstop: least-permissive-wins (smallest cap). A
+            // `None` row (no backstop) does NOT override a numeric cap from
+            // another group — only numeric values compete. This is the
+            // inverse of quotas: backstops tighten under merge.
+            if let Some(row_cap) = row_max_ttl {
+                max_token_ttl_seconds = match max_token_ttl_seconds {
+                    None => Some(row_cap),
+                    Some(acc) => Some(acc.min(row_cap)),
+                };
+            }
         }
 
         Ok(ResolvedPolicy {
@@ -232,6 +253,7 @@ impl PolicyStore {
                 collapse_repeated_lines,
                 strip_ansi,
             },
+            max_token_ttl_seconds,
         })
     }
 
@@ -289,12 +311,14 @@ impl PolicyStore {
             None,
             false,
             false,
+            None,
         )
         .await
     }
 
     /// Upserts a group policy including the admin-controlled token-saver
-    /// fields (`token_saver_enabled`, `max_input_tokens`).
+    /// fields (`token_saver_enabled`, `max_input_tokens`) and the
+    /// admin-controlled token-TTL backstop (`max_token_ttl_seconds`).
     ///
     /// # Errors
     ///
@@ -311,6 +335,7 @@ impl PolicyStore {
         max_input_tokens: Option<i64>,
         collapse_repeated_lines: bool,
         strip_ansi: bool,
+        max_token_ttl_seconds: Option<i64>,
     ) -> Result<group_policy::Model> {
         let existing = self.get_policy(group_name).await?;
         let now = time_util::now_utc();
@@ -334,6 +359,9 @@ impl PolicyStore {
             .unwrap_or(Value::BigInt(None));
         let collapse_val = Value::Bool(Some(collapse_repeated_lines));
         let strip_ansi_val = Value::Bool(Some(strip_ansi));
+        let max_ttl_val = max_token_ttl_seconds
+            .map(|v| Value::BigInt(Some(v)))
+            .unwrap_or(Value::BigInt(None));
 
         if let Some(model) = existing {
             // Update existing.
@@ -341,7 +369,8 @@ impl PolicyStore {
                  allowed_endpoints = $2, daily_token_quota = $3, \
                  daily_request_quota = $4, token_saver_enabled = $5, \
                  max_input_tokens = $6, collapse_repeated_lines = $7, \
-                 strip_ansi = $8, updated_at = $9 WHERE id = $10";
+                 strip_ansi = $8, max_token_ttl_seconds = $9, updated_at = $10 \
+                 WHERE id = $11";
             self.db
                 .execute(Statement::from_sql_and_values(
                     self.db.get_database_backend(),
@@ -355,6 +384,7 @@ impl PolicyStore {
                         max_input_val,
                         collapse_val,
                         strip_ansi_val,
+                        max_ttl_val,
                         now_str.into(),
                         model.id.clone().into(),
                     ],
@@ -372,6 +402,7 @@ impl PolicyStore {
                 max_input_tokens,
                 collapse_repeated_lines,
                 strip_ansi,
+                max_token_ttl_seconds,
                 created_at: model.created_at,
                 updated_at: now,
             })
@@ -382,8 +413,8 @@ impl PolicyStore {
                  (id, group_name, allowed_models, allowed_endpoints, \
                  daily_token_quota, daily_request_quota, \
                  token_saver_enabled, max_input_tokens, collapse_repeated_lines, \
-                 strip_ansi, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)";
+                 strip_ansi, max_token_ttl_seconds, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)";
             self.db
                 .execute(Statement::from_sql_and_values(
                     self.db.get_database_backend(),
@@ -399,6 +430,7 @@ impl PolicyStore {
                         max_input_val,
                         collapse_val,
                         strip_ansi_val,
+                        max_ttl_val,
                         now_str.clone().into(),
                         now_str.into(),
                     ],
@@ -416,6 +448,7 @@ impl PolicyStore {
                 max_input_tokens,
                 collapse_repeated_lines,
                 strip_ansi,
+                max_token_ttl_seconds,
                 created_at: now,
                 updated_at: now,
             })
@@ -887,6 +920,7 @@ mod tests {
                 Some(8000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert");
@@ -914,6 +948,7 @@ mod tests {
                 Some(2000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert a");
@@ -928,6 +963,7 @@ mod tests {
                 Some(5000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert b");
@@ -957,11 +993,14 @@ mod tests {
                 Some(1000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert a");
         store
-            .upsert_policy_full("group-b", None, None, None, None, false, None, false, false)
+            .upsert_policy_full(
+                "group-b", None, None, None, None, false, None, false, false, None,
+            )
             .await
             .expect("upsert b");
         let policy = store
@@ -987,6 +1026,7 @@ mod tests {
                 Some(1000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert a");
@@ -1001,6 +1041,7 @@ mod tests {
                 Some(1000),
                 true,
                 false,
+                None,
             )
             .await
             .expect("upsert b");
@@ -1026,6 +1067,7 @@ mod tests {
                 Some(1000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert a");
@@ -1040,6 +1082,7 @@ mod tests {
                 Some(1000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert b");
@@ -1069,6 +1112,7 @@ mod tests {
                 Some(1000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert a");
@@ -1083,6 +1127,7 @@ mod tests {
                 Some(1000),
                 false,
                 true,
+                None,
             )
             .await
             .expect("upsert b");
@@ -1108,6 +1153,7 @@ mod tests {
                 Some(1000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert a");
@@ -1122,6 +1168,7 @@ mod tests {
                 Some(1000),
                 false,
                 false,
+                None,
             )
             .await
             .expect("upsert b");
@@ -1288,5 +1335,248 @@ mod tests {
             .expect("resolve")
             .expect("must be Some(empty), not allow-all None");
         assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn max_token_ttl_seconds_merge_smallest_cap_wins() {
+        // Two groups each set a numeric cap; the merge must pick the
+        // smallest (least-permissive-wins for backstops).
+        let store = setup_test_db().await;
+        store
+            .upsert_policy_full(
+                "group-a",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(3600),
+            )
+            .await
+            .expect("upsert a");
+        store
+            .upsert_policy_full(
+                "group-b",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(1800),
+            )
+            .await
+            .expect("upsert b");
+
+        let policy = store
+            .resolve_policy(&["group-a".into(), "group-b".into()])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            policy.max_token_ttl_seconds,
+            Some(1800),
+            "the smallest cap must win for backstops"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_token_ttl_seconds_none_does_not_override_cap() {
+        // One group sets a cap, the other has None (no backstop). The cap
+        // must still apply — a None row does NOT override a numeric cap.
+        let store = setup_test_db().await;
+        store
+            .upsert_policy_full(
+                "group-a",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(3600),
+            )
+            .await
+            .expect("upsert a");
+        store
+            .upsert_policy_full(
+                "group-b", None, None, None, None, false, None, false, false, None,
+            )
+            .await
+            .expect("upsert b");
+
+        let policy = store
+            .resolve_policy(&["group-a".into(), "group-b".into()])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            policy.max_token_ttl_seconds,
+            Some(3600),
+            "a None row must not override a numeric cap from another group"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_token_ttl_seconds_single_group_applies() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy_full(
+                "engineering",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(7200),
+            )
+            .await
+            .expect("upsert");
+        let policy = store
+            .resolve_policy(&["engineering".into()])
+            .await
+            .expect("resolve");
+        assert_eq!(policy.max_token_ttl_seconds, Some(7200));
+    }
+
+    #[tokio::test]
+    async fn max_token_ttl_seconds_none_when_no_group_sets_it() {
+        let store = setup_test_db().await;
+        store
+            .upsert_policy("engineering", None, None, None, None)
+            .await
+            .expect("upsert");
+        let policy = store
+            .resolve_policy(&["engineering".into()])
+            .await
+            .expect("resolve");
+        assert!(policy.max_token_ttl_seconds.is_none());
+    }
+
+    #[tokio::test]
+    async fn delete_and_recreate_policy_round_trip() {
+        // Deleting a policy then re-creating it with different values must
+        // resolve to the new values (not the stale deleted row).
+        let store = setup_test_db().await;
+        store
+            .upsert_policy("g", Some(r#"["m1"]"#), None, Some(100), None)
+            .await
+            .expect("upsert 1");
+        assert!(store.delete_policy("g").await.expect("delete"));
+        store
+            .upsert_policy("g", Some(r#"["m2"]"#), None, Some(200), None)
+            .await
+            .expect("upsert 2");
+        let policy = store.resolve_policy(&["g".into()]).await.expect("resolve");
+        assert!(policy.is_model_allowed("m2"));
+        assert!(!policy.is_model_allowed("m1"));
+        assert_eq!(policy.daily_token_quota, Some(200));
+    }
+
+    #[tokio::test]
+    async fn upsert_policy_full_round_trips_max_token_ttl() {
+        // Verify upsert_policy_full stores and returns the TTL cap.
+        let store = setup_test_db().await;
+        let model = store
+            .upsert_policy_full(
+                "ttl-group",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(7200),
+            )
+            .await
+            .expect("upsert");
+        assert_eq!(model.max_token_ttl_seconds, Some(7200));
+        let stored = store
+            .get_policy("ttl-group")
+            .await
+            .expect("get")
+            .expect("some");
+        assert_eq!(stored.max_token_ttl_seconds, Some(7200));
+    }
+
+    #[tokio::test]
+    async fn resolve_policy_mixed_none_and_some_token_ttl() {
+        // One group sets a cap, the other has None. The cap must survive
+        // (None does not override), and if a third group sets a smaller cap,
+        // the smallest wins.
+        let store = setup_test_db().await;
+        store
+            .upsert_policy_full(
+                "a",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(3600),
+            )
+            .await
+            .expect("upsert a");
+        store
+            .upsert_policy_full("b", None, None, None, None, false, None, false, false, None)
+            .await
+            .expect("upsert b");
+        store
+            .upsert_policy_full(
+                "c",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(1800),
+            )
+            .await
+            .expect("upsert c");
+        let policy = store
+            .resolve_policy(&["a".into(), "b".into(), "c".into()])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            policy.max_token_ttl_seconds,
+            Some(1800),
+            "smallest cap wins across mixed None/Some"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_mcp_policy_round_trips() {
+        let store = setup_test_db().await;
+        store
+            .upsert_mcp_policy("eng", Some(&["fs:read".to_string()]))
+            .await
+            .expect("upsert");
+        assert!(store.delete_mcp_policy("eng").await.expect("delete"));
+        // Deleting again → false (already gone).
+        assert!(!store.delete_mcp_policy("eng").await.expect("delete2"));
+        // After delete, the tool is denied (no policy → deny-all).
+        assert!(
+            !store
+                .resolve_mcp_tool_allowed(&["eng".into()], "fs", "read")
+                .await
+                .expect("resolve"),
+            "after delete, tools must be denied"
+        );
     }
 }

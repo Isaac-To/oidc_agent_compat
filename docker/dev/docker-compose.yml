@@ -101,7 +101,9 @@ services:
       # Use the built-in openai provider pointing at the relay.
       GOOSE_PROVIDER: openai
       GOOSE_MODEL: mock-gpt-4
-      OPENAI_API_KEY: oac_test_key_alice
+      # Dev token is minted dynamically by docker/dev.sh after central starts.
+      # Set OPENAI_API_KEY at runtime (e.g. via docker compose run --env).
+      # OPENAI_API_KEY: set-at-runtime
       OPENAI_HOST: http://relay:8787
       OPENAI_BASE_PATH: v1/chat/completions
       # Headless mode — auto-approve tools, no prompts.

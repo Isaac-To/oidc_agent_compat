@@ -38,7 +38,7 @@ Key points:
 
 - `listen_addr` is `0.0.0.0:8443` (network-accessible) in production.
 - `dev_mode = false` enforces mTLS and rejects requests without
-  relay-forwarded identity headers.
+  bearer token verification.
 - Provider and key records are not in the TOML file. Add them with the admin
   API after central starts.
 - `[admin]` is optional. If present, the admin API is enabled and
@@ -54,7 +54,7 @@ export OAC_OIDC_CLIENT_SECRET="your-oidc-client-secret"
 
 Note: the `[oidc]` section is schema-required and validated, but central
 never performs an OIDC login at runtime — it trusts relay-forwarded
-identity headers over mTLS. The env var only needs to exist for config
+the bearer token over mTLS. The env var only needs to exist for config
 loading (the Docker stack sets it automatically).
 
 Set the provider-key encryption key through your secret manager or Docker
@@ -90,7 +90,7 @@ oac-central --config config.toml serve
 ### `oac-central admin` — admin CLI
 
 The admin CLI sends requests **through the relay** (which authenticates the
-user via OIDC and forwards identity headers to central). The user must
+user via OIDC and forwards the bearer token to central). The user must
 belong to the configured `admin_group`.
 
 ```sh

@@ -108,6 +108,32 @@ pub async fn permissions_middleware(
         }
     };
 
+    // Backstop check: if the verified identity carries a token id and
+    // created_at (always present when auth came from the token store),
+    // reject tokens older than the policy's max_token_ttl_seconds. This
+    // is a harder rejection than device revocation — a backstop-violating
+    // token is already stale and must not reach the backend. The token
+    // row is deleted by check_backstop so it cannot be replayed.
+    if let (Some(token_id), Some(created_at)) = (&identity.token_id, identity.created_at) {
+        if crate::token_store::check_backstop(created_at, policy.max_token_ttl_seconds) {
+            // Delete the stale token row so it cannot be replayed.
+            let _ = state.token_store.revoke_by_token_id(token_id).await;
+            tracing::warn!(
+                token_id = %token_id,
+                "token backstop exceeded: token is older than the maximum allowed lifetime"
+            );
+            return deny(
+                &state,
+                &identity,
+                &endpoint,
+                None,
+                "token backstop exceeded: token is older than the maximum allowed lifetime",
+                StatusCode::UNAUTHORIZED,
+            )
+            .await;
+        }
+    }
+
     // Check device revocation and auto-register the device. The device is
     // identified by the relay-side identity (identity_id, falling back to
     // the subject). In production (mTLS) the transport layer has already
@@ -343,7 +369,6 @@ mod tests {
     use crate::provider::ProviderStore;
     use crate::usage::UsageTracker;
     use axum::Router;
-    use oidc_agent_common::identity;
     use tower::ServiceExt;
     use zeroize::Zeroizing;
 
@@ -380,12 +405,31 @@ mod tests {
             rate_limiter: None,
             policy_store: crate::policy::PolicyStore::new(db.clone()),
             device_store: crate::device_store::DeviceStore::new(db.clone()),
-            usage_tracker: UsageTracker::new(db),
+            usage_tracker: UsageTracker::new(db.clone()),
             price_table: crate::pricing::PriceTable::empty(),
             mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+            token_store: crate::token_store::TokenStore::new(db),
         }
     }
 
+    /// Mints a token with the given subject and groups, returns the plaintext.
+    async fn mint_test_token(state: &AppState, subject: &str, groups: &str) -> String {
+        let minted = state
+            .token_store
+            .mint_token(&crate::token_store::MintRequest {
+                subject: subject.into(),
+                issuer: "https://idp.example.com".into(),
+                email: None,
+                display_name: None,
+                groups: Some(groups.into()),
+                identity_id: Some(format!("{subject}-identity")),
+                label: "test".into(),
+                expires_at: None,
+            })
+            .await
+            .expect("mint token");
+        minted.plaintext.to_string()
+    }
     fn test_router(state: AppState) -> Router {
         Router::new()
             .route(
@@ -403,14 +447,12 @@ mod tests {
             .with_state(())
     }
 
-    fn chat_request(subject: &str, groups: &str) -> Request<Body> {
+    fn chat_request(token: &str) -> Request<Body> {
         Request::builder()
             .method(axum::http::Method::POST)
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
-            .header(identity::HEADER_USER_SUBJECT, subject)
-            .header(identity::HEADER_IDENTITY_ID, format!("{subject}-identity"))
-            .header(identity::HEADER_USER_GROUPS, groups)
+            .header("authorization", format!("Bearer {token}"))
             .body(Body::from(
                 r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
             ))
@@ -432,8 +474,9 @@ mod tests {
             .await
             .expect("seed usage");
 
+        let token_quota_user = mint_test_token(&state, "quota-user", r#"["engineering"]"#).await;
         let response = test_router(state)
-            .oneshot(chat_request("quota-user", r#"["engineering"]"#))
+            .oneshot(chat_request(&token_quota_user))
             .await
             .expect("middleware run");
         assert_eq!(
@@ -486,8 +529,10 @@ mod tests {
             ))
             .with_state(());
 
+        let token_quota_user_audit =
+            mint_test_token(&state, "quota-user-audit", r#"["engineering"]"#).await;
         let response = app
-            .oneshot(chat_request("quota-user-audit", r#"["engineering"]"#))
+            .oneshot(chat_request(&token_quota_user_audit))
             .await
             .expect("middleware run");
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -543,8 +588,10 @@ mod tests {
             .await
             .expect("seed usage");
 
+        let token_quota_user_2 =
+            mint_test_token(&state, "quota-user-2", r#"["engineering"]"#).await;
         let response = test_router(state)
-            .oneshot(chat_request("quota-user-2", r#"["engineering"]"#))
+            .oneshot(chat_request(&token_quota_user_2))
             .await
             .expect("middleware run");
         assert_eq!(
@@ -568,8 +615,10 @@ mod tests {
             .await
             .expect("seed usage");
 
+        let token_quota_user_3 =
+            mint_test_token(&state, "quota-user-3", r#"["engineering"]"#).await;
         let response = test_router(state)
-            .oneshot(chat_request("quota-user-3", r#"["engineering"]"#))
+            .oneshot(chat_request(&token_quota_user_3))
             .await
             .expect("middleware run");
         assert_eq!(
@@ -593,8 +642,10 @@ mod tests {
             .await
             .expect("seed usage");
 
+        let token_quota_user_4 =
+            mint_test_token(&state, "quota-user-4", r#"["engineering"]"#).await;
         let response = test_router(state)
-            .oneshot(chat_request("quota-user-4", r#"["engineering"]"#))
+            .oneshot(chat_request(&token_quota_user_4))
             .await
             .expect("middleware run");
         assert_eq!(
@@ -620,6 +671,8 @@ mod tests {
         let usage_tracker = state.usage_tracker.clone();
         let downstream_calls = Arc::new(AtomicUsize::new(0));
         let calls = downstream_calls.clone();
+        let token_concurrent_user =
+            mint_test_token(&state, "concurrent-user", r#"["engineering"]"#).await;
         let app = Router::new()
             .route(
                 "/v1/chat/completions",
@@ -644,7 +697,7 @@ mod tests {
         // All requests start concurrently. A read-then-forward implementation
         // would let every request observe request_count=0 and reach the
         // handler. The atomic reservation must admit exactly one.
-        let requests = (0..16).map(|_| chat_request("concurrent-user", r#"["engineering"]"#));
+        let requests = (0..16).map(|_| chat_request(&token_concurrent_user));
         let responses =
             futures::future::join_all(requests.map(|request| app.clone().oneshot(request))).await;
         let responses = responses
@@ -710,9 +763,10 @@ mod tests {
             ))
             .with_state(());
 
+        let token_rate_user = mint_test_token(&state, "rate-user", r#"["engineering"]"#).await;
         let first = app
             .clone()
-            .oneshot(chat_request("rate-user", r#"["engineering"]"#))
+            .oneshot(chat_request(&token_rate_user))
             .await
             .expect("first request");
         assert_eq!(first.status(), StatusCode::OK);
@@ -720,7 +774,7 @@ mod tests {
         // Same default client IP exhausts the token bucket. This request is
         // rejected before permissions can reserve the second quota slot.
         let second = app
-            .oneshot(chat_request("rate-user", r#"["engineering"]"#))
+            .oneshot(chat_request(&token_rate_user))
             .await
             .expect("second request");
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -738,8 +792,9 @@ mod tests {
         let state = test_state().await;
         let device_store = state.device_store.clone();
 
+        let token_device_user = mint_test_token(&state, "device-user", r#"[]"#).await;
         let response = test_router(state)
-            .oneshot(chat_request("device-user", r#"[]"#))
+            .oneshot(chat_request(&token_device_user))
             .await
             .expect("middleware run");
         assert_eq!(response.status(), StatusCode::OK);
@@ -767,8 +822,9 @@ mod tests {
             .await
             .expect("revoke");
 
+        let token_device_user = mint_test_token(&state, "device-user", r#"[]"#).await;
         let response = test_router(state)
-            .oneshot(chat_request("device-user", r#"[]"#))
+            .oneshot(chat_request(&token_device_user))
             .await
             .expect("middleware run");
         assert_eq!(
@@ -800,14 +856,15 @@ mod tests {
 
         // /v1/embeddings is not on the allowlist → 403 with a JSON body that
         // names the reason so agents surface something actionable.
+        let token_endpoint_user =
+            mint_test_token(&state, "endpoint-user", r#"["restricted"]"#).await;
         let response = test_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method(axum::http::Method::POST)
                     .uri("/v1/embeddings")
                     .header("content-type", "application/json")
-                    .header(identity::HEADER_USER_SUBJECT, "endpoint-user")
-                    .header(identity::HEADER_USER_GROUPS, r#"["restricted"]"#)
+                    .header("authorization", format!("Bearer {token_endpoint_user}"))
                     .body(Body::from(r#"{"model":"gpt-4","messages":[]}"#.to_string()))
                     .expect("build request"),
             )
@@ -847,6 +904,8 @@ mod tests {
             .upsert_policy("restricted", None, Some(r#"["/v1/models"]"#), None, None)
             .await
             .expect("policy");
+        let token_list_models_user =
+            mint_test_token(&state, "list-models-user", r#"["restricted"]"#).await;
 
         // A router with both routes so GET /v1/models resolves.
         let app = Router::new()
@@ -873,8 +932,7 @@ mod tests {
                 Request::builder()
                     .method(axum::http::Method::GET)
                     .uri("/v1/models")
-                    .header(identity::HEADER_USER_SUBJECT, "list-models-user")
-                    .header(identity::HEADER_USER_GROUPS, r#"["restricted"]"#)
+                    .header("authorization", format!("Bearer {token_list_models_user}"))
                     .body(Body::empty())
                     .expect("build request"),
             )
@@ -884,7 +942,7 @@ mod tests {
 
         // POST to an endpoint not on the list → denied.
         let response = app
-            .oneshot(chat_request("list-models-user", r#"["restricted"]"#))
+            .oneshot(chat_request(&token_list_models_user))
             .await
             .expect("middleware run");
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -900,6 +958,7 @@ mod tests {
             .upsert_policy("restricted", Some(r#"["gpt-4o"]"#), None, None, None)
             .await
             .expect("policy");
+        let token_model_user = mint_test_token(&state, "model-user", r#"["restricted"]"#).await;
 
         // Request a model outside the allowlist.
         let response = test_router(state.clone())
@@ -908,8 +967,7 @@ mod tests {
                     .method(axum::http::Method::POST)
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
-                    .header(identity::HEADER_USER_SUBJECT, "model-user")
-                    .header(identity::HEADER_USER_GROUPS, r#"["restricted"]"#)
+                    .header("authorization", format!("Bearer {token_model_user}"))
                     .body(Body::from(
                         r#"{"model":"o1-preview","messages":[]}"#.to_string(),
                     ))
@@ -1008,5 +1066,244 @@ mod tests {
             .await
             .expect("middleware run");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // --- Token TTL backstop (admin-controlled max_token_ttl_seconds) ---
+
+    /// Mints a token and backdates its `created_at` so it is older than the
+    /// given TTL cap. Returns the plaintext bearer token and the token row
+    /// id (so the caller can verify the row was deleted).
+    async fn mint_and_backdate(
+        state: &AppState,
+        subject: &str,
+        groups: &str,
+        age_secs: i64,
+    ) -> (String, String) {
+        use sea_orm::{ConnectionTrait, Statement};
+        let minted = state
+            .token_store
+            .mint_token(&crate::token_store::MintRequest {
+                subject: subject.into(),
+                issuer: "https://idp.example.com".into(),
+                email: None,
+                display_name: None,
+                groups: Some(groups.into()),
+                identity_id: Some(format!("{subject}-identity")),
+                label: "test".into(),
+                expires_at: None,
+            })
+            .await
+            .expect("mint token");
+        let token_id = minted.token_id.clone();
+        // Backdate created_at by age_secs.
+        let old_created =
+            oidc_agent_common::time_util::now_utc() - time::Duration::seconds(age_secs);
+        let old_str = oidc_agent_common::time_util::format_time(&old_created);
+        let sql = "UPDATE tokens SET created_at = $1 WHERE id = $2";
+        state
+            .audit
+            .db()
+            .execute(Statement::from_sql_and_values(
+                state.audit.db().get_database_backend(),
+                sql,
+                vec![old_str.into(), token_id.clone().into()],
+            ))
+            .await
+            .expect("backdate");
+        (minted.plaintext.to_string(), token_id)
+    }
+
+    /// Verifies a token row exists (or not) by id.
+    async fn token_row_exists(state: &AppState, token_id: &str) -> bool {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        crate::entity::token::Entity::find()
+            .filter(crate::entity::token::Column::Id.eq(token_id))
+            .one(state.audit.db())
+            .await
+            .expect("query")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn backstop_denies_token_older_than_max_ttl_and_deletes_token() {
+        let state = test_state().await;
+        // Policy: max token lifetime 500 seconds.
+        state
+            .policy_store
+            .upsert_policy_full(
+                "engineering",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(500),
+            )
+            .await
+            .expect("policy");
+
+        // Mint a token and backdate it to 1000 seconds ago (exceeds 500s cap).
+        let (token, token_id) =
+            mint_and_backdate(&state, "backstop-user", r#"["engineering"]"#, 1000).await;
+
+        let response = test_router(state.clone())
+            .oneshot(chat_request(&token))
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a token older than max_token_ttl_seconds must be denied with 401"
+        );
+
+        // The stale token row must have been deleted so it cannot be replayed.
+        assert!(
+            !token_row_exists(&state, &token_id).await,
+            "backstop-violating token must be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn backstop_allows_token_within_max_ttl() {
+        let state = test_state().await;
+        // Policy: max token lifetime 5000 seconds.
+        state
+            .policy_store
+            .upsert_policy_full(
+                "engineering",
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+                false,
+                Some(5000),
+            )
+            .await
+            .expect("policy");
+
+        // Mint a token and backdate it to 100 seconds ago (within 5000s cap).
+        let (token, token_id) =
+            mint_and_backdate(&state, "backstop-ok-user", r#"["engineering"]"#, 100).await;
+
+        let response = test_router(state.clone())
+            .oneshot(chat_request(&token))
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a token within max_token_ttl_seconds must be allowed"
+        );
+
+        // The token must still exist (not deleted).
+        assert!(
+            token_row_exists(&state, &token_id).await,
+            "a valid token must not be deleted by the backstop check"
+        );
+    }
+
+    #[tokio::test]
+    async fn backstop_no_cap_allows_any_age() {
+        // No max_token_ttl_seconds configured → no backstop, any age allowed.
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, None, None)
+            .await
+            .expect("policy");
+
+        let (token, _token_id) =
+            mint_and_backdate(&state, "backstop-nocap-user", r#"["engineering"]"#, 100_000).await;
+
+        let response = test_router(state)
+            .oneshot(chat_request(&token))
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "no max_token_ttl_seconds means no backstop — any age allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_request_without_model_field_is_allowed() {
+        // A POST body without a `model` field must pass (no model to check).
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("engineering", None, None, None, None)
+            .await
+            .expect("policy");
+        let token = mint_test_token(&state, "nomodel", r#"["engineering"]"#).await;
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { "ok" }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                permissions_middleware,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                super::super::auth::auth_middleware,
+            ))
+            .with_state(());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(r#"{"messages":[]}"#))
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "POST without a model field must pass the model check"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_allowlist_with_none_means_all_models_allowed() {
+        // A group with allowed_models=None (all allowed) must let any model
+        // through the permissions middleware.
+        let state = test_state().await;
+        state
+            .policy_store
+            .upsert_policy("open", None, None, None, None)
+            .await
+            .expect("policy");
+        let token = mint_test_token(&state, "open-user", r#"["open"]"#).await;
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(axum::http::Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::from(
+                        r#"{"model":"any-model","messages":[]}"#.to_string(),
+                    ))
+                    .expect("build request"),
+            )
+            .await
+            .expect("middleware run");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "None models allowlist means all models allowed"
+        );
     }
 }

@@ -4,7 +4,7 @@
 
 ```
 Agent (Codex, Goose, etc.)
-  │  Authorization: Bearer <local key>
+  │  Authorization: Bearer *** token>
   ▼
 [127.0.0.1 relay]  ── mTLS (TLS 1.3) ──►  [central proxy]  ──►  [OpenAI-compatible backend]
   │                                        │
@@ -19,7 +19,7 @@ Agent (Codex, Goose, etc.)
 | Component | Where it runs | Role |
 |---|---|---|
 | Agent | Employee laptop | Sends OpenAI-compatible API requests to `127.0.0.1:8787/v1` or MCP JSON-RPC to `127.0.0.1:8787/mcp/{server}` |
-| Relay (`oac-relay`) | Employee laptop | Authenticates employee via OIDC, mints local key, forwards over mTLS (OpenAI and MCP traffic) |
+| Relay (`oac-relay`) | Employee laptop | Authenticates employee via OIDC, requests central-minted token, forwards over mTLS (OpenAI and MCP traffic) |
 | Central proxy (`oac-central`) | Company-hosted server | Manages encrypted provider keys, enforces policies and quotas, forwards to backend; enforces per-tool MCP policies and forwards MCP JSON-RPC to centrally-hosted MCP servers |
 | IdP | Company infrastructure | Authenticates employees via OIDC auth-code + PKCE |
 | Backend | External | OpenAI-compatible API called with a selected provider key |
@@ -40,8 +40,8 @@ Agent (Codex, Goose, etc.)
 |---|---|---|
 | Provider API keys | Central DB ciphertext → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop |
 | MCP server auth headers | Central DB ciphertext (`mcp_servers`) → `Zeroizing` memory during forwarding | **CRITICAL** — never on laptop, never returned by any API |
-| Local API keys (plaintext) | Agent config file (`0600`) | Medium — loopback-only, revocable |
-| Local API key hashes | Relay SQLite (`0600`) | Low — SHA-256 hashes |
+| Central-minted tokens (plaintext) | Agent config file (`0600`) | Medium — loopback-only, revocable at central |
+| Token hashes | Central DB | Low — SHA-256 hashes, constant-time compare |
 | OIDC ID tokens | In transit only (not stored in v1) | Medium — short-lived |
 | User identity (subject, email) | Relay + central DB, audit log | Medium — PII |
 | Audit log | Central DB (append-only) | Medium — tamper-evident |

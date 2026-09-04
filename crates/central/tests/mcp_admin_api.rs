@@ -8,6 +8,7 @@
 //! - `PUT /admin/v1/mcp/servers/{id}` upserts and the path `{id}` wins over
 //!   any body id.
 //! - Get/list/delete round trip, and the auth header is never returned.
+//! - Admin auth: 401 without a bearer token, 403 without the admin group.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -21,7 +22,9 @@ use oac_central::usage::UsageTracker;
 use tower::util::ServiceExt;
 use zeroize::Zeroizing;
 
-async fn setup_router() -> axum::Router {
+/// Sets up the admin router and returns it together with an admin bearer
+/// token and a non-admin bearer token.
+async fn setup_router() -> (axum::Router, String, String) {
     let url = oidc_agent_common::persistence::temp_sqlite_url("admin-mcp");
     let db = oac_central::db::setup(&url).await.expect("db setup");
     let audit = AuditLogger::new(db.clone());
@@ -31,23 +34,59 @@ async fn setup_router() -> axum::Router {
         device_store: DeviceStore::new(db.clone()),
         audit,
         usage_tracker: UsageTracker::new(db.clone()),
-        mcp_manager: oac_central::mcp::McpManager::new(db, Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(db.clone(), Zeroizing::new([7_u8; 32])),
+        token_store: oac_central::token_store::TokenStore::new(db),
         admin_group: "oac-admins".into(),
     };
-    admin::router(state)
+    let admin_token = mint_admin_token(&state).await;
+    let non_admin_token = state
+        .token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "regular-user".into(),
+            issuer: "https://idp.example.com".into(),
+            email: None,
+            display_name: None,
+            groups: Some(r#"["engineering"]"#.into()),
+            identity_id: None,
+            label: "non-admin".into(),
+            expires_at: None,
+        })
+        .await
+        .expect("mint non-admin token");
+    let non_admin_token = non_admin_token.plaintext.to_string();
+    (admin::router(state), admin_token, non_admin_token)
 }
 
-/// Builds an admin-authenticated JSON request.
+/// Mints an admin token via the token store and returns the plaintext.
+async fn mint_admin_token(state: &AdminState) -> String {
+    let minted = state
+        .token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "admin-user".into(),
+            issuer: "https://idp.example.com".into(),
+            email: None,
+            display_name: None,
+            groups: Some(r#"["oac-admins"]"#.into()),
+            identity_id: None,
+            label: "test".into(),
+            expires_at: None,
+        })
+        .await
+        .expect("mint admin token");
+    minted.plaintext.to_string()
+}
+
+/// Builds an admin-authenticated JSON request with a bearer token.
 fn admin_request(
     method: &str,
     uri: &str,
+    token: &str,
     body: Option<serde_json::Value>,
 ) -> Request<axum::body::Body> {
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header("x-oac-user-subject", "admin-user")
-        .header("x-oac-user-groups", r#"["oac-admins"]"#);
+        .header("authorization", format!("Bearer {token}"));
     if let Some(body) = body {
         builder = builder.header("content-type", "application/json");
         builder
@@ -74,14 +113,48 @@ fn server_body(id: &str) -> serde_json::Value {
     })
 }
 
+// --- Auth middleware ---
+
+#[tokio::test]
+async fn admin_requires_bearer_token() {
+    let (router, _admin_token, _non_admin_token) = setup_router().await;
+    let resp = router
+        .oneshot(
+            Request::get("/admin/v1/mcp/servers")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_rejects_non_admin_group() {
+    let (router, _admin_token, non_admin_token) = setup_router().await;
+    let resp = router
+        .oneshot(
+            Request::get("/admin/v1/mcp/servers")
+                .header("authorization", format!("Bearer {non_admin_token}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// --- MCP server CRUD ---
+
 #[tokio::test]
 async fn post_creates_mcp_server_with_body_id() {
-    let router = setup_router().await;
+    let (router, admin_token, _non_admin_token) = setup_router().await;
     let resp = router
         .clone()
         .oneshot(admin_request(
             "POST",
             "/admin/v1/mcp/servers",
+            &admin_token,
             Some(server_body("fs")),
         ))
         .await
@@ -95,14 +168,19 @@ async fn post_creates_mcp_server_with_body_id() {
 
 #[tokio::test]
 async fn post_without_body_id_is_rejected_400() {
-    let router = setup_router().await;
+    let (router, admin_token, _non_admin_token) = setup_router().await;
     // Omitting `id` deserializes to the empty string (serde default) and
     // must be rejected by the handler with 400, not a 500 from a path
     // extractor mismatch.
     let mut body = server_body("fs");
     body.as_object_mut().unwrap().remove("id");
     let resp = router
-        .oneshot(admin_request("POST", "/admin/v1/mcp/servers", Some(body)))
+        .oneshot(admin_request(
+            "POST",
+            "/admin/v1/mcp/servers",
+            &admin_token,
+            Some(body),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -110,7 +188,7 @@ async fn post_without_body_id_is_rejected_400() {
 
 #[tokio::test]
 async fn put_takes_id_from_path_and_ignores_body_id() {
-    let router = setup_router().await;
+    let (router, admin_token, _non_admin_token) = setup_router().await;
 
     // Create via POST first.
     let resp = router
@@ -118,6 +196,7 @@ async fn put_takes_id_from_path_and_ignores_body_id() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/mcp/servers",
+            &admin_token,
             Some(server_body("fs")),
         ))
         .await
@@ -129,7 +208,12 @@ async fn put_takes_id_from_path_and_ignores_body_id() {
     body["name"] = serde_json::json!("GitHub");
     let resp = router
         .clone()
-        .oneshot(admin_request("PUT", "/admin/v1/mcp/servers/gh", Some(body)))
+        .oneshot(admin_request(
+            "PUT",
+            "/admin/v1/mcp/servers/gh",
+            &admin_token,
+            Some(body),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -139,7 +223,12 @@ async fn put_takes_id_from_path_and_ignores_body_id() {
 
     // The original "fs" server is untouched.
     let resp = router
-        .oneshot(admin_request("GET", "/admin/v1/mcp/servers/fs", None))
+        .oneshot(admin_request(
+            "GET",
+            "/admin/v1/mcp/servers/fs",
+            &admin_token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -147,7 +236,7 @@ async fn put_takes_id_from_path_and_ignores_body_id() {
 
 #[tokio::test]
 async fn mcp_server_crud_round_trip() {
-    let router = setup_router().await;
+    let (router, admin_token, _non_admin_token) = setup_router().await;
 
     // Create.
     let resp = router
@@ -155,6 +244,7 @@ async fn mcp_server_crud_round_trip() {
         .oneshot(admin_request(
             "POST",
             "/admin/v1/mcp/servers",
+            &admin_token,
             Some(server_body("fs")),
         ))
         .await
@@ -164,7 +254,12 @@ async fn mcp_server_crud_round_trip() {
     // List contains it.
     let resp = router
         .clone()
-        .oneshot(admin_request("GET", "/admin/v1/mcp/servers", None))
+        .oneshot(admin_request(
+            "GET",
+            "/admin/v1/mcp/servers",
+            &admin_token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -174,7 +269,12 @@ async fn mcp_server_crud_round_trip() {
     // Get by id.
     let resp = router
         .clone()
-        .oneshot(admin_request("GET", "/admin/v1/mcp/servers/fs", None))
+        .oneshot(admin_request(
+            "GET",
+            "/admin/v1/mcp/servers/fs",
+            &admin_token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -184,14 +284,24 @@ async fn mcp_server_crud_round_trip() {
     // Delete → {"deleted": true}, then get → 404.
     let resp = router
         .clone()
-        .oneshot(admin_request("DELETE", "/admin/v1/mcp/servers/fs", None))
+        .oneshot(admin_request(
+            "DELETE",
+            "/admin/v1/mcp/servers/fs",
+            &admin_token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(body_json(resp).await["deleted"], true);
 
     let resp = router
-        .oneshot(admin_request("GET", "/admin/v1/mcp/servers/fs", None))
+        .oneshot(admin_request(
+            "GET",
+            "/admin/v1/mcp/servers/fs",
+            &admin_token,
+            None,
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -199,12 +309,17 @@ async fn mcp_server_crud_round_trip() {
 
 #[tokio::test]
 async fn mcp_server_response_never_contains_auth_header() {
-    let router = setup_router().await;
+    let (router, admin_token, _non_admin_token) = setup_router().await;
     let mut body = server_body("fs");
-    body["auth_header"] = serde_json::json!("Authorization: Bearer super-secret-token");
+    body["auth_header"] = serde_json::json!("Authorization: Bearer ***");
     let resp = router
         .clone()
-        .oneshot(admin_request("POST", "/admin/v1/mcp/servers", Some(body)))
+        .oneshot(admin_request(
+            "POST",
+            "/admin/v1/mcp/servers",
+            &admin_token,
+            Some(body),
+        ))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -217,7 +332,12 @@ async fn mcp_server_response_never_contains_auth_header() {
 
     // Also not on GET.
     let resp = router
-        .oneshot(admin_request("GET", "/admin/v1/mcp/servers/fs", None))
+        .oneshot(admin_request(
+            "GET",
+            "/admin/v1/mcp/servers/fs",
+            &admin_token,
+            None,
+        ))
         .await
         .unwrap();
     let body = body_json(resp).await;

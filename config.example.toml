@@ -16,9 +16,8 @@
 # listen_addr = "127.0.0.1:8787"
 # database_url = "sqlite://~/.oac/relay.db"
 # dev_mode = false
-# # Lifetime of OIDC-login API keys in hours (default 24; range 1-876000;
-# # expiry cannot be disabled).
-# session_ttl_hours = 24
+# Token lifetime is set via the --ttl flag on `oac-relay login`
+# (e.g. --ttl 1d, --ttl 1y). Default: never expires.
 #
 # [oidc]
 # issuer = "https://idp.example.com"

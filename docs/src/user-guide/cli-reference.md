@@ -36,40 +36,45 @@ oac-relay --config config.toml
 ```
 
 - Opens the SQLite DB (runs migrations, enforces `0600` perms).
-- If `dev_mode = true`, auto-mints the dev key `oac_test_key_alice`.
+- If `dev_mode = true`, skips auth checks (central rejects unauthenticated
+  requests via its token store).
 - Binds to `listen_addr` and serves with graceful shutdown.
 
 #### `login`
 
-Run the OIDC auth-code + PKCE flow, mint a local key, and inject it into
-the agent config.
+Run the OIDC auth-code + PKCE flow, request a central-minted token, and
+inject it into the agent config.
 
 ```sh
-oac-relay --config config.toml login
+oac-relay --config config.toml login [--ttl <DURATION>]
 ```
 
+The `--ttl` flag sets the token lifetime (e.g. `--ttl 1d`, `--ttl 12h`,
+`--ttl 1y`, `--ttl 3600s`). Default: never expires (unless the admin
+`max_token_ttl_seconds` backstop clamps it).
+
 Opens a browser to the IdP login page. After successful authentication,
-mints a 256-bit local API key and writes the agent config file with `0600`
-perms. The Codex config (`$CODEX_HOME/config.json`, or
+requests a central-minted token via `POST /v1/tokens` and writes the agent
+config file with `0600` perms. The Codex config (`$CODEX_HOME/config.json`, or
 `~/.codex/config.json`) is used only if `CODEX_HOME` is set or
 `~/.codex/config.json` already exists; otherwise the generic env file
 `~/.oac/agent-env.sh` is written.
 
 #### `logout`
 
-Revoke all local keys for all identities.
+Revoke the current central token.
 
 ```sh
 oac-relay --config config.toml logout
 ```
 
-Revokes every local API key. The agent config file is **not** deleted — the
-key stays in the file but stops working; run `login` again to mint a fresh
-key. Prints `oac-relay: revoked N key(s)`.
+Calls `DELETE /v1/tokens/current` at central to revoke the token. The agent
+config file is **not** deleted — the token stays in the file but stops
+working; run `login` again to mint a fresh token.
 
 #### `print-key`
 
-Re-print the base URL and API key from the agent config file (not the DB).
+Re-print the base URL and token from the agent config file (not the DB).
 The only subcommand that runs without loading a config file.
 
 ```sh
@@ -78,26 +83,15 @@ oac-relay print-key
 
 #### `list-keys`
 
-List all local API keys.
+List all tokens for the current user (via the central token API).
 
 ```sh
 oac-relay --config config.toml list-keys
 ```
 
-Output columns: `id`, `label`, `created_at`, `last_used_at` (or `"never"`).
-
-OIDC-login keys expire after `session_ttl_hours` (24 hours by default). An
-expired key is rejected with a `session_expired` response; run `login` again.
-
-#### `revoke-key`
-
-Revoke a single key by ID.
-
-```sh
-oac-relay --config config.toml revoke-key <KEY_ID>
-```
-
-Prints `oac-relay: revoked key <id>` or `oac-relay: key <id> not found`.
+Calls `GET /v1/tokens` at central with the current bearer token. Output:
+id, label, created_at, expires_at, last_used_at. Never includes the hash
+or plaintext.
 
 #### `activity`
 
@@ -165,7 +159,7 @@ oac-central admin --key <KEY> [--url <URL>] <SUBCOMMAND>
 | Flag | Long | Env var | Default | Description |
 |---|---|---|---|---|
 | url | `--url` | `OAC_ADMIN_URL` | `http://127.0.0.1:8787` | Relay URL |
-| key | `--key` | `OAC_API_KEY` | (required) | Local API key from `oac-relay login` |
+| key | `--key` | `OAC_API_KEY` | (required) | Central token from `oac-relay login` |
 
 `--key` and `--url` belong to `admin` itself and must appear **before** the
 admin subcommand (e.g. `oac-central admin --key K policy-list`). With

@@ -9,4 +9,5 @@ pub mod mcp_server_policy;
 pub mod provider;
 pub mod provider_key;
 pub mod provider_key_access;
+pub mod token;
 pub mod usage_counter;

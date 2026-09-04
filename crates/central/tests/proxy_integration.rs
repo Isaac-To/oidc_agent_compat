@@ -115,6 +115,7 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -126,6 +127,44 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
     });
 
     (addr, reqwest::Client::new())
+}
+
+/// Mints a token via the central proxy's token API endpoint.
+/// Returns the plaintext bearer token.
+async fn mint_token_via_api(
+    client: &reqwest::Client,
+    scheme: &str,
+    addr: &std::net::SocketAddr,
+    subject: &str,
+    groups: Option<&str>,
+    identity_id: Option<&str>,
+) -> String {
+    let url = format!("{scheme}://127.0.0.1:{}/v1/tokens", addr.port());
+    let mut body = serde_json::json!({
+        "subject": subject,
+        "issuer": "https://idp.example.com",
+        "label": "integration-test",
+    });
+    if let Some(g) = groups {
+        body["groups"] = serde_json::json!(g);
+    }
+    if let Some(id) = identity_id {
+        body["identity_id"] = serde_json::json!(id);
+    }
+    let resp = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .expect("mint token request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "token mint must succeed"
+    );
+    let json: serde_json::Value = resp.json().await.expect("json response");
+    json["token"].as_str().expect("token field").to_string()
 }
 
 #[tokio::test]
@@ -283,7 +322,24 @@ async fn streaming_response_records_token_usage_after_stream_completes() {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
+    // Mint a token before moving state into the router.
+    let minted = state
+        .token_store
+        .mint_token(&oac_central::token_store::MintRequest {
+            subject: "stream-user-1".into(),
+            issuer: "https://idp.example.com".into(),
+            email: None,
+            display_name: None,
+            groups: None,
+            identity_id: Some("stream-user-1-identity".into()),
+            label: "stream-test".into(),
+            expires_at: None,
+        })
+        .await
+        .expect("mint");
+    let stream_token = minted.plaintext.to_string();
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -293,8 +349,7 @@ async fn streaming_response_records_token_usage_after_stream_completes() {
         let _ = axum::serve(listener, app).await;
     });
 
-    // Send a streaming request with a relay identity header (dev mode still
-    // attaches the identity when the header is present — required for the
+    // Send a streaming request with a bearer token (required for the
     // usage counters to be incremented).
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
     let body = serde_json::json!({
@@ -304,7 +359,7 @@ async fn streaming_response_records_token_usage_after_stream_completes() {
     });
     let resp = reqwest::Client::new()
         .post(&url)
-        .header("X-OAC-User-Subject", "stream-user-1")
+        .header("authorization", format!("Bearer {stream_token}"))
         .json(&body)
         .send()
         .await
@@ -359,7 +414,7 @@ async fn streaming_response_records_token_usage_after_stream_completes() {
 // ─── Auth middleware tests (non-dev-mode) ──────────────────────────────────
 
 /// Sets up a central proxy in **production mode** (`dev_mode = false`) so the
-/// auth middleware enforces the `X-OAC-User-Subject` header.
+/// auth middleware enforces the bearer token.
 async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -442,6 +497,7 @@ async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -459,12 +515,12 @@ async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
 async fn prod_mode_rejects_request_without_identity_headers() {
     let (addr, client) = setup_prod_central().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
-    // No X-OAC-User-Subject header → must be rejected.
+    // No Authorization bearer token → must be rejected.
     let resp = client.get(&url).send().await.expect("request");
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::UNAUTHORIZED,
-        "prod-mode central must reject requests without X-OAC-User-Subject"
+        "prod-mode central must reject requests without a bearer token"
     );
 }
 
@@ -472,11 +528,11 @@ async fn prod_mode_rejects_request_without_identity_headers() {
 async fn prod_mode_accepts_request_with_identity_headers() {
     let (addr, client) = setup_prod_central().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
+    // Mint a token via the token API.
+    let token = mint_token_via_api(&client, "http", &addr, "user-123", None, Some("id-456")).await;
     let resp = client
         .get(&url)
-        .header("X-OAC-User-Subject", "user-123")
-        .header("X-OAC-User-Email", "user@example.com")
-        .header("X-OAC-Identity-Id", "id-456")
+        .header("authorization", format!("Bearer {token}"))
         .send()
         .await
         .expect("request");
@@ -503,16 +559,11 @@ async fn prod_mode_healthz_bypasses_auth() {
 async fn prod_mode_rejects_empty_subject() {
     let (addr, client) = setup_prod_central().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
-    let resp = client
-        .get(&url)
-        .header("X-OAC-User-Subject", "")
-        .send()
-        .await
-        .expect("request");
+    let resp = client.get(&url).send().await.expect("request");
     assert_eq!(
         resp.status(),
         reqwest::StatusCode::UNAUTHORIZED,
-        "empty X-OAC-User-Subject must be rejected"
+        "missing bearer token must be rejected"
     );
 }
 
@@ -677,6 +728,7 @@ async fn setup_mtls_central() -> SocketAddr {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
 
@@ -737,9 +789,12 @@ async fn mtls_accepts_valid_client_cert() {
 
     let client = build_mtls_client(&ca_path, &client_cert_path, &client_key_path);
     let url = format!("https://127.0.0.1:{}/v1/models", addr.port());
+    // Mint a token for the mTLS test (over the mTLS channel, since the
+    // production-mode central server only accepts HTTPS/mTLS).
+    let token = mint_token_via_api(&client, "https", &addr, "mtls-test-user", None, None).await;
     let resp = client
         .get(&url)
-        .header("X-OAC-User-Subject", "mtls-test-user")
+        .header("authorization", format!("Bearer {token}"))
         .send()
         .await
         .expect("request");
@@ -928,6 +983,7 @@ async fn setup_multi_provider_central(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -949,11 +1005,20 @@ async fn post_completion(
 ) -> (reqwest::StatusCode, String) {
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
     let groups_json = serde_json::json!(groups).to_string();
+    // Mint a token with the given groups.
+    let token = mint_token_via_api(
+        client,
+        "http",
+        addr,
+        "routing-test-user",
+        Some(&groups_json),
+        None,
+    )
+    .await;
     let req = client
         .post(&url)
         .header("Content-Type", "application/json")
-        .header("X-OAC-User-Subject", "routing-test-user")
-        .header("X-OAC-User-Groups", groups_json)
+        .header("authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({
             "model": model,
             "messages": [{"role": "user", "content": "hi"}],
@@ -1070,10 +1135,13 @@ async fn missing_identity_groups_cannot_use_restricted_keys() {
 
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
     let client = reqwest::Client::new();
+    // Mint a token without groups → empty group set → restricted keys
+    // are unavailable.
+    let token = mint_token_via_api(&client, "http", &addr, "groupless-user", None, None).await;
     let resp = client
         .post(&url)
         .header("Content-Type", "application/json")
-        .header("X-OAC-User-Subject", "groupless-user")
+        .header("authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({
             "model": "any-model",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1166,6 +1234,7 @@ async fn key_falls_back_on_upstream_401() {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1178,10 +1247,11 @@ async fn key_falls_back_on_upstream_401() {
 
     let http = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
+    let token = mint_token_via_api(&http, "http", &addr, "fallback-user", None, None).await;
     let resp = http
         .post(&url)
         .header("Content-Type", "application/json")
-        .header("X-OAC-User-Subject", "fallback-user")
+        .header("authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({
             "model": "any-model",
             "messages": [{"role": "user", "content": "hi"}],
@@ -1253,6 +1323,7 @@ async fn no_provider_configured_returns_error_without_key_leak() {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1352,6 +1423,7 @@ async fn token_saver_deduplicates_and_audits() {
             Some(100_000),
             true,
             false,
+            None,
         )
         .await
         .expect("enable saver for engineering");
@@ -1408,6 +1480,7 @@ async fn token_saver_deduplicates_and_audits() {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1430,14 +1503,22 @@ async fn token_saver_deduplicates_and_audits() {
             {"role": "user", "content": "and add tests"}
         ]
     });
+    let token = mint_token_via_api(
+        &http,
+        "http",
+        &addr,
+        "alice",
+        Some(r#"["engineering"]"#),
+        None,
+    )
+    .await;
     let resp = http
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
             addr.port()
         ))
         .header("Content-Type", "application/json")
-        .header("x-oac-user-subject", "alice")
-        .header("x-oac-user-groups", r#"["engineering"]"#)
+        .header("authorization", format!("Bearer {token}"))
         .json(&body)
         .send()
         .await
@@ -1493,14 +1574,15 @@ async fn token_saver_deduplicates_and_audits() {
     );
 
     // A request from a NON-saver group must pass through untouched.
+    let token_sales =
+        mint_token_via_api(&http, "http", &addr, "bob", Some(r#"["sales"]"#), None).await;
     let resp2 = http
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
             addr.port()
         ))
         .header("Content-Type", "application/json")
-        .header("x-oac-user-subject", "bob")
-        .header("x-oac-user-groups", r#"["sales"]"#)
+        .header("authorization", format!("Bearer {token_sales}"))
         .json(&body)
         .send()
         .await
@@ -1574,6 +1656,7 @@ async fn ansi_strip_end_to_end() {
             Some(100_000),
             false,
             true,
+            None,
         )
         .await
         .expect("enable ansi for engineering");
@@ -1630,6 +1713,7 @@ async fn ansi_strip_end_to_end() {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1648,14 +1732,22 @@ async fn ansi_strip_end_to_end() {
             {"role": "user", "content": "plain line"}
         ]
     });
+    let token = mint_token_via_api(
+        &http,
+        "http",
+        &addr,
+        "alice",
+        Some(r#"["engineering"]"#),
+        None,
+    )
+    .await;
     let resp = http
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
             addr.port()
         ))
         .header("Content-Type", "application/json")
-        .header("x-oac-user-subject", "alice")
-        .header("x-oac-user-groups", r#"["engineering"]"#)
+        .header("authorization", format!("Bearer {token}"))
         .json(&body)
         .send()
         .await
@@ -1799,6 +1891,7 @@ async fn rtk_collapse_repeated_lines_end_to_end() {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1825,18 +1918,27 @@ async fn rtk_collapse_repeated_lines_end_to_end() {
             Some(50_000),
             true,
             false,
+            None,
         )
         .await
         .expect("enable collapse for group-collapse");
     let repeated_content = "refactor the parser module\nwarning: unused import detected in src/main.rs\nwarning: unused import detected in src/main.rs\nwarning: unused import detected in src/main.rs\nfinished refactor\nnext: tweak config tests\nwarning: cache miss retriggering build step\nwarning: cache miss retriggering build step";
+    let token = mint_token_via_api(
+        &http,
+        "http",
+        &addr,
+        "alice",
+        Some(r#"["group-collapse"]"#),
+        None,
+    )
+    .await;
     let resp = http
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
             addr.port()
         ))
         .header("Content-Type", "application/json")
-        .header("x-oac-user-subject", "alice")
-        .header("x-oac-user-groups", r#"["group-collapse"]"#)
+        .header("authorization", format!("Bearer {token}"))
         .json(&serde_json::json!({
             "model": "gpt-4",
             "messages": [{"role": "user", "content": repeated_content}]
@@ -1897,17 +1999,26 @@ async fn rtk_collapse_repeated_lines_end_to_end() {
             Some(50_000),
             false,
             false,
+            None,
         )
         .await
         .expect("enable saver (no collapse) for group-nocollapse");
+    let token_nocollapse = mint_token_via_api(
+        &http,
+        "http",
+        &addr,
+        "bob",
+        Some(r#"["group-nocollapse"]"#),
+        None,
+    )
+    .await;
     let resp2 = http
         .post(format!(
             "http://127.0.0.1:{}/v1/chat/completions",
             addr.port()
         ))
         .header("Content-Type", "application/json")
-        .header("x-oac-user-subject", "bob")
-        .header("x-oac-user-groups", r#"["group-nocollapse"]"#)
+        .header("authorization", format!("Bearer {token_nocollapse}"))
         .json(&serde_json::json!({
             "model": "gpt-4",
             "messages": [{"role": "user", "content": repeated_content}]
@@ -2009,6 +2120,7 @@ async fn upstream_failure_releases_request_quota_reservation() {
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
         ),
+        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2028,11 +2140,19 @@ async fn upstream_failure_releases_request_quota_reservation() {
 
     // First request: the forward fails (dead upstream) → 502 with a JSON
     // body that never leaks the provider key.
+    let token = mint_token_via_api(
+        &http,
+        "http",
+        &addr,
+        "quota-fairness-user",
+        Some(r#"["engineering"]"#),
+        None,
+    )
+    .await;
     let resp = http
         .post(&endpoint)
         .header("content-type", "application/json")
-        .header("X-OAC-User-Subject", "quota-fairness-user")
-        .header("X-OAC-User-Groups", r#"["engineering"]"#)
+        .header("authorization", format!("Bearer {token}"))
         .json(&body)
         .send()
         .await
@@ -2064,11 +2184,19 @@ async fn upstream_failure_releases_request_quota_reservation() {
 
     // And the next request is still admitted by the permissions middleware
     // (it fails at the forwarder again, but with 502 — NOT quota 429).
+    let token = mint_token_via_api(
+        &http,
+        "http",
+        &addr,
+        "quota-fairness-user",
+        Some(r#"["engineering"]"#),
+        None,
+    )
+    .await;
     let resp = http
         .post(&endpoint)
         .header("content-type", "application/json")
-        .header("X-OAC-User-Subject", "quota-fairness-user")
-        .header("X-OAC-User-Groups", r#"["engineering"]"#)
+        .header("authorization", format!("Bearer {token}"))
         .json(&body)
         .send()
         .await
@@ -2164,6 +2292,7 @@ async fn rate_limit_429_through_router_carries_retry_after() {
         usage_tracker: oac_central::usage::UsageTracker::new(db.clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
         mcp_manager: oac_central::mcp::McpManager::new(db.clone(), Zeroizing::new([7_u8; 32])),
+        token_store: oac_central::token_store::TokenStore::new(db.clone()),
     };
     let app = proxy::router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2177,10 +2306,12 @@ async fn rate_limit_429_through_router_carries_retry_after() {
     let http = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
 
-    // First request passes (prod mode requires the identity header).
+    // Mint a token for the rate-limit test.
+    let token = mint_token_via_api(&http, "http", &addr, "rate-user", None, None).await;
+    // First request passes (prod mode requires a bearer token).
     let resp = http
         .get(&url)
-        .header("X-OAC-User-Subject", "rate-user")
+        .header("authorization", format!("Bearer {token}"))
         .send()
         .await
         .expect("first");
@@ -2190,7 +2321,7 @@ async fn rate_limit_429_through_router_carries_retry_after() {
     // can back off instead of hammering.
     let resp = http
         .get(&url)
-        .header("X-OAC-User-Subject", "rate-user")
+        .header("authorization", format!("Bearer {token}"))
         .send()
         .await
         .expect("second");

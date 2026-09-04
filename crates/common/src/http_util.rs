@@ -293,4 +293,59 @@ mod tests {
         assert!(is_response_header_stripped("content-length"));
         assert!(!is_response_header_stripped("content-type"));
     }
+
+    #[test]
+    fn sanitize_path_accepts_root() {
+        assert_eq!(sanitize_path("/").unwrap(), "/");
+    }
+
+    #[test]
+    fn sanitize_path_accepts_empty_string() {
+        // An empty path is not unsafe (no traversal, no double slash).
+        assert_eq!(sanitize_path("").unwrap(), "");
+    }
+
+    #[test]
+    fn sanitize_path_rejects_just_backslash() {
+        assert!(sanitize_path(r#"\"#).is_err());
+    }
+
+    #[test]
+    fn sanitize_path_rejects_just_dot_dot() {
+        assert!(sanitize_path("..").is_err());
+    }
+
+    #[test]
+    fn build_forward_headers_returns_empty_for_no_headers() {
+        let headers = HeaderMap::new();
+        let forwarded = build_forward_headers(&headers);
+        assert!(forwarded.is_empty(), "no forwardable headers → empty vec");
+    }
+
+    #[test]
+    fn build_forward_headers_skips_connection_named_forwardable() {
+        // If the Connection header names a forwardable header (e.g.
+        // "content-type"), that header must be stripped even though it is
+        // on the allowlist.
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("connection", "content-type".parse().unwrap());
+        let forwarded = build_forward_headers(&headers);
+        let names: Vec<&str> = forwarded.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            !names.contains(&"content-type"),
+            "a header named in Connection must be stripped"
+        );
+    }
+
+    #[test]
+    fn extract_model_handles_null_model() {
+        let body = br#"{"model":null,"messages":[]}"#;
+        assert_eq!(extract_model(body), None);
+    }
+
+    #[test]
+    fn extract_model_handles_empty_body() {
+        assert_eq!(extract_model(b""), None);
+    }
 }

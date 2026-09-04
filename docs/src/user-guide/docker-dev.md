@@ -41,7 +41,7 @@ All users are in the `oac-dev` Keycloak realm:
 > The dev realm defines **no groups or roles** — the last-name column is
 > just profile data. Group-based policies cannot be exercised through real
 > OIDC logins in this stack; `dev.sh` performs admin operations directly
-> with dev-mode identity headers instead.
+> with a dev token (minted via `POST /v1/tokens` with the `oac-admins` group) instead.
 
 Keycloak admin console: `http://localhost:8080/admin` (admin / admin).
 
@@ -78,23 +78,24 @@ docker compose -f docker/dev/docker-compose.yml run --rm goose session
 
 ## Manual requests
 
-The relay auto-mints a dev key `oac_test_key_alice` when `dev_mode = true`.
-Use it for manual curl:
+`docker/dev.sh up` mints a dev token via `POST /v1/tokens` at central
+after the stack starts, and writes it to `/tmp/oac-dev-token`. Use it for
+manual curl:
 
 ```sh
 # List models:
-curl -H 'Authorization: Bearer oac_test_key_alice' \
+curl -H 'Authorization: Bearer $DEV_TOKEN' \
   http://127.0.0.1:8787/v1/models
 
 # Chat completion (non-streaming):
 curl -X POST http://127.0.0.1:8787/v1/chat/completions \
-  -H 'Authorization: Bearer oac_test_key_alice' \
+  -H 'Authorization: Bearer $DEV_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{"model":"mock-gpt-4","messages":[{"role":"user","content":"hello"}]}'
 
 # Chat completion (SSE streaming):
 curl -X POST http://127.0.0.1:8787/v1/chat/completions \
-  -H 'Authorization: Bearer oac_test_key_alice' \
+  -H 'Authorization: Bearer $DEV_TOKEN' \
   -H 'Content-Type: application/json' \
   -d '{"model":"mock-gpt-4","messages":[{"role":"user","content":"hello"}],"stream":true}'
 ```
@@ -125,8 +126,8 @@ OAC_OIDC_CLIENT_SECRET="oac-relay-secret" \
 ```
 
 A browser opens to the Keycloak login page. Sign in as a test user. The
-relay validates the ID token, mints a local key, and injects it into
-`~/.oac/agent-env.sh`.
+relay validates the ID token, requests a central-minted token via
+`POST /v1/tokens`, and injects it into `~/.oac/agent-env.sh`.
 
 The login-test config uses `dev_mode = true`, a separate SQLite DB
 (`/tmp/oac-relay-login-test.db`), and listens on `127.0.0.1:8788` to
@@ -136,11 +137,11 @@ avoid port conflicts with the Docker relay on `:8787`.
 
 The dev central config enables the admin API with
 `admin_group = "oac-admins"`. The dev Keycloak realm defines no groups, so
-no real login can satisfy that check — instead, `dev.sh up` calls the admin
-API directly with dev-mode identity headers
-(`X-OAC-User-Subject: dev-admin`, `X-OAC-User-Groups: ["oac-admins"]`) to
-register the mock provider and its key. To exercise group-based admin
-access end-to-end, add groups and a group mapper to the realm first.
+no real login can satisfy that check — instead, `dev.sh up` mints a dev
+token via `POST /v1/tokens` with the `oac-admins` group, then uses it as a
+bearer token for admin API calls to register the mock provider and its key.
+To exercise group-based admin access end-to-end, add groups and a group
+mapper to the realm first.
 
 For reference, the admin CLI form (against a stack where your login's
 groups include the admin group — note `--key` precedes the subcommand):
@@ -152,8 +153,8 @@ export OAC_API_KEY="<key from oac-relay login>"
 ./target/release/oac-central admin --key $OAC_API_KEY audit-query
 ```
 
-In the stock dev stack (no groups in the realm) these calls return `403`;
-`dev.sh` covers admin operations with the dev-mode headers shown above.
+In the stock dev stack, `dev.sh` mints the dev token with the `oac-admins`
+group directly in the token record, so admin API calls succeed.
 
 See [Admin API](./admin-api.md) for all endpoints.
 
@@ -164,10 +165,10 @@ The test command verifies:
 1. Relay healthz → 200.
 2. Central healthz → 200.
 3. Mock backend `/v1/models` → 200.
-4. Relay `/v1/models` without key → 401.
-5. Relay `/v1/models` with invalid key → 401.
+4. Relay `/v1/models` without Authorization → 401.
+5. Relay `/v1/models` with invalid token → 401.
 6. Relay with non-loopback Host header → 400 (DNS rebinding defense).
-7. Full chain `GET /v1/models` with dev key → 200, contains `mock-gpt-4`.
+7. Full chain `GET /v1/models` with dev token → 200, contains `mock-gpt-4`.
 8. Full chain `POST /v1/chat/completions` (non-streaming) → 200, contains
    `Mock response to: hello`.
 9. Full chain `POST /v1/chat/completions` (SSE streaming) →

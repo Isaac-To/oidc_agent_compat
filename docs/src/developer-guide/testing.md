@@ -31,18 +31,18 @@ test individual functions and modules in isolation. Run them as part of
 ## Relay integration tests (`crates/relay/tests/proxy_integration.rs`)
 
 12 tests. `setup_test_relay()` spins up a mock central proxy (Axum) + relay
-proxy (in-process, `dev_mode=true`). Mints a key for identity `user123`.
+proxy (in-process, `dev_mode=true`). Mints a central token for identity `user123` via the token API.
 
 | Test | Description | Assertion |
 |---|---|---|
 | `healthz_returns_ok` | GET `/healthz` | 200 OK |
 | `rejects_request_without_authorization` | GET `/v1/models` no auth | 401 |
 | `rejects_request_with_invalid_key` | GET `/v1/models` with `oac_invalid` | 401 |
-| `expired_session_returns_relogin_error_and_removes_key` | Key past `expires_at` | `session_expired` error; key deleted from DB |
+| `expired_session_returns_relogin_error_and_removes_key` | Token past `expires_at` | rejected; token deleted from central DB |
 | `rejects_non_loopback_host` | GET with `Host: evil.example.com` | 400 (DNS rebinding) |
 | `forwards_get_request_with_valid_key` | GET `/v1/models` with valid key | 200, `data` array |
 | `forwards_post_request_with_valid_key` | POST `/v1/chat/completions` with valid key | 200, `choices` array |
-| `forwards_verified_identity_and_request_id_headers` | Forwarded request headers | `x-oac-user-subject`/`x-oac-request-id` reach central |
+| `forwards_verified_identity_and_request_id_headers` | Forwarded request headers | `Authorization`/`x-oac-request-id` reach central |
 | `streams_sse_response_unchanged` | SSE passthrough | `text/event-stream` body streams verbatim |
 | `unreachable_central_returns_typed_502_json` | Central down | typed JSON `502` error |
 | `build_client_uses_mtls_in_production_mode` | Client builder | rustls client cert configured when `dev_mode=false` |
@@ -68,14 +68,14 @@ proxy (in-process, `dev_mode=true`). Mints a key for identity `user123`.
 ### Production mode tests
 
 `setup_prod_central()` — same but `dev_mode=false` (auth middleware
-enforces `X-OAC-User-Subject`).
+enforces bearer token verification via TokenStore.
 
 | Test | Description | Assertion |
 |---|---|---|
-| `prod_mode_rejects_request_without_identity_headers` | GET no `X-OAC-User-Subject` | 401 |
-| `prod_mode_accepts_request_with_identity_headers` | GET with identity headers | 200 |
+| `prod_mode_rejects_request_without_identity_headers` | GET no `Authorization` bearer | 401 |
+| `prod_mode_accepts_request_with_identity_headers` | GET with valid bearer token | 200 |
 | `prod_mode_healthz_bypasses_auth` | GET `/healthz` no auth | 200 (healthz bypasses auth) |
-| `prod_mode_rejects_empty_subject` | GET with `X-OAC-User-Subject: ""` | 401 |
+| `prod_mode_rejects_empty_subject` | GET with empty bearer token | 401 |
 
 ### mTLS tests
 
@@ -85,7 +85,7 @@ with client cert required.
 
 | Test | Description | Assertion |
 |---|---|---|
-| `mtls_accepts_valid_client_cert` | GET with valid client cert + `X-OAC-User-Subject` | 200 |
+| `mtls_accepts_valid_client_cert` | GET with valid client cert + bearer token | 200 |
 | `mtls_rejects_connection_without_client_cert` | GET with plain HTTPS client (no client cert) | TLS handshake fails |
 
 ### Provider-routing tests (mock `RecordingBackend`)
@@ -113,7 +113,7 @@ with client cert required.
 
 ### `crates/central/tests/provider_admin_api.rs` — 13 tests
 
-Admin auth (401 without identity headers; 403 for non-admin group; 200
+Admin auth (401 without bearer token; 403 for non-admin group; 200
 for members), provider CRUD round-trip, invalid-payload rejection (4xx),
 404s for missing provider/key, exactly-one-default enforcement,
 key-metadata-only responses, key 404s, invalid key bodies, cascade key
@@ -128,7 +128,7 @@ full server CRUD round-trip; responses never contain the `auth_header`.
 ## E2E tests (`tests/e2e/tests/e2e.rs`)
 
 16 tests. `setup_full_system()` spins up in-process: mock backend + central
-+ relay, all wired together. Mints a key for identity `e2e-user`
++ relay, all wired together. Mints a central token for identity `e2e-user`
 (`e2e@example.com`).
 
 ### Basic chain tests
@@ -181,7 +181,7 @@ per-server endpoint, the combined hub, and the relay tunnel:
 |---|---|---|
 | `allowed_tool_is_forwarded_and_audited` | Per-server `tools/call` in policy | forwarded; audit `mcp_*` fields set |
 | `denied_tool_returns_403_and_is_denied_in_audit` | `tools/call` outside policy | 403 `-32001`; audit decision `denied` |
-| `relay_requires_auth_for_mcp` | `/mcp*` without local key | 401 |
+| `relay_requires_auth_for_mcp` | `/mcp*` without Authorization header | 401 |
 | `per_server_endpoint_allows_non_tools_call_methods_under_specific_policy` | `initialize`/`tools/list` with ≥1 allowed tool | forwarded |
 | `per_server_endpoint_denies_non_tools_call_methods_under_deny_all_policy` | Non-`tools/call` with deny-all policy | 403 |
 | `relay_activity_records_mcp_metadata` | Activity log for `/mcp*` | `mcp_server`/`mcp_tool`/`mcp_method` recorded |
@@ -191,7 +191,7 @@ per-server endpoint, the combined hub, and the relay tunnel:
 | `hub_tools_call_routes_to_correct_upstream` | `server__tool` call | routed to the right mock server |
 | `hub_tools_call_denies_tool_outside_policy` | Hub call outside policy | 403 |
 | `hub_tools_call_rejects_unprefixed_tool_name` | Missing `server__` prefix | 400 `-32602` |
-| `hub_requires_auth` | `/mcp` without local key | 401 |
+| `hub_requires_auth` | `/mcp` without Authorization header | 401 |
 
 ## Test cert generation
 

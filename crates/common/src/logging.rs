@@ -580,4 +580,55 @@ mod tests {
             "re-initializing the subscriber must be a visible error"
         );
     }
+
+    #[test]
+    fn redact_json_fields_redacts_bearer_field() {
+        let input = r#"{"bearer":"tok-abc","model":"gpt-4"}"#;
+        let output = redact_json_fields(input);
+        assert!(output.contains(r#""bearer":"[REDACTED]""#), "{output}");
+        assert!(!output.contains("tok-abc"), "{output}");
+    }
+
+    #[test]
+    fn redact_json_fields_redacts_master_key_field() {
+        let input = r#"{"master_key":"mk-xyz","model":"gpt-4"}"#;
+        let output = redact_json_fields(input);
+        assert!(output.contains(r#""master_key":"[REDACTED]""#), "{output}");
+        assert!(!output.contains("mk-xyz"), "{output}");
+    }
+
+    #[test]
+    fn redact_json_fields_preserves_fields_with_sensitive_substring() {
+        // A key like "model" that does not match any sensitive field name
+        // must survive even if its value contains "key".
+        let input = r#"{"model":"key-gpt-4"}"#;
+        let output = redact_json_fields(input);
+        assert_eq!(output, input, "non-sensitive key must survive");
+    }
+
+    #[test]
+    fn redact_json_fields_redacts_all_documented_sensitive_fields() {
+        // Every field in SENSITIVE_FIELDS must be redacted.
+        for field in SENSITIVE_FIELDS {
+            let input = format!(r#"{{"{field}":"secret-value","model":"gpt-4"}}"#);
+            let output = redact_json_fields(&input);
+            assert!(
+                output.contains("[REDACTED]"),
+                "field '{field}' must be redacted: {output}"
+            );
+            assert!(
+                !output.contains("secret-value"),
+                "value for '{field}' must be redacted: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_json_fields_handles_mixed_case_sensitive_field() {
+        // The field match is case-insensitive.
+        let input = r#"{"Api_Key":"sk-123","model":"gpt-4"}"#;
+        let output = redact_json_fields(input);
+        assert!(output.contains("[REDACTED]"), "{output}");
+        assert!(!output.contains("sk-123"), "{output}");
+    }
 }

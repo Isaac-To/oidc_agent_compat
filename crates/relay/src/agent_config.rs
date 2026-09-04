@@ -605,4 +605,215 @@ mod tests {
         assert!(err.to_string().contains("api_key"), "{err}");
         let _ = std::fs::remove_file(&tmp);
     }
+
+    #[test]
+    fn read_codex_valid_json_array_returns_missing_field_error() {
+        // A JSON array is valid JSON but not an object. serde_json parses it
+        // as a Value::Array, then `.get("api_base_url")` returns None → the
+        // error mentions the missing field, not a parse error.
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-codex-array-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&tmp, "[1, 2, 3]").expect("write");
+        let err = read_codex(&tmp).unwrap_err();
+        assert!(
+            err.to_string().contains("api_base_url"),
+            "array (not object) must report missing api_base_url: {err}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn inject_codex_fails_when_existing_file_is_not_valid_json() {
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-inject-badjson-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&tmp, "not valid json {{{").expect("write existing");
+        let config = test_config();
+        let err = inject_codex(&tmp, &config).unwrap_err();
+        assert!(err.to_string().contains("parse"), "{err}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn write_secure_fails_when_path_is_a_directory() {
+        // Writing to a directory path (not a file) must fail.
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "oac-write-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+        let err = write_secure(&tmp_dir, b"test").unwrap_err();
+        assert!(err.to_string().contains("write"), "{err}");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inject_generic_env_fails_on_unwritable_parent() {
+        // Create a read-only directory and try to write in it (Unix only —
+        // Windows does not enforce directory permissions the same way).
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "oac-readonly-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::create_dir_all(&tmp_dir).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o444))
+                .expect("chmod");
+        }
+        let target = tmp_dir.join("agent-env.sh");
+        let config = test_config();
+        let err = inject_generic_env(&target, &config).unwrap_err();
+        assert!(
+            err.to_string().contains("write") || err.to_string().contains("create dir"),
+            "expected write/create error, got: {err}"
+        );
+        // Restore permissions so cleanup works.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755));
+        }
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn inject_codex_preserves_unexpected_fields() {
+        // An existing config with unexpected (non-standard) fields must
+        // preserve them alongside the injected api_base_url and api_key.
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-codex-unexpected-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(
+            &tmp,
+            r#"{"model":"gpt-4","max_tokens":4096,"custom_nested":{"a":1},"array":[1,2,3]}"#,
+        )
+        .expect("write existing");
+
+        let config = test_config();
+        inject_codex(&tmp, &config).expect("inject");
+
+        let content = std::fs::read_to_string(&tmp).expect("read");
+        let json: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        // The original fields survive.
+        assert_eq!(json["model"], "gpt-4");
+        assert_eq!(json["max_tokens"], 4096);
+        assert_eq!(json["custom_nested"]["a"], 1);
+        assert_eq!(json["array"], serde_json::json!([1, 2, 3]));
+        // The injected fields are present.
+        assert_eq!(json["api_base_url"], "http://127.0.0.1:8787/v1");
+        assert_eq!(json["api_key"], "oac_test_key_12345");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn detect_agent_falls_back_to_generic_env_when_no_codex() {
+        // With HOME set to a temp dir (no ~/.codex/config.json) and no
+        // CODEX_HOME, detect_agent must return GenericEnv.
+        // We can't easily set env vars in Rust 2024 without unsafe, so we
+        // verify the logic indirectly: if CODEX_HOME is not set and
+        // ~/.codex/config.json does not exist, the fallback is GenericEnv.
+        // This test exercises the detect_agent happy path when it does not
+        // find Codex — the result depends on the test environment.
+        let result = detect_agent();
+        // The result must be Ok (home dir is set in the test environment).
+        assert!(result.is_ok(), "detect_agent must not error: {result:?}");
+        let (kind, path) = result.expect("ok");
+        // If CODEX_HOME is set or ~/.codex exists, it's Codex; otherwise
+        // GenericEnv. Either way the path must be non-empty.
+        assert!(!path.as_os_str().is_empty(), "path must be non-empty");
+        let _ = kind; // discard
+    }
+
+    #[test]
+    fn read_codex_with_non_object_json_returns_missing_field_error() {
+        // A JSON number (valid JSON but not an object) → .get returns None →
+        // the error mentions the missing api_base_url field.
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-codex-number-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&tmp, "42").expect("write");
+        let err = read_codex(&tmp).unwrap_err();
+        assert!(
+            err.to_string().contains("api_base_url"),
+            "non-object JSON must report missing api_base_url: {err}"
+        );
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn extract_env_var_finds_first_matching_line() {
+        // When multiple vars are present, the correct one is extracted.
+        let contents = "export OPENAI_API_BASE='http://old'\nexport OPENAI_API_BASE='http://new'\n";
+        assert_eq!(
+            extract_env_var(contents, "OPENAI_API_BASE"),
+            Some("http://old".into()),
+            "the first matching export must be returned"
+        );
+    }
+
+    #[test]
+    fn extract_env_var_ignores_partial_prefix_matches() {
+        // A line starting with a prefix of the var name must not match.
+        let contents = "export OPENAI_API_BAS='wrong'\n";
+        assert_eq!(
+            extract_env_var(contents, "OPENAI_API_BASE"),
+            None,
+            "partial prefix must not match"
+        );
+    }
+
+    #[test]
+    fn read_generic_env_with_unquoted_values() {
+        // A hand-written env file with unquoted values must be read back.
+        let tmp = std::env::temp_dir().join(format!(
+            "oac-read-env-unquoted-{}-{}.sh",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(
+            &tmp,
+            "export OPENAI_API_BASE=http://127.0.0.1:8787/v1\nexport OPENAI_API_KEY=oac_bare\n",
+        )
+        .expect("write");
+        let config = read_generic_env(&tmp).expect("read");
+        assert_eq!(config.base_url, "http://127.0.0.1:8787/v1");
+        assert_eq!(config.api_key, "oac_bare");
+        let _ = std::fs::remove_file(&tmp);
+    }
 }

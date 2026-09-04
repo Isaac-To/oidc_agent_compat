@@ -14,7 +14,8 @@ revoked per-person. This project solves that by inserting two components
 between the agent and the backend:
 
 1. A **laptop relay** that authenticates the employee via OIDC and holds
-  only a short-lived local key.
+  only a central-minted token (the relay is a dumb forwarder; central
+  verifies every token).
 2. A **central proxy** that manages encrypted provider keys and enforces
   group-based authorization policies.
 
@@ -31,8 +32,8 @@ Agent → [127.0.0.1 relay] → mTLS → [central proxy] → [OpenAI-compatible 
 | Component | Where it runs | What it does |
 |---|---|---|
 | **Agent** (Codex, Goose, etc.) | Employee laptop | Sends OpenAI-compatible API requests to `127.0.0.1:8787/v1` |
-| **Relay** (`oac-relay`) | Employee laptop | Authenticates employee via OIDC, mints a local API key, injects it into the agent config, forwards traffic over mTLS to the central proxy |
-| **Central proxy** (`oac-central`) | Company-hosted server | Manages encrypted provider keys, validates relay-forwarded identity, enforces group-based policies and quotas, forwards to the backend with SSE streaming |
+| **Relay** (`oac-relay`) | Employee laptop | Authenticates employee via OIDC, requests a central-minted token, injects it into the agent config, forwards traffic over mTLS to the central proxy |
+| **Central proxy** (`oac-central`) | Company-hosted server | Mints and verifies opaque tokens (TokenStore), manages encrypted provider keys, enforces group-based policies and quotas, forwards to the backend with SSE streaming |
 | **IdP** (Okta, Keycloak, etc.) | Company infrastructure | Authenticates employees via OIDC auth-code + PKCE |
 | **Backend** (OpenAI, Azure OpenAI, etc.) | External | OpenAI-compatible API that the central proxy calls with a selected provider key |
 
@@ -61,9 +62,10 @@ Agent → [127.0.0.1 relay] → mTLS → [central proxy] → [OpenAI-compatible 
   mutations record the verified administrator subject.
 - **Device revocation** — relay identities are auto-registered on their
   first request; administrators can revoke or reinstate them.
-- **Session expiry** — OIDC-login keys expire after 24 hours by default;
-  configure `session_ttl_hours` to change the lifetime (expiry cannot be
-  disabled).
+- **Token lifetime** — central-minted tokens have a lifetime set by the
+  `--ttl` flag on `oac-relay login` (e.g. `--ttl 1d`, `--ttl 1y`). Default:
+  never expires. An admin can set `max_token_ttl_seconds` on group policies
+  as a backstop.
 - **No `unsafe` code** — `#![forbid(unsafe_code)]` across all crates.
 
 ## Remaining deployment-specific work
@@ -73,5 +75,5 @@ deferred:
 
 - External KMS backends for the provider encryption key and distributed
   Redis-backed rate limiting for horizontally scaled central instances.
-- OIDC refresh-token storage is intentionally not implemented; sessions use
-  local API-key expiry and require `oac-relay login` after expiry.
+- OIDC refresh-token storage is intentionally not implemented; tokens are
+  minted by central and expire per the `--ttl` flag (default: never).

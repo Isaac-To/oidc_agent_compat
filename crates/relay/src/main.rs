@@ -38,18 +38,18 @@ enum Command {
     /// Start the relay server (default).
     Serve,
     /// Authenticate via OIDC and configure the agent.
-    Login,
-    /// Revoke all local API keys (does not delete the agent config file).
+    Login {
+        /// Optional token lifetime (e.g. '1d', '12h', '1y', '3600s').
+        /// If omitted, the token never expires (unless the admin backstop clamps it).
+        #[arg(long)]
+        ttl: Option<String>,
+    },
+    /// Revoke the current central token (does not delete the agent config file).
     Logout,
     /// Re-display the local API key from the agent config file.
     PrintKey,
-    /// List all local API keys.
+    /// List all tokens for the current user (via the central token API).
     ListKeys,
-    /// Revoke a local API key by its ID.
-    RevokeKey {
-        /// The key ID to revoke.
-        key_id: String,
-    },
     /// Show recent relay request activity.
     Activity {
         /// Maximum number of entries to display (default 20, max 1000).
@@ -76,11 +76,10 @@ fn main() -> Result<()> {
         let config = load_config(&cli.config)?;
         match cli.command.unwrap_or(Command::Serve) {
             Command::Serve => serve(config).await,
-            Command::Login => login_cmd(config).await,
+            Command::Login { ttl } => login_cmd(config, ttl.as_deref()).await,
             Command::Logout => logout_cmd(config).await,
             Command::PrintKey => print_key_cmd().await,
             Command::ListKeys => list_keys_cmd(config).await,
-            Command::RevokeKey { key_id } => revoke_key_cmd(config, &key_id).await,
             Command::Activity { limit } => activity_cmd(config, limit).await,
         }
     })
@@ -95,67 +94,25 @@ fn load_config(path: &std::path::Path) -> Result<RelayConfig> {
 }
 
 /// Starts the relay server.
+///
+/// The relay is a dumb forwarder: it does not seed a local dev key. In dev
+/// mode, the relay skips auth entirely (central rejects unauthenticated
+/// requests via its token store). The dev stack should run `oac-relay login`
+/// (or use a pre-minted central dev token).
 async fn serve(config: RelayConfig) -> Result<()> {
     let db = db::setup(&config.database_url).await?;
-    let key_store = KeyStore::new(db);
-
-    // In dev mode, seed a well-known API key so containerized agents (e.g.
-    // Goose) and manual curl can authenticate without running the full OIDC
-    // login flow. This is strictly gated behind `dev_mode` (false in all
-    // production configs) and is idempotent across restarts.
-    if config.dev_mode {
-        seed_dev_key(&key_store).await?;
-    }
-
-    proxy::serve(config, key_store).await
-}
-
-/// The well-known plaintext dev API key minted when `dev_mode` is enabled.
-///
-/// This matches the `OPENAI_API_KEY` configured for the Goose service in
-/// `docker/dev/docker-compose.yml`. It is intentionally a constant (not random)
-/// so the dev stack works out of the box without any login step.
-const DEV_KEY_PLAINTEXT: &str = "oac_test_key_alice";
-
-/// Seeds the well-known dev API key into the key store if it is not already
-/// present. Idempotent: skips minting if a key with the dev plaintext already
-/// verifies.
-///
-/// # Security
-///
-/// Only called when `config.dev_mode` is true. The key value is never logged.
-///
-/// # Errors
-///
-/// Returns [`Error`] if the identity upsert, verification, or mint fails.
-async fn seed_dev_key(key_store: &KeyStore) -> Result<()> {
-    // Upsert a dev identity (issuer "dev", subject "dev-user").
-    let identity = key_store
-        .upsert_identity("dev", "dev-user", None, Some("Dev User"), None)
-        .await?;
-
-    // Only mint if the dev key is not already present (idempotent across
-    // restarts — avoids duplicate rows).
-    let existing = key_store.verify_key(DEV_KEY_PLAINTEXT).await?;
-    if matches!(existing, oac_relay::keystore::KeyVerification::Invalid) {
-        key_store
-            .mint_dev_key(&identity.id, "dev", DEV_KEY_PLAINTEXT)
-            .await?;
-        tracing::info!(
-            "dev_mode: seeded well-known dev API key (label 'dev') for identity {}",
-            identity.id
-        );
-    } else {
-        tracing::debug!("dev_mode: dev API key already present, skipping seed");
-    }
-    Ok(())
+    proxy::serve(config, db).await
 }
 
 /// Runs the OIDC login flow and configures the agent.
-async fn login_cmd(config: RelayConfig) -> Result<()> {
+///
+/// The optional `ttl` string is parsed into seconds and forwarded to the
+/// central token API. See [`login::parse_ttl_to_seconds`] for supported
+/// formats.
+async fn login_cmd(config: RelayConfig, ttl: Option<&str>) -> Result<()> {
     let db = db::setup(&config.database_url).await?;
     let key_store = KeyStore::new(db);
-    let result = login::run_login(&config, &key_store).await?;
+    let result = login::run_login(&config, &key_store, ttl).await?;
     println!(
         "oac-relay: login successful for {} (agent config written to {})",
         result.email.as_deref().unwrap_or(&result.subject),
@@ -164,25 +121,47 @@ async fn login_cmd(config: RelayConfig) -> Result<()> {
     Ok(())
 }
 
-/// Revokes local keys and clears the agent config.
+/// Revokes the current central token via `DELETE /v1/tokens/current`.
+///
+/// Reads the current token from the agent config file, sends it to the
+/// central proxy for revocation, and prints the result. The local identity
+/// DB is left intact (the user's OIDC identity record stays for
+/// convenience).
 async fn logout_cmd(config: RelayConfig) -> Result<()> {
-    let db = db::setup(&config.database_url).await?;
-    let key_store = KeyStore::new(db);
-    use sea_orm::EntityTrait;
-    let identities = oac_relay::entity::identity::Entity::find()
-        .all(&key_store.db)
+    // 1. Read the current token from the agent config file.
+    let agent_config = oac_relay::agent_config::read().map_err(|e| {
+        oidc_agent_common::error::Error::Config(format!(
+            "not logged in — run oac-relay login first ({e})"
+        ))
+    })?;
+
+    // 2. Build the central HTTP client (handles mTLS in production).
+    let client = proxy::forward::build_client(&config)?;
+
+    // 3. Call DELETE /v1/tokens/current with Authorization Bearer.
+    let url = format!("{}/v1/tokens/current", config.central.url);
+    let resp = client
+        .delete(&url)
+        .header("authorization", format!("Bearer {}", agent_config.api_key))
+        .send()
         .await
-        .map_err(|e| oidc_agent_common::error::Error::Database(format!("load identities: {e}")))?;
-    let mut total = 0;
-    for ident in identities {
-        total += key_store
-            .revoke_all_keys(&ident.id)
-            .await
-            .map(|n| n as usize)
-            .unwrap_or(0);
+        .map_err(|e| {
+            oidc_agent_common::error::Error::Http(format!("failed to revoke token at central: {e}"))
+        })?;
+
+    let status = resp.status();
+    if status == axum::http::StatusCode::NO_CONTENT {
+        println!("oac-relay: token revoked at central");
+        Ok(())
+    } else if status == axum::http::StatusCode::NOT_FOUND {
+        println!("oac-relay: token not found at central (already revoked or expired)");
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        Err(oidc_agent_common::error::Error::Http(format!(
+            "failed to revoke token at central: {status} {body}"
+        )))
     }
-    println!("oac-relay: revoked {total} key(s)");
-    Ok(())
 }
 
 /// Re-displays the local API key from the agent config file.
@@ -198,49 +177,61 @@ async fn print_key_cmd() -> Result<()> {
     Ok(())
 }
 
-/// Lists all local API keys (key ID, label, creation time, last used).
+/// Lists all tokens for the current user via `GET /v1/tokens`.
+///
+/// Reads the current token from the agent config file, calls the central
+/// token API with it as the bearer, and displays the returned list: id,
+/// label, created_at, expires_at, last_used_at.
 async fn list_keys_cmd(config: RelayConfig) -> Result<()> {
-    let db = oac_relay::db::setup(&config.database_url).await?;
-    let key_store = oac_relay::keystore::KeyStore::new(db);
+    // 1. Read the current token from the agent config file.
+    let agent_config = oac_relay::agent_config::read().map_err(|e| {
+        oidc_agent_common::error::Error::Config(format!(
+            "not logged in — run oac-relay login first ({e})"
+        ))
+    })?;
 
-    use oac_relay::entity::api_key;
-    use sea_orm::EntityTrait;
-    let keys = api_key::Entity::find()
-        .all(&key_store.db)
+    // 2. Build the central HTTP client (handles mTLS in production).
+    let client = proxy::forward::build_client(&config)?;
+
+    // 3. Call GET /v1/tokens with Authorization Bearer.
+    let url = format!("{}/v1/tokens", config.central.url);
+    let resp = client
+        .get(&url)
+        .header("authorization", format!("Bearer {}", agent_config.api_key))
+        .send()
         .await
-        .map_err(|e| oidc_agent_common::error::Error::Database(format!("list keys: {e}")))?;
+        .map_err(|e| {
+            oidc_agent_common::error::Error::Http(format!("failed to list tokens at central: {e}"))
+        })?;
 
-    if keys.is_empty() {
-        println!("oac-relay: no keys found");
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(oidc_agent_common::error::Error::Http(format!(
+            "failed to list tokens at central: {status} {body}"
+        )));
+    }
+
+    // 4. Parse and display the returned list.
+    let items: Vec<serde_json::Value> = resp.json().await.map_err(|e| {
+        oidc_agent_common::error::Error::Http(format!("failed to parse token list: {e}"))
+    })?;
+
+    if items.is_empty() {
+        println!("oac-relay: no tokens found");
         return Ok(());
     }
 
-    println!("oac-relay: {} key(s):", keys.len());
-    for key in &keys {
+    println!("oac-relay: {} token(s):", items.len());
+    for item in &items {
+        let id = item["id"].as_str().unwrap_or("-");
+        let label = item["label"].as_str().unwrap_or("-");
+        let created_at = item["created_at"].as_str().unwrap_or("-");
+        let expires_at = item["expires_at"].as_str().unwrap_or("never");
+        let last_used_at = item["last_used_at"].as_str().unwrap_or("never");
         println!(
-            "  id={} label={} created={} last_used={}",
-            key.id,
-            key.label,
-            key.created_at,
-            key.last_used_at
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "never".into()),
+            "  id={id} label={label} created={created_at} expires={expires_at} last_used={last_used_at}"
         );
-    }
-    Ok(())
-}
-
-/// Revokes a local API key by its ID (deletes it from the database).
-async fn revoke_key_cmd(config: RelayConfig, key_id: &str) -> Result<()> {
-    let db = oac_relay::db::setup(&config.database_url).await?;
-    let key_store = oac_relay::keystore::KeyStore::new(db);
-
-    let revoked = key_store.revoke_key(key_id).await?;
-
-    if revoked {
-        println!("oac-relay: revoked key {key_id}");
-    } else {
-        println!("oac-relay: key {key_id} not found");
     }
     Ok(())
 }

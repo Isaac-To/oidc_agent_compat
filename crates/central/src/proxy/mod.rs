@@ -23,6 +23,7 @@ pub mod mcp_hub;
 pub mod mcp_permissions;
 pub mod permissions;
 pub mod rate_limit;
+pub mod tokens;
 
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
@@ -58,6 +59,8 @@ pub struct AppState {
     pub price_table: PriceTable,
     /// The runtime MCP server registry.
     pub mcp_manager: crate::mcp::McpManager,
+    /// The central token store (zero-trust opaque tokens).
+    pub token_store: crate::token_store::TokenStore,
 }
 
 impl AppState {
@@ -132,6 +135,26 @@ pub fn router(state: AppState) -> Router {
         .with_state(state.clone());
     proxy_router = proxy_router.merge(mcp_router);
 
+    // Token API routes: mint (mTLS-authenticated, no middleware), revoke and
+    // list (bearer-token auth, handled in the handlers). These are mounted
+    // WITHOUT the existing auth middleware — they use their own auth.
+    let token_router = Router::new()
+        .route(
+            "/v1/tokens",
+            axum::routing::post(tokens::mint_token_handler),
+        )
+        .route(
+            "/v1/tokens/current",
+            axum::routing::delete(tokens::revoke_current_handler),
+        )
+        .route(
+            "/v1/tokens",
+            axum::routing::get(tokens::list_tokens_handler),
+        )
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
+        .with_state(state.clone());
+    proxy_router = proxy_router.merge(token_router);
+
     // Merge the admin API router if an admin config is present.
     if let Some(admin_group) = state.admin_group() {
         let admin_state = crate::admin::AdminState {
@@ -141,6 +164,7 @@ pub fn router(state: AppState) -> Router {
             audit: state.audit.clone(),
             usage_tracker: state.usage_tracker.clone(),
             mcp_manager: state.mcp_manager.clone(),
+            token_store: state.token_store.clone(),
             admin_group: admin_group.to_string(),
         };
         proxy_router = proxy_router.merge(crate::admin::router(admin_state));
@@ -180,6 +204,7 @@ pub async fn serve(
     let provider_store = ProviderStore::new(audit.db().clone(), encryption_key.clone());
     let mcp_manager = crate::mcp::McpManager::new(audit.db().clone(), encryption_key);
     let usage_tracker = UsageTracker::new(audit.db().clone());
+    let token_store = crate::token_store::TokenStore::new(audit.db().clone());
     let price_table = config
         .pricing
         .as_ref()
@@ -219,6 +244,7 @@ pub async fn serve(
         usage_tracker,
         price_table,
         mcp_manager,
+        token_store,
     };
     let app = router(state);
 
@@ -314,9 +340,10 @@ mod tests {
             rate_limiter: None,
             policy_store: PolicyStore::new(db.clone()),
             device_store: DeviceStore::new(db.clone()),
-            usage_tracker: UsageTracker::new(db),
+            usage_tracker: UsageTracker::new(db.clone()),
             price_table: crate::pricing::PriceTable::empty(),
             mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+            token_store: crate::token_store::TokenStore::new(db),
         }
     }
 
@@ -329,10 +356,26 @@ mod tests {
     #[tokio::test]
     async fn router_mounts_admin_api_when_admin_config_present() {
         let state = test_state(Some(admin_group_config())).await;
+        // Mint an admin token (subject in the admin group).
+        let minted = state
+            .token_store
+            .mint_token(&crate::token_store::MintRequest {
+                subject: "alice".into(),
+                issuer: "https://idp.example.com".into(),
+                email: None,
+                display_name: None,
+                groups: Some(r#"["oac-admins"]"#.into()),
+                identity_id: None,
+                label: "test".into(),
+                expires_at: None,
+            })
+            .await
+            .expect("mint token");
+        let admin_token = minted.plaintext.to_string();
         let app = router(state);
 
-        // Without relay-forwarded identity headers the admin API must
-        // refuse (401), proving the routes + auth middleware are mounted.
+        // Without a bearer token the admin API must refuse (401), proving
+        // the routes + auth middleware are mounted.
         let resp = app
             .clone()
             .oneshot(
@@ -345,13 +388,12 @@ mod tests {
             .expect("router");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // With an admin identity the same route answers 200.
+        // With an admin bearer token the same route answers 200.
         let resp = app
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/admin/v1/group-policies")
-                    .header("x-oac-user-subject", "alice")
-                    .header("x-oac-user-groups", r#"["oac-admins"]"#)
+                    .header("authorization", format!("Bearer {admin_token}"))
                     .body(axum::body::Body::empty())
                     .expect("request"),
             )
@@ -371,7 +413,6 @@ mod tests {
             .oneshot(
                 axum::http::Request::builder()
                     .uri("/admin/v1/group-policies")
-                    .header("x-oac-user-subject", "alice")
                     .body(axum::body::Body::empty())
                     .expect("request"),
             )

@@ -102,3 +102,103 @@ pub fn parse_request_body(body: &[u8]) -> Result<Option<JsonRpcRequest>, crate::
         _ => Ok(None),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_valid_request() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let req = parse_request_body(body).expect("parse").expect("some");
+        assert_eq!(req.jsonrpc, "2.0");
+        assert_eq!(req.method, "tools/list");
+        assert_eq!(req.id, Some(serde_json::json!(1)));
+    }
+
+    #[test]
+    fn parse_notification_has_no_id() {
+        let body = br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+        let req = parse_request_body(body).expect("parse").expect("some");
+        assert!(req.is_notification());
+        assert!(req.id.is_none());
+    }
+
+    #[test]
+    fn parse_batch_returns_batch_unsupported() {
+        let body = br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#;
+        let err = parse_request_body(body).unwrap_err();
+        assert!(matches!(err, crate::McpError::BatchUnsupported));
+    }
+
+    #[test]
+    fn parse_scalar_returns_none() {
+        assert!(parse_request_body(b"42").expect("parse").is_none());
+        assert!(parse_request_body(b"null").expect("parse").is_none());
+        assert!(parse_request_body(b"true").expect("parse").is_none());
+        assert!(
+            parse_request_body(b"\"a string\"")
+                .expect("parse")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_wrong_jsonrpc_version_errors() {
+        let body = br#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#;
+        assert!(parse_request_body(body).is_err());
+    }
+
+    #[test]
+    fn parse_missing_method_errors() {
+        // An object with jsonrpc+id but no method fails to deserialize as
+        // JsonRpcRequest → Malformed error.
+        let body = br#"{"jsonrpc":"2.0","id":1}"#;
+        assert!(parse_request_body(body).is_err());
+    }
+
+    #[test]
+    fn parse_empty_object_errors() {
+        // {} deserializes (method defaults to empty string? No — method is
+        // required). It must error as Malformed.
+        let body = b"{}";
+        assert!(parse_request_body(body).is_err());
+    }
+
+    #[test]
+    fn parse_invalid_utf8_errors() {
+        assert!(parse_request_body(&[0xff, 0xfe, 0x00]).is_err());
+    }
+
+    #[test]
+    fn parse_invalid_json_errors() {
+        assert!(parse_request_body(b"{not json}").is_err());
+    }
+
+    #[test]
+    fn jsonrpc_response_serializes_with_skip_none() {
+        let resp = JsonRpcResponse {
+            jsonrpc: "2.0".into(),
+            id: serde_json::json!(1),
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+        };
+        let s = serde_json::to_string(&resp).expect("serialize");
+        assert!(s.contains("\"result\""));
+        assert!(!s.contains("\"error\""));
+    }
+
+    #[test]
+    fn jsonrpc_error_obj_round_trips() {
+        let err = JsonRpcErrorObj {
+            code: -32601,
+            message: "method not found".into(),
+            data: Some(serde_json::json!("extra")),
+        };
+        let s = serde_json::to_string(&err).expect("serialize");
+        let back: JsonRpcErrorObj = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back.code, -32601);
+        assert_eq!(back.message, "method not found");
+        assert!(back.data.is_some());
+    }
+}

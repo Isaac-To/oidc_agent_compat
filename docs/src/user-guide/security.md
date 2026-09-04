@@ -17,8 +17,10 @@ memory. They are:
 - Never in a config file or admin API response.
 - Never in an error response.
 
-The relay holds only a **local API key** — a 256-bit random value that is
-SHA-256 hashed at rest and only valid on your laptop's loopback interface.
+The relay holds only a **central-minted opaque token** — a 256-bit random
+value (`oac_` prefix) that is SHA-256 hashed at rest in central's database and
+verified by the central proxy on every request. The relay is a dumb forwarder;
+it does not verify tokens locally.
 
 ## OIDC authentication
 
@@ -33,10 +35,10 @@ against your enterprise IdP (Okta, Keycloak, etc.):
 - **ID token validation** — the relay verifies the ID token signature
   (alg pinned to RS256 or ES256), issuer, audience, expiry, nonce, and
   `at_hash`.
-- **No token storage** — in v1, tokens are not stored; you re-login when
-  they expire.
-- **Local session expiry** — keys created by OIDC login expire after 24 hours
-  by default; configure `session_ttl_hours` for a different lifetime.
+- **Token lifetime** — central-minted tokens have a lifetime set by the
+  `--ttl` flag on `oac-relay login` (e.g. `--ttl 1d`, `--ttl 1y`). Default:
+  never expires. An admin can set `max_token_ttl_seconds` on group policies as
+  a backstop that rejects tokens older than the limit at request time.
 
 ## mTLS between relay and central
 
@@ -53,17 +55,17 @@ company CA:
 > (CN=`OAC Test CA`) — these are for dev/testing only and must not be used
 > in a production deployment that handles real API keys.
 
-## Local key security
+## Token security
 
-- **256-bit keys** generated from the OS CSPRNG (`OsRng`).
-- **SHA-256 hashed at rest** — only the hash is stored in the local SQLite
-  DB, never the plaintext.
-- **Constant-time comparison** — key verification uses
+- **256-bit tokens** generated from the OS CSPRNG (`OsRng`) at central.
+- **SHA-256 hashed at rest** — only the hash is stored in central's database,
+  never the plaintext.
+- **Constant-time comparison** — token verification uses
   `subtle::ConstantTimeEq` with no early return (prevents timing attacks,
   CWE-208).
-- **`0600` file permissions** — the SQLite DB and agent config file are
-  readable only by you.
-- **`Zeroizing` memory** — plaintext keys are held in `Zeroizing` wrappers
+- **`0600` file permissions** — the agent config file (containing the
+  plaintext token) is readable only by you.
+- **`Zeroizing` memory** — plaintext tokens are held in `Zeroizing` wrappers
   that zero memory on drop.
 
 ## DNS rebinding defense
@@ -117,10 +119,11 @@ fields (`authorization`, `api_key`, `client_secret`, `token`,
 
 ## What you should do
 
-- **Keep your laptop secure** — the local API key is only as safe as your
-  laptop. Use disk encryption and screen lock.
-- **Log out when done** — run `oac-relay logout` to revoke all local keys.
+- **Keep your laptop secure** — the central token in your agent config is
+  only as safe as your laptop. Use disk encryption and screen lock.
+- **Log out when done** — run `oac-relay logout` to revoke your token at
+  central (`DELETE /v1/tokens/current`).
 - **Don't share your agent config file** — `~/.codex/config.json` or
-  `~/.oac/agent-env.sh` contains your local API key.
+  `~/.oac/agent-env.sh` contains your central token.
 - **Report suspicious activity** — check the audit log via the admin API
   if you suspect unauthorized use.

@@ -3,21 +3,33 @@
 //! These tests spin up a mock central proxy (a simple Axum server) and the
 //! relay proxy, then verify:
 //! - Host header validation (DNS rebinding defense)
-//! - Auth middleware (401 without key, 200 with valid key)
+//! - Auth middleware pass-through (relay does NOT verify; central does)
 //! - Hop-by-hop header stripping
 //! - Non-streaming forwarding
 //! - SSE streaming passthrough
+//!
+//! The relay is a dumb forwarder: it checks that a bearer token is present
+//! (non-dev mode) but does NOT verify it. Central is the sole verification
+//! authority (zero-trust). In dev_mode, the relay skips auth entirely.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::net::SocketAddr;
 
 use axum::Router;
-use oac_relay::keystore::KeyStore;
 use oac_relay::proxy;
 
 /// Sets up a test relay with a mock central proxy.
-async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String, KeyStore) {
+///
+/// Returns the relay address, an HTTP client, a bearer token (a dummy
+/// non-empty string — the relay does not verify it), and the relay's
+/// database connection (for activity log queries).
+async fn setup_test_relay() -> (
+    SocketAddr,
+    reqwest::Client,
+    String,
+    sea_orm::DatabaseConnection,
+) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -33,18 +45,11 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String, KeyStore) {
     ));
     let url = format!("sqlite://{}?mode=rwc", tmp.display());
     let db = oac_relay::db::setup(&url).await.expect("db setup");
-    let key_store = KeyStore::new(db);
 
-    // Mint a key for testing.
-    let ident = key_store
-        .upsert_identity("https://idp.example.com", "user123", None, None, None)
-        .await
-        .expect("identity");
-    let minted = key_store
-        .mint_key(&ident.id, "test", None)
-        .await
-        .expect("mint");
-    let key = minted.plaintext.to_string();
+    // The relay does not mint or verify local keys. The bearer token is a
+    // dummy — the relay only checks it's present (non-dev mode). Central
+    // verifies it.
+    let key = "oac_dummy_token_relay_does_not_verify".to_string();
 
     // Set up a mock central proxy.
     let mock_central = Router::new()
@@ -84,7 +89,6 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String, KeyStore) {
             client_key_path: "/client.key".into(),
         },
         dev_mode: true,
-        session_ttl_hours: None,
     };
 
     let client = proxy::forward::build_client(&config).expect("client");
@@ -93,18 +97,17 @@ async fn setup_test_relay() -> (SocketAddr, reqwest::Client, String, KeyStore) {
         .expect("bind relay");
     let relay_addr = relay_listener.local_addr().expect("relay addr");
     let state = proxy::AppState {
-        key_store: key_store.clone(),
         config: config.clone(),
         client,
         listen_addr: relay_addr,
-        activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
+        activity: oac_relay::activity::ActivityLogger::new(db.clone()),
     };
     let app = proxy::router(state);
     tokio::spawn(async {
         let _ = axum::serve(relay_listener, app).await;
     });
 
-    (relay_addr, reqwest::Client::new(), key, key_store)
+    (relay_addr, reqwest::Client::new(), key, db)
 }
 
 #[tokio::test]
@@ -116,79 +119,13 @@ async fn healthz_returns_ok() {
 }
 
 #[tokio::test]
-async fn rejects_request_without_authorization() {
+async fn dev_mode_allows_request_without_authorization() {
+    // In dev_mode, the relay skips auth entirely. Central will reject
+    // unauthenticated requests (but the mock central here does not check).
     let (addr, client, _, _) = setup_test_relay().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client.get(&url).send().await.expect("request");
-    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn rejects_request_with_invalid_key() {
-    let (addr, client, _, _) = setup_test_relay().await;
-    let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
-    let resp = client
-        .get(&url)
-        .header("Authorization", "Bearer oac_invalid")
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn expired_session_returns_relogin_error_and_removes_key() {
-    let (addr, client, _, key_store) = setup_test_relay().await;
-    let identity = key_store
-        .upsert_identity("https://idp.example.com", "expired-user", None, None, None)
-        .await
-        .expect("identity");
-    let expires_at = oidc_agent_common::time_util::now_utc() - time::Duration::minutes(1);
-    let minted = key_store
-        .mint_key(&identity.id, "expired", Some(expires_at))
-        .await
-        .expect("expired key");
-    let expired_key = minted.plaintext.to_string();
-
-    let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
-    let response = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {expired_key}"))
-        .send()
-        .await
-        .expect("request");
-    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
-    assert_eq!(
-        response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("application/json")
-    );
-    let body: serde_json::Value = response.json().await.expect("JSON error body");
-    assert_eq!(body["error"]["type"], "session_expired");
-    assert_eq!(
-        body["error"]["message"],
-        "session expired; run `oac-relay login` to re-authenticate"
-    );
-
-    // The middleware's first verification must delete the stale row, so a
-    // replay is indistinguishable from an unknown credential.
-    let replay = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {expired_key}"))
-        .send()
-        .await
-        .expect("replay request");
-    assert_eq!(replay.status(), reqwest::StatusCode::UNAUTHORIZED);
-    let remaining = key_store
-        .verify_key(&expired_key)
-        .await
-        .expect("replay verification");
-    assert!(matches!(
-        remaining,
-        oac_relay::keystore::KeyVerification::Invalid
-    ));
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
 #[tokio::test]
@@ -205,7 +142,7 @@ async fn rejects_non_loopback_host() {
 }
 
 #[tokio::test]
-async fn forwards_get_request_with_valid_key() {
+async fn forwards_get_request_with_bearer() {
     let (addr, client, key, _) = setup_test_relay().await;
     let url = format!("http://127.0.0.1:{}/v1/models", addr.port());
     let resp = client
@@ -220,7 +157,7 @@ async fn forwards_get_request_with_valid_key() {
 }
 
 #[tokio::test]
-async fn forwards_post_request_with_valid_key() {
+async fn forwards_post_request_with_bearer() {
     let (addr, client, key, _) = setup_test_relay().await;
     let url = format!("http://127.0.0.1:{}/v1/chat/completions", addr.port());
     let body = serde_json::json!({
@@ -243,21 +180,25 @@ async fn forwards_post_request_with_valid_key() {
     );
 }
 
-// ─── Identity forwarding (what central authorizes on) ─────────────────────
+// ─── Bearer forwarding (zero-trust) ───────────────────────────────────────
 
 #[tokio::test]
-async fn forwards_verified_identity_and_request_id_headers() {
+async fn forwards_authorization_header_to_central() {
     use std::sync::{Arc, Mutex};
 
-    // A mock central that records the headers it received.
-    let seen: Arc<Mutex<Vec<axum::http::HeaderMap>>> = Arc::new(Mutex::new(Vec::new()));
+    // A mock central that records the Authorization header it received.
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let captured = seen.clone();
     let mock_central = Router::new().route(
         "/v1/models",
         axum::routing::get(move |headers: axum::http::HeaderMap| {
             let captured = captured.clone();
             async move {
-                captured.lock().expect("lock").push(headers);
+                let auth = headers
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                captured.lock().expect("lock").push(auth);
                 r#"{"data": [{"id": "gpt-4"}]}"#
             }
         }),
@@ -270,10 +211,8 @@ async fn forwards_verified_identity_and_request_id_headers() {
         let _ = axum::serve(mock_listener, mock_central).await;
     });
 
-    // Relay DB + an identity WITH email and groups so we can assert they
-    // are forwarded (not just the subject).
     let tmp = std::env::temp_dir().join(format!(
-        "oac-identity-fwd-{}-{}.db",
+        "oac-bearer-fwd-{}-{}.db",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -282,22 +221,6 @@ async fn forwards_verified_identity_and_request_id_headers() {
     ));
     let url = format!("sqlite://{}?mode=rwc", tmp.display());
     let db = oac_relay::db::setup(&url).await.expect("db setup");
-    let key_store = KeyStore::new(db);
-    let ident = key_store
-        .upsert_identity(
-            "https://idp.example.com",
-            "alice",
-            Some("alice@example.com"),
-            None,
-            Some(r#"["engineering","ai-users"]"#),
-        )
-        .await
-        .expect("identity");
-    let minted = key_store
-        .mint_key(&ident.id, "test", None)
-        .await
-        .expect("mint");
-    let key = minted.plaintext.to_string();
 
     let config = oidc_agent_common::config::RelayConfig {
         listen_addr: "127.0.0.1:0".parse().expect("addr"),
@@ -316,98 +239,41 @@ async fn forwards_verified_identity_and_request_id_headers() {
             client_key_path: "/client.key".into(),
         },
         dev_mode: true,
-        session_ttl_hours: None,
     };
     let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind relay");
     let relay_addr = relay_listener.local_addr().expect("relay addr");
     let state = proxy::AppState {
-        key_store: key_store.clone(),
         config: config.clone(),
         client: proxy::forward::build_client(&config).expect("client"),
         listen_addr: relay_addr,
-        activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
+        activity: oac_relay::activity::ActivityLogger::new(db),
     };
     let app = proxy::router(state);
     tokio::spawn(async {
         let _ = axum::serve(relay_listener, app).await;
     });
 
+    let token = "oac_test_central_token";
     let resp = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{}/v1/models", relay_addr.port()))
-        .header("Authorization", format!("Bearer {key}"))
-        .header("X-Attacker-User-Subject", "mallory")
+        .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
         .expect("request");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
 
+    // The relay must forward the bearer token to central unchanged.
     let headers = {
         let guard = seen.lock().expect("lock");
         guard.last().expect("central received the request").clone()
     };
-    // The relay must forward ONLY the auth-middleware-verified identity…
     assert_eq!(
-        headers
-            .get("x-oac-user-subject")
-            .and_then(|v| v.to_str().ok()),
-        Some("alice"),
-        "the verified subject must be forwarded"
+        headers.as_deref(),
+        Some(format!("Bearer {token}").as_str()),
+        "the bearer token must be forwarded to central for zero-trust re-verification"
     );
-    // …never a client-supplied spoof (the attacker header must not leak
-    // through — build_forward_headers only forwards the allowlist).
-    assert_eq!(
-        headers
-            .get("x-attacker-user-subject")
-            .and_then(|v| v.to_str().ok()),
-        None,
-        "client-supplied identity headers must never be forwarded"
-    );
-    assert_eq!(
-        headers
-            .get("x-oac-user-email")
-            .and_then(|v| v.to_str().ok()),
-        Some("alice@example.com")
-    );
-    assert_eq!(
-        headers
-            .get("x-oac-user-groups")
-            .and_then(|v| v.to_str().ok()),
-        Some(r#"["engineering","ai-users"]"#)
-    );
-    assert_eq!(
-        headers
-            .get("x-oac-identity-id")
-            .and_then(|v| v.to_str().ok()),
-        Some(ident.id.as_str()),
-        "central needs the identity id for device/audit correlation"
-    );
-    // A request id must be generated for end-to-end correlation.
-    let request_id = headers
-        .get("x-oac-request-id")
-        .and_then(|v| v.to_str().ok())
-        .expect("x-oac-request-id must be forwarded");
-    assert!(!request_id.is_empty());
-    assert_eq!(request_id.len(), 36, "request id is a UUID: {request_id}");
-    // The local API key must NOT be forwarded to central.
-    assert!(
-        headers.get("authorization").is_none(),
-        "the local bearer key must be stripped, not forwarded"
-    );
-
-    // The activity log must record the request with the same request id.
-    use sea_orm::EntityTrait;
-    let rows = oac_relay::entity::relay_activity_log::Entity::find()
-        .all(&key_store.db)
-        .await
-        .expect("activity rows");
-    let row = rows.last().expect("activity row recorded");
-    assert_eq!(row.identity_id, ident.id);
-    assert_eq!(row.method, "GET");
-    assert_eq!(row.endpoint, "/v1/models");
-    assert_eq!(row.central_status, Some(200));
-    assert_eq!(row.request_id.as_deref(), Some(request_id));
 }
 
 // ─── SSE streaming passthrough ─────────────────────────────────────────────
@@ -417,7 +283,7 @@ async fn streams_sse_response_unchanged() {
     let sse_body = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n",
         "data: {\"choices\":[],\"usage\":{\"total_tokens\":7}}\n\n",
-        "data: [DONE]\n\n",
+        "\n",
     );
     let mock_central = Router::new().route(
         "/v1/chat/completions",
@@ -446,16 +312,6 @@ async fn streams_sse_response_unchanged() {
     ));
     let url = format!("sqlite://{}?mode=rwc", tmp.display());
     let db = oac_relay::db::setup(&url).await.expect("db setup");
-    let key_store = KeyStore::new(db);
-    let ident = key_store
-        .upsert_identity("https://idp.example.com", "sse-user", None, None, None)
-        .await
-        .expect("identity");
-    let minted = key_store
-        .mint_key(&ident.id, "test", None)
-        .await
-        .expect("mint");
-    let key = minted.plaintext.to_string();
 
     let config = oidc_agent_common::config::RelayConfig {
         listen_addr: "127.0.0.1:0".parse().expect("addr"),
@@ -474,18 +330,16 @@ async fn streams_sse_response_unchanged() {
             client_key_path: "/client.key".into(),
         },
         dev_mode: true,
-        session_ttl_hours: None,
     };
     let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind relay");
     let relay_addr = relay_listener.local_addr().expect("relay addr");
     let state = proxy::AppState {
-        key_store: key_store.clone(),
         config: config.clone(),
         client: proxy::forward::build_client(&config).expect("client"),
         listen_addr: relay_addr,
-        activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
+        activity: oac_relay::activity::ActivityLogger::new(db),
     };
     let app = proxy::router(state);
     tokio::spawn(async {
@@ -497,7 +351,7 @@ async fn streams_sse_response_unchanged() {
             "http://127.0.0.1:{}/v1/chat/completions",
             relay_addr.port()
         ))
-        .header("Authorization", format!("Bearer {key}"))
+        .header("Authorization", "Bearer oac_test_token")
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
             "model": "gpt-4",
@@ -536,16 +390,6 @@ async fn unreachable_central_returns_typed_502_json() {
     ));
     let url = format!("sqlite://{}?mode=rwc", tmp.display());
     let db = oac_relay::db::setup(&url).await.expect("db setup");
-    let key_store = KeyStore::new(db);
-    let ident = key_store
-        .upsert_identity("https://idp.example.com", "offline-user", None, None, None)
-        .await
-        .expect("identity");
-    let minted = key_store
-        .mint_key(&ident.id, "test", None)
-        .await
-        .expect("mint");
-    let key = minted.plaintext.to_string();
 
     let config = oidc_agent_common::config::RelayConfig {
         listen_addr: "127.0.0.1:0".parse().expect("addr"),
@@ -565,18 +409,16 @@ async fn unreachable_central_returns_typed_502_json() {
             client_key_path: "/client.key".into(),
         },
         dev_mode: true,
-        session_ttl_hours: None,
     };
     let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind relay");
     let relay_addr = relay_listener.local_addr().expect("relay addr");
     let state = proxy::AppState {
-        key_store: key_store.clone(),
         config: config.clone(),
         client: proxy::forward::build_client(&config).expect("client"),
         listen_addr: relay_addr,
-        activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
+        activity: oac_relay::activity::ActivityLogger::new(db.clone()),
     };
     let app = proxy::router(state);
     tokio::spawn(async {
@@ -585,7 +427,7 @@ async fn unreachable_central_returns_typed_502_json() {
 
     let resp = reqwest::Client::new()
         .get(format!("http://127.0.0.1:{}/v1/models", relay_addr.port()))
-        .header("Authorization", format!("Bearer {key}"))
+        .header("Authorization", "Bearer oac_test_token")
         .send()
         .await
         .expect("request");
@@ -606,7 +448,7 @@ async fn unreachable_central_returns_typed_502_json() {
     // status) so users/admins can see the outage from the relay side.
     use sea_orm::EntityTrait;
     let rows = oac_relay::entity::relay_activity_log::Entity::find()
-        .all(&key_store.db)
+        .all(&db)
         .await
         .expect("activity rows");
     let row = rows.last().expect("failure recorded");
@@ -661,7 +503,6 @@ async fn build_client_uses_mtls_in_production_mode() {
         },
         // Production mode: the client MUST be built with mTLS.
         dev_mode: false,
-        session_ttl_hours: None,
     };
     let client = proxy::forward::build_client(&config).expect("mTLS client builds");
     // The builder enforces https-only in prod mode; a plain-http target
@@ -691,7 +532,6 @@ async fn serve_boots_and_shuts_down_gracefully_on_sigterm() {
     ));
     let url = format!("sqlite://{}?mode=rwc", tmp.display());
     let db = oac_relay::db::setup(&url).await.expect("db setup");
-    let key_store = KeyStore::new(db);
 
     let config = oidc_agent_common::config::RelayConfig {
         listen_addr: "127.0.0.1:0".parse().expect("addr"),
@@ -710,10 +550,9 @@ async fn serve_boots_and_shuts_down_gracefully_on_sigterm() {
             client_key_path: "/client.key".into(),
         },
         dev_mode: true,
-        session_ttl_hours: None,
     };
 
-    let task = tokio::spawn(async move { proxy::serve(config, key_store).await });
+    let task = tokio::spawn(async move { proxy::serve(config, db).await });
 
     // Let the server bind and install the graceful-shutdown signal handler.
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

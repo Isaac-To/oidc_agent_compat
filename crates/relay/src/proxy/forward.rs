@@ -1,9 +1,9 @@
 //! Forward handler for the relay proxy.
 //!
 //! This handler receives authenticated agent requests and forwards them to
-//! the central proxy over mTLS. It strips hop-by-hop headers, replaces the
-//! incoming `Authorization` (local key) with the user token, and passes
-//! streaming responses through as raw bytes.
+//! the central proxy over mTLS. It strips hop-by-hop headers, forwards the
+//! incoming `Authorization` header (the agent's bearer token) unchanged, and
+//! passes streaming responses through as raw bytes.
 //!
 //! # Security
 //!
@@ -15,6 +15,10 @@
 //! - **Raw byte SSE passthrough** for streaming responses.
 //! - **SSRF prevention**: the central URL comes from config only; the request
 //!   path is sanitized (rejects `..`, `//`, absolute URLs).
+//! - **Zero-trust**: the relay forwards the `Authorization` header to
+//!   central, which verifies the token via its token store. The relay does
+//!   NOT inject identity headers upstream — central extracts the identity
+//!   from the token itself.
 
 use axum::Router;
 use axum::body::Body;
@@ -99,13 +103,14 @@ pub async fn proxy_handler(
     let endpoint = request.uri().path().to_string();
 
     // Extract the verified identity (attached by auth middleware) before
-    // the request body is consumed.
+    // the request body is consumed. In the zero-trust model, all identity
+    // fields are None on the relay side.
     let identity = request
         .extensions()
         .get::<super::auth::VerifiedIdentity>()
         .cloned();
 
-    let result = forward_request(&state, request, identity.as_ref(), &request_id).await;
+    let result = forward_request(&state, request, &request_id).await;
 
     // Record a relay-side activity log entry (best-effort; log on failure).
     let latency_ms = start.elapsed().as_millis() as i64;
@@ -115,8 +120,8 @@ pub async fn proxy_handler(
     };
     if let Some(ident) = &identity {
         let entry = crate::activity::RelayActivityEntry {
-            identity_id: ident.identity_id.clone(),
-            key_id: ident.key_id.clone(),
+            identity_id: ident.identity_id.clone().unwrap_or_default(),
+            key_id: ident.key_id.clone().unwrap_or_default(),
             method,
             endpoint,
             model,
@@ -156,17 +161,16 @@ pub async fn proxy_handler(
 ///
 /// # Security
 ///
-/// The relay replaces the incoming `Authorization` (the local API key) with
-/// the verified user identity, forwarded as `X-OAC-User-Subject`,
-/// `X-OAC-User-Email`, `X-OAC-User-Groups`, and `X-OAC-Identity-Id` headers.
-/// The central proxy uses these for audit logging and authorization. The
-/// local key is never forwarded to the central proxy.
+/// The relay forwards the incoming `Authorization` header (the agent's
+/// bearer token) to central unchanged. Central verifies the token via its
+/// token store (zero-trust) and extracts the identity from it. The relay
+/// does NOT inject `X-OAC-*` identity headers — it no longer knows the
+/// identity.
 ///
 /// Returns the response and the parsed model (for activity logging).
 async fn forward_request(
     state: &AppState,
     request: axum::extract::Request,
-    identity: Option<&super::auth::VerifiedIdentity>,
     request_id: &str,
 ) -> Result<(Response<Body>, Option<String>)> {
     let (parts, body) = request.into_parts();
@@ -195,27 +199,11 @@ async fn forward_request(
         upstream = upstream.header(name, value);
     }
 
-    // Forward the verified user identity to the central proxy for audit
-    // logging and authorization. These headers are set by the relay ONLY
-    // from the auth-middleware-verified identity (never from the incoming
-    // request headers), so a client cannot spoof them.
-    if let Some(ident) = identity {
-        if let Ok(v) = HeaderValue::from_str(&ident.subject) {
-            upstream = upstream.header(identity::HEADER_USER_SUBJECT, v);
-        }
-        if let Some(email) = &ident.email {
-            if let Ok(v) = HeaderValue::from_str(email) {
-                upstream = upstream.header(identity::HEADER_USER_EMAIL, v);
-            }
-        }
-        if let Some(groups) = &ident.groups {
-            if let Ok(v) = HeaderValue::from_str(groups) {
-                upstream = upstream.header(identity::HEADER_USER_GROUPS, v);
-            }
-        }
-        if let Ok(v) = HeaderValue::from_str(&ident.identity_id) {
-            upstream = upstream.header(identity::HEADER_IDENTITY_ID, v);
-        }
+    // Forward the incoming Authorization header (the agent's bearer token) to
+    // the central proxy. The central proxy verifies it via its token store
+    // (zero-trust). The relay does not verify the token locally.
+    if let Some(auth) = parts.headers.get("authorization") {
+        upstream = upstream.header("authorization", auth);
     }
 
     // Forward the request ID for end-to-end correlation.
@@ -287,7 +275,6 @@ mod tests {
 
         let url = oidc_agent_common::persistence::temp_sqlite_url("fwd-routes");
         let db = crate::db::setup(&url).await.expect("db");
-        let key_store = crate::keystore::KeyStore::new(db.clone());
         let config = RelayConfig {
             listen_addr: "127.0.0.1:0".parse().expect("addr"),
             database_url: "sqlite://test.db".into(),
@@ -305,10 +292,8 @@ mod tests {
                 client_key_path: "/c.key".into(),
             },
             dev_mode: true,
-            session_ttl_hours: None,
         };
         let state = AppState {
-            key_store,
             config: config.clone(),
             client: build_client(&config).expect("client"),
             listen_addr: "127.0.0.1:8787".parse().expect("addr"),

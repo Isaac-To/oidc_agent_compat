@@ -502,4 +502,120 @@ mod tests {
         let pt = decrypt(&key, &ct, &nonce).expect("decrypt");
         assert_eq!(pt.as_slice(), b"secret".as_slice());
     }
+
+    #[tokio::test]
+    async fn server_with_no_auth_header_resolves_without_auth() {
+        // A server created with auth_header: None must resolve to a
+        // ResolvedMcpServer with auth_header: None (not an error).
+        let mgr = setup_manager(Zeroizing::new([7u8; 32])).await;
+        mgr.upsert_server(&McpServerInput {
+            id: "no-auth".into(),
+            name: "NoAuth".into(),
+            base_url: "https://mcp.example.com".into(),
+            enabled: true,
+            auth_header: None,
+        })
+        .await
+        .expect("upsert");
+        let info = mgr.get_server("no-auth").await.expect("get").expect("some");
+        assert!(!info.has_auth, "no-auth server must report has_auth=false");
+        let resolved = mgr
+            .resolve_server("no-auth")
+            .await
+            .expect("resolve")
+            .expect("some");
+        assert!(resolved.auth_header.is_none(), "resolved auth must be None");
+        assert_eq!(resolved.base_url, "https://mcp.example.com");
+    }
+
+    #[tokio::test]
+    async fn upsert_replaces_auth_header_when_supplied() {
+        let mgr = setup_manager(Zeroizing::new([7u8; 32])).await;
+        // Create with an auth header.
+        mgr.upsert_server(&McpServerInput {
+            id: "authed".into(),
+            name: "Authed".into(),
+            base_url: "https://mcp.example.com".into(),
+            enabled: true,
+            auth_header: Some("Authorization: Bearer old-secret".into()),
+        })
+        .await
+        .expect("upsert");
+        // Upsert again with a new auth header — must replace the old one.
+        mgr.upsert_server(&McpServerInput {
+            id: "authed".into(),
+            name: "Authed2".into(),
+            base_url: "https://mcp2.example.com".into(),
+            enabled: true,
+            auth_header: Some("Authorization: Bearer new-secret".into()),
+        })
+        .await
+        .expect("upsert2");
+        let resolved = mgr
+            .resolve_server("authed")
+            .await
+            .expect("resolve")
+            .expect("some");
+        assert_eq!(
+            resolved.auth_header.as_deref().map(AsRef::as_ref),
+            Some("Authorization: Bearer new-secret"),
+            "second upsert must replace the auth header"
+        );
+        assert_eq!(resolved.base_url, "https://mcp2.example.com");
+    }
+
+    #[tokio::test]
+    async fn upsert_without_auth_header_keeps_existing() {
+        let mgr = setup_manager(Zeroizing::new([7u8; 32])).await;
+        mgr.upsert_server(&McpServerInput {
+            id: "keep-auth".into(),
+            name: "Keep".into(),
+            base_url: "https://mcp.example.com".into(),
+            enabled: true,
+            auth_header: Some("Authorization: Bearer keep-secret".into()),
+        })
+        .await
+        .expect("upsert1");
+        // Upsert WITHOUT a new auth header — the existing encrypted value
+        // must survive.
+        mgr.upsert_server(&McpServerInput {
+            id: "keep-auth".into(),
+            name: "Keep2".into(),
+            base_url: "https://mcp2.example.com".into(),
+            enabled: true,
+            auth_header: None,
+        })
+        .await
+        .expect("upsert2");
+        let resolved = mgr
+            .resolve_server("keep-auth")
+            .await
+            .expect("resolve")
+            .expect("some");
+        assert_eq!(
+            resolved.auth_header.as_deref().map(AsRef::as_ref),
+            Some("Authorization: Bearer keep-secret"),
+            "omitting auth_header on upsert must keep the existing value"
+        );
+    }
+
+    #[test]
+    fn decrypt_with_wrong_nonce_length_errors() {
+        // A truncated nonce must produce a clean error, not a panic.
+        let key = [3u8; 32];
+        let result = decrypt(&key, b"some ciphertext", b"short");
+        assert!(result.is_err(), "short nonce must error");
+    }
+
+    #[test]
+    fn decrypt_with_tampered_ciphertext_errors() {
+        let key = [3u8; 32];
+        let (ct, nonce) = encrypt(&key, "secret").expect("encrypt");
+        // Flip a bit in the ciphertext → AES-GCM authentication must fail.
+        let mut tampered = ct.clone();
+        if let Some(byte) = tampered.first_mut() {
+            *byte ^= 0xFF;
+        }
+        assert!(decrypt(&key, &tampered, &nonce).is_err());
+    }
 }

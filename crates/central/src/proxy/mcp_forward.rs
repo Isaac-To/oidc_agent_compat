@@ -278,3 +278,271 @@ async fn record_audit(
         tracing::error!(error = %e, "failed to write MCP audit log");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use tower::ServiceExt;
+    use zeroize::Zeroizing;
+
+    async fn test_state() -> AppState {
+        let url = oidc_agent_common::persistence::temp_sqlite_url("mcp-fwd");
+        let db = crate::db::setup(&url).await.expect("db");
+        let mcp_db = db.clone();
+        AppState {
+            config: oidc_agent_common::config::CentralConfig {
+                listen_addr: "127.0.0.1:0".parse().expect("addr"),
+                database_url: "sqlite://test.db".into(),
+                oidc: oidc_agent_common::config::OidcConfig {
+                    issuer: "https://idp".into(),
+                    client_id: "c".into(),
+                    client_secret_env: "E".into(),
+                    redirect_uri: "http://127.0.0.1:0/cb".into(),
+                    scopes: vec!["openid".into()],
+                },
+                mtls: oidc_agent_common::config::MtlsServerConfig {
+                    ca_cert_path: "/c".into(),
+                    server_cert_path: "/s".into(),
+                    server_key_path: "/k".into(),
+                },
+                admin: None,
+                pricing: None,
+                dev_mode: true,
+                rate_limit_requests: 60,
+                rate_limit_window_secs: 60,
+            },
+            provider_store: crate::provider::ProviderStore::new(
+                db.clone(),
+                Zeroizing::new([7_u8; 32]),
+            ),
+            client: reqwest::Client::new(),
+            audit: crate::audit::AuditLogger::new(db.clone()),
+            rate_limiter: None,
+            policy_store: crate::policy::PolicyStore::new(db.clone()),
+            device_store: crate::device_store::DeviceStore::new(db.clone()),
+            usage_tracker: crate::usage::UsageTracker::new(db.clone()),
+            price_table: crate::pricing::PriceTable::empty(),
+            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+            token_store: crate::token_store::TokenStore::new(db),
+        }
+    }
+
+    fn forward_router(state: AppState) -> Router {
+        Router::new()
+            .route("/mcp/{server}", axum::routing::any(mcp_handler))
+            .with_state(state)
+    }
+
+    fn mcp_request(server: &str) -> axum::http::Request<Body> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        })
+        .to_string();
+        axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri(format!("/mcp/{server}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("build request")
+    }
+
+    #[tokio::test]
+    async fn invalid_server_id_returns_not_found() {
+        let state = test_state().await;
+        let app = forward_router(state);
+        let resp = app
+            .oneshot(mcp_request("nonexistent-server"))
+            .await
+            .expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "unregistered server id must return 404"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["error"]["code"], -32602);
+    }
+
+    #[tokio::test]
+    async fn upstream_connection_failure_returns_bad_gateway() {
+        let state = test_state().await;
+        // Register an MCP server pointing at an unreachable URL.
+        state
+            .mcp_manager
+            .upsert_server(&crate::mcp::McpServerInput {
+                id: "unreachable".into(),
+                name: "Unreachable Server".into(),
+                base_url: "http://127.0.0.1:1/mcp".into(),
+                enabled: true,
+                auth_header: None,
+            })
+            .await
+            .expect("upsert server");
+        let app = forward_router(state);
+        let resp = app
+            .oneshot(mcp_request("unreachable"))
+            .await
+            .expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "upstream connection failure must return 502"
+        );
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(json["error"]["code"], -32603);
+    }
+
+    #[tokio::test]
+    async fn disabled_server_returns_not_found() {
+        let state = test_state().await;
+        state
+            .mcp_manager
+            .upsert_server(&crate::mcp::McpServerInput {
+                id: "disabled-srv".into(),
+                name: "Disabled".into(),
+                base_url: "http://127.0.0.1:1/mcp".into(),
+                enabled: false,
+                auth_header: None,
+            })
+            .await
+            .expect("upsert server");
+        let app = forward_router(state);
+        let resp = app
+            .oneshot(mcp_request("disabled-srv"))
+            .await
+            .expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "disabled server must return 404"
+        );
+    }
+
+    /// Spawns a mock MCP upstream returning the given (status, content-type,
+    /// body). Returns its base URL (without the `/mcp` suffix).
+    async fn spawn_mock_upstream(
+        status: axum::http::StatusCode,
+        content_type: &'static str,
+        body: &'static str,
+    ) -> String {
+        let mock = Router::new().route(
+            "/mcp",
+            axum::routing::post(move |_body: axum::body::Body| async move {
+                (
+                    status,
+                    [(axum::http::header::CONTENT_TYPE, content_type)],
+                    body,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, mock).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn forward_passes_through_non_streaming_response() {
+        let state = test_state().await;
+        let url = spawn_mock_upstream(
+            StatusCode::OK,
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#,
+        )
+        .await;
+        state
+            .mcp_manager
+            .upsert_server(&crate::mcp::McpServerInput {
+                id: "mock".into(),
+                name: "Mock".into(),
+                base_url: format!("{url}/mcp"),
+                enabled: true,
+                auth_header: None,
+            })
+            .await
+            .expect("upsert");
+        let app = forward_router(state);
+        let resp = app.oneshot(mcp_request("mock")).await.expect("router");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert!(json.get("result").is_some());
+    }
+
+    #[tokio::test]
+    async fn forward_passes_through_empty_response_body() {
+        let state = test_state().await;
+        let url = spawn_mock_upstream(StatusCode::OK, "application/json", "").await;
+        state
+            .mcp_manager
+            .upsert_server(&crate::mcp::McpServerInput {
+                id: "empty".into(),
+                name: "Empty".into(),
+                base_url: format!("{url}/mcp"),
+                enabled: true,
+                auth_header: None,
+            })
+            .await
+            .expect("upsert");
+        let app = forward_router(state);
+        let resp = app.oneshot(mcp_request("empty")).await.expect("router");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 65536)
+            .await
+            .expect("body");
+        assert!(bytes.is_empty(), "empty body must pass through");
+    }
+
+    #[tokio::test]
+    async fn forward_preserves_upstream_status_code() {
+        let state = test_state().await;
+        let url = spawn_mock_upstream(
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            r#"{"error":"bad"}"#,
+        )
+        .await;
+        state
+            .mcp_manager
+            .upsert_server(&crate::mcp::McpServerInput {
+                id: "err400".into(),
+                name: "Err400".into(),
+                base_url: format!("{url}/mcp"),
+                enabled: true,
+                auth_header: None,
+            })
+            .await
+            .expect("upsert");
+        let app = forward_router(state);
+        let resp = app.oneshot(mcp_request("err400")).await.expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "upstream 400 must be preserved"
+        );
+    }
+
+    #[test]
+    fn mcp_path_suffix_strips_prefix() {
+        assert_eq!(mcp_path_suffix("/mcp/fs", "fs"), "");
+        assert_eq!(mcp_path_suffix("/mcp/fs/", "fs"), "");
+        assert_eq!(mcp_path_suffix("/mcp/fs/extra", "fs"), "/extra");
+        // A path that does not match the prefix passes through verbatim.
+        assert_eq!(mcp_path_suffix("/v1/models", "fs"), "/v1/models");
+    }
+}
