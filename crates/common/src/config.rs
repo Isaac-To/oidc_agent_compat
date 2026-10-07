@@ -227,6 +227,7 @@ impl RelayConfig {
     ///
     /// Returns [`Error::Config`] if:
     /// - `listen_addr` is not a loopback address (unless `dev_mode` is true).
+    /// - `database_url` is empty or not a valid SQLite/Postgres URL.
     /// - `oidc.issuer` is empty or not a valid URL.
     /// - `oidc.client_id` is empty.
     /// - `oidc.client_secret_env` is empty.
@@ -236,6 +237,7 @@ impl RelayConfig {
         if !self.dev_mode {
             validate_loopback(&self.listen_addr)?;
         }
+        validate_database_url(&self.database_url)?;
         validate_oidc(&self.oidc)?;
         if !self.dev_mode {
             validate_central_url(&self.central.url)?;
@@ -265,6 +267,7 @@ impl CentralConfig {
     /// fields are zero, or an enabled `[admin]` section has an empty
     /// `admin_group`.
     pub fn validate(&self) -> Result<()> {
+        validate_database_url(&self.database_url)?;
         validate_oidc(&self.oidc)?;
         if self.rate_limit_requests == 0 {
             return Err(Error::Config(
@@ -285,6 +288,22 @@ impl CentralConfig {
         }
         Ok(())
     }
+}
+
+/// Validates that a database URL is non-empty and has a recognized scheme.
+fn validate_database_url(url: &str) -> Result<()> {
+    if url.trim().is_empty() {
+        return Err(Error::Config("database_url must not be empty".into()));
+    }
+    if !url.starts_with("sqlite://")
+        && !url.starts_with("postgres://")
+        && !url.starts_with("postgresql://")
+    {
+        return Err(Error::Config(format!(
+            "database_url must start with sqlite://, postgres://, or postgresql://, got: {url}"
+        )));
+    }
+    Ok(())
 }
 
 /// Validates that a socket address is loopback (127.0.0.0/8 or ::1).

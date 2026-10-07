@@ -347,6 +347,12 @@ pub async fn run_login(
     println!("Open this URL in your browser to log in:\n{url_string}\n");
     open_browser(&url_string);
 
+    // 9b. Show a progress message while waiting for the browser callback.
+    let timeout_secs = CALLBACK_TIMEOUT.as_secs();
+    println!("Waiting for browser login to complete... (timeout: {timeout_secs}s)");
+    println!("If the browser did not open, copy the URL above and paste it manually.");
+    println!();
+
     // 10. Wait for the callback (with timeout).
     let (code, state) = wait_for_callback(listener, CALLBACK_TIMEOUT).await?;
 
