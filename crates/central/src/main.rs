@@ -162,20 +162,64 @@ enum AdminSubcommand {
     },
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
-    let config = load_config(&cli.config)?;
 
     let _ = oidc_agent_common::logging::init();
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| oidc_agent_common::error::Error::Internal(format!("tokio runtime: {e}")))?;
-    rt.block_on(async {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("oac-central: error: failed to create async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let result = rt.block_on(async {
+        let config = load_config(&cli.config)?;
         match cli.command.unwrap_or(Command::Serve) {
             Command::Serve => serve(config).await,
             Command::Admin(admin_cli) => admin(admin_cli).await,
         }
-    })
+    });
+
+    if let Err(e) = result {
+        print_error(&e);
+        std::process::exit(1);
+    }
+}
+
+/// Prints a user-friendly error message with actionable hints.
+fn print_error(err: &oidc_agent_common::error::Error) {
+    use oidc_agent_common::error::Error;
+    eprintln!("oac-central: error: {err}");
+    match err {
+        Error::Config(msg) => {
+            if msg.contains("No such file or directory") {
+                eprintln!();
+                eprintln!("hint: the config file was not found. Create one from the example:");
+                eprintln!("  cp config.example.toml config.toml");
+                eprintln!("  # then edit config.toml with your settings");
+            } else if msg.contains("OAC_PROVIDER_ENCRYPTION_KEY") {
+                eprintln!();
+                eprintln!("hint: set the provider encryption key environment variable:");
+                eprintln!("  export OAC_PROVIDER_ENCRYPTION_KEY=$(openssl rand -hex 32)");
+            }
+        }
+        Error::Http(msg) => {
+            if msg.contains("Connection refused") || msg.contains("connect") {
+                eprintln!();
+                eprintln!("hint: could not reach the relay. Is it running?");
+                eprintln!("  Check the --url flag or OAC_ADMIN_URL environment variable.");
+            }
+        }
+        Error::Database(msg) => {
+            eprintln!();
+            eprintln!("hint: database error: {msg}");
+            eprintln!("  Check that the database_url in your config is correct.");
+        }
+        _ => {}
+    }
 }
 
 /// Loads the central config from the given path.

@@ -62,6 +62,8 @@ enum Command {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    /// Show relay status: config, database, central connectivity, token info.
+    Status,
 }
 
 /// Subcommands for `oac-relay token`.
@@ -86,15 +88,21 @@ enum TokenCommand {
     },
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
 
     // Initialize logging.
     let _ = oidc_agent_common::logging::init();
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| oidc_agent_common::error::Error::Internal(format!("tokio runtime: {e}")))?;
-    rt.block_on(async move {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("oac-relay: error: failed to create async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let result = rt.block_on(async move {
         // `print-key` reads from the agent config file (written by `login`),
         // not from the relay TOML config or the database, so it does not need
         // to load a config file. All other subcommands require the config.
@@ -110,8 +118,46 @@ fn main() -> Result<()> {
             Command::ListKeys => list_keys_cmd(config).await,
             Command::Activity { limit } => activity_cmd(config, limit).await,
             Command::Token { command } => token_cmd(config, command).await,
+            Command::Status => status_cmd(&config).await,
         }
-    })
+    });
+
+    if let Err(e) = result {
+        print_error(&e);
+        std::process::exit(1);
+    }
+}
+
+/// Prints a user-friendly error message with actionable hints.
+fn print_error(err: &oidc_agent_common::error::Error) {
+    use oidc_agent_common::error::Error;
+    eprintln!("oac-relay: error: {err}");
+    match err {
+        Error::Config(msg) => {
+            if msg.contains("No such file or directory") {
+                eprintln!();
+                eprintln!("hint: the config file was not found. Create one from the example:");
+                eprintln!("  cp config.example.toml config.toml");
+                eprintln!("  # then edit config.toml with your settings");
+            } else if msg.contains("not logged in") {
+                eprintln!();
+                eprintln!("hint: run 'oac-relay login' first to authenticate via OIDC.");
+            }
+        }
+        Error::Http(msg) => {
+            if msg.contains("Connection refused") || msg.contains("connect") {
+                eprintln!();
+                eprintln!("hint: could not reach the central proxy. Is it running?");
+                eprintln!("  Check the central URL in your config file.");
+            }
+        }
+        Error::Database(msg) => {
+            eprintln!();
+            eprintln!("hint: database error: {msg}");
+            eprintln!("  Check that the database_url in your config is correct.");
+        }
+        _ => {}
+    }
 }
 
 /// Loads the relay config from the given path.
@@ -438,5 +484,146 @@ async fn token_revoke_cmd(config: RelayConfig, token_id: &str) -> Result<()> {
         Err(oidc_agent_common::error::Error::Http(format!(
             "failed to revoke token at central: {status} {body}"
         )))
+    }
+}
+
+/// Shows relay status: config summary, database health, central connectivity,
+/// and token info.
+///
+/// This is a diagnostic command — it does not start the relay server. It
+/// checks each component and reports OK/WARN/FAIL for each.
+async fn status_cmd(config: &RelayConfig) -> Result<()> {
+    println!("oac-relay: status");
+    println!();
+
+    // 1. Config summary (redacted).
+    println!("Config:");
+    println!("  listen_addr   = {}", config.listen_addr);
+    println!("  database_url  = {}", redact_db_url(&config.database_url));
+    println!("  oidc.issuer   = {}", config.oidc.issuer);
+    println!("  oidc.client_id = {}", config.oidc.client_id);
+    println!("  central.url   = {}", config.central.url);
+    println!("  dev_mode      = {}", config.dev_mode);
+    println!();
+
+    // 2. Database health.
+    print!("Database: ");
+    match db::setup(&config.database_url).await {
+        Ok(_db) => println!("OK"),
+        Err(e) => println!("FAIL ({e})"),
+    }
+    println!();
+
+    // 3. Central connectivity.
+    print!("Central proxy: ");
+    match check_central_health(config).await {
+        Ok(()) => println!("OK (reachable)"),
+        Err(e) => println!("WARN ({e})"),
+    }
+    println!();
+
+    // 4. Agent config (login status).
+    print!("Agent config: ");
+    match oac_relay::agent_config::read() {
+        Ok(agent_cfg) => {
+            println!("OK (logged in)");
+            println!("  base_url = {}", agent_cfg.base_url);
+            // Redact the API key — show only the prefix.
+            let key_preview = if agent_cfg.api_key.len() > 12 {
+                format!("{}...", &agent_cfg.api_key[..12])
+            } else {
+                "***".to_string()
+            };
+            println!("  api_key  = {key_preview}");
+        }
+        Err(_) => {
+            println!("NOT FOUND (run 'oac-relay login' to authenticate)");
+        }
+    }
+    println!();
+
+    // 5. Token list (if logged in).
+    if oac_relay::agent_config::read().is_ok() {
+        print!("Token list: ");
+        match list_tokens_for_status(config).await {
+            Ok(count) => println!("OK ({count} token(s))"),
+            Err(e) => println!("WARN ({e})"),
+        }
+    }
+
+    Ok(())
+}
+
+/// Checks if the central proxy is reachable by hitting its health endpoint.
+async fn check_central_health(config: &RelayConfig) -> Result<()> {
+    let client = proxy::forward::build_client(config)?;
+    let url = format!("{}/healthz", config.central.url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Http(format!("health check: {e}")))?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(oidc_agent_common::error::Error::Http(format!(
+            "health check returned {}",
+            resp.status()
+        )))
+    }
+}
+
+/// Lists tokens for the status command. Returns the count on success.
+async fn list_tokens_for_status(config: &RelayConfig) -> Result<usize> {
+    let agent_config = oac_relay::agent_config::read()
+        .map_err(|e| oidc_agent_common::error::Error::Config(format!("not logged in: {e}")))?;
+    let client = proxy::forward::build_client(config)?;
+    let url = format!("{}/v1/tokens", config.central.url);
+    let resp = client
+        .get(&url)
+        .header("authorization", format!("Bearer {}", agent_config.api_key))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Http(format!("list tokens: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(oidc_agent_common::error::Error::Http(format!(
+            "list tokens returned {}",
+            resp.status()
+        )));
+    }
+    let items: Vec<serde_json::Value> = resp
+        .json()
+        .await
+        .map_err(|e| oidc_agent_common::error::Error::Http(format!("parse token list: {e}")))?;
+    Ok(items.len())
+}
+
+/// Redacts a database URL for display (shows only the scheme and filename).
+fn redact_db_url(url: &str) -> String {
+    if let Some(path) = url.strip_prefix("sqlite://") {
+        // Show only the filename, not the full path.
+        let filename = std::path::Path::new(path)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+        format!("sqlite://.../{filename}")
+    } else if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        // Redact credentials in postgres URLs: postgres://user:pass@host/db
+        // → postgres://user:***@host/db
+        if let Some(at_pos) = url.rfind('@') {
+            let scheme_end = url.find("://").map(|i| i + 3).unwrap_or(0);
+            let after_scheme = &url[scheme_end..];
+            if let Some(colon_pos) = after_scheme.find(':') {
+                let user = &after_scheme[..colon_pos];
+                let rest = &url[at_pos..];
+                let scheme = &url[..scheme_end];
+                return format!("{scheme}{user}:***{rest}");
+            }
+        }
+        url.to_string()
+    } else {
+        url.to_string()
     }
 }

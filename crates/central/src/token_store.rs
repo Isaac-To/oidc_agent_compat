@@ -234,6 +234,17 @@ impl TokenStore {
             let row_revoked: bool = row.try_get("", "revoked").unwrap_or(true);
             let row_device_fingerprint: Option<String> = row.try_get("", "device_fingerprint").ok();
 
+            // Skip rows with corrupted token_hash (wrong length) instead of
+            // panicking. This is defense-in-depth against DB corruption.
+            if row_hash.len() != 32 {
+                tracing::error!(
+                    token_id = %row_id,
+                    hash_len = row_hash.len(),
+                    "corrupted token_hash in database row, skipping"
+                );
+                continue;
+            }
+
             // Constant-time comparison against the candidate hash.
             let stored = KeyHash::from_hash_bytes(&row_hash);
             if !row_revoked && stored.matches(&candidate) {
@@ -305,6 +316,15 @@ impl TokenStore {
         for row in rows {
             let row_id: String = row.try_get("", "id").unwrap_or_default();
             let row_hash: Vec<u8> = row.try_get("", "token_hash").unwrap_or_default();
+            // Skip rows with corrupted token_hash instead of panicking.
+            if row_hash.len() != 32 {
+                tracing::error!(
+                    token_id = %row_id,
+                    hash_len = row_hash.len(),
+                    "corrupted token_hash in database row, skipping"
+                );
+                continue;
+            }
             let stored = KeyHash::from_hash_bytes(&row_hash);
             if stored.matches(&candidate) {
                 target_id = Some(row_id);
@@ -341,6 +361,28 @@ impl TokenStore {
     /// Returns [`Error::Database`] on query failure.
     pub async fn revoke_by_token_id(&self, id: &str) -> Result<()> {
         self.delete_by_id(id).await
+    }
+
+    /// Revokes a token by id, but only if it belongs to the given subject.
+    ///
+    /// Returns `Ok(true)` if the token was found and deleted, `Ok(false)` if
+    /// no token with that id belongs to the subject (or doesn't exist).
+    ///
+    /// This prevents cross-user token revocation: a user can only revoke
+    /// their own tokens.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Database`] on query failure.
+    pub async fn revoke_by_token_id_for_subject(&self, id: &str, subject: &str) -> Result<bool> {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let result = token::Entity::delete_many()
+            .filter(token::Column::Id.eq(id))
+            .filter(token::Column::Subject.eq(subject))
+            .exec(&self.db)
+            .await
+            .map_err(|e| Error::Database(format!("delete token: {e}")))?;
+        Ok(result.rows_affected > 0)
     }
 
     /// Deletes a token row by id.
@@ -568,5 +610,137 @@ mod tests {
             verify.identity.device_fingerprint.is_none(),
             "device fingerprint must be None when not set"
         );
+    }
+
+    #[tokio::test]
+    async fn revoke_by_token_id_for_subject_only_own_tokens() {
+        let store = setup_store().await;
+        // Mint a token for alice.
+        let alice_token = store
+            .mint_token(&mint_req("alice", "laptop", Some(3600)))
+            .await
+            .expect("mint alice");
+        // Mint a token for bob.
+        let bob_token = store
+            .mint_token(&mint_req("bob", "desktop", Some(3600)))
+            .await
+            .expect("mint bob");
+
+        // Alice can revoke her own token.
+        let revoked = store
+            .revoke_by_token_id_for_subject(&alice_token.token_id, "alice")
+            .await
+            .expect("revoke alice");
+        assert!(revoked, "alice must be able to revoke her own token");
+
+        // Alice CANNOT revoke bob's token.
+        let revoked = store
+            .revoke_by_token_id_for_subject(&bob_token.token_id, "alice")
+            .await
+            .expect("revoke bob as alice");
+        assert!(!revoked, "alice must NOT be able to revoke bob's token");
+
+        // Bob's token must still verify.
+        let verify = store
+            .verify_token(bob_token.plaintext.as_str())
+            .await
+            .expect("verify bob")
+            .expect("bob token must still be valid");
+        assert_eq!(verify.identity.subject, "bob");
+
+        // Bob can revoke his own token.
+        let revoked = store
+            .revoke_by_token_id_for_subject(&bob_token.token_id, "bob")
+            .await
+            .expect("revoke bob");
+        assert!(revoked, "bob must be able to revoke his own token");
+    }
+
+    #[tokio::test]
+    async fn revoke_by_token_id_for_subject_nonexistent_returns_false() {
+        let store = setup_store().await;
+        let revoked = store
+            .revoke_by_token_id_for_subject("nonexistent-id", "alice")
+            .await
+            .expect("revoke");
+        assert!(!revoked, "revoking a nonexistent token must return false");
+    }
+
+    #[tokio::test]
+    async fn verify_token_skips_corrupted_hash_rows() {
+        let store = setup_store().await;
+        // Mint a valid token.
+        let minted = store
+            .mint_token(&mint_req("alice", "laptop", Some(3600)))
+            .await
+            .expect("mint");
+        let plaintext = minted.plaintext.to_string();
+
+        // Insert a corrupted row with a wrong-length token_hash.
+        let now_str = time_util::format_time(&time_util::now_utc());
+        store
+            .db
+            .execute(Statement::from_sql_and_values(
+                store.db.get_database_backend(),
+                "INSERT INTO tokens (id, subject, issuer, label, token_hash, created_at, revoked) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                vec![
+                    "corrupted-id".into(),
+                    "mallory".into(),
+                    "https://idp.example.com".into(),
+                    "corrupted".into(),
+                    vec![1_u8, 2, 3].into(), // Only 3 bytes — corrupted!
+                    now_str.into(),
+                    false.into(),
+                ],
+            ))
+            .await
+            .expect("insert corrupted row");
+
+        // Verification must not panic — it should skip the corrupted row
+        // and still find the valid token.
+        let verify = store.verify_token(&plaintext).await.expect("verify");
+        assert!(
+            verify.is_some(),
+            "verification must succeed despite corrupted rows"
+        );
+        assert_eq!(verify.expect("verified").identity.subject, "alice");
+    }
+
+    #[tokio::test]
+    async fn revoke_by_token_skips_corrupted_hash_rows() {
+        let store = setup_store().await;
+        // Mint a valid token.
+        let minted = store
+            .mint_token(&mint_req("alice", "laptop", Some(3600)))
+            .await
+            .expect("mint");
+        let plaintext = minted.plaintext.to_string();
+
+        // Insert a corrupted row.
+        let now_str = time_util::format_time(&time_util::now_utc());
+        store
+            .db
+            .execute(Statement::from_sql_and_values(
+                store.db.get_database_backend(),
+                "INSERT INTO tokens (id, subject, issuer, label, token_hash, created_at, revoked) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                vec![
+                    "corrupted-id".into(),
+                    "mallory".into(),
+                    "https://idp.example.com".into(),
+                    "corrupted".into(),
+                    vec![1_u8, 2, 3].into(), // Only 3 bytes — corrupted!
+                    now_str.into(),
+                    false.into(),
+                ],
+            ))
+            .await
+            .expect("insert corrupted row");
+
+        // Revocation must not panic — it should skip the corrupted row
+        // and still find and revoke the valid token.
+        let revoked = store.revoke_by_token(&plaintext).await.expect("revoke");
+        assert!(revoked, "revocation must succeed despite corrupted rows");
     }
 }

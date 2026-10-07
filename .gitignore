@@ -25,3 +25,4 @@ docker/prod/.env
 .vscode/
 .idea/
 *.swp
+.DS_Store

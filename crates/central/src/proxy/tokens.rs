@@ -289,32 +289,41 @@ pub async fn list_tokens_handler(
 /// `DELETE /v1/tokens/{id}` — revokes a specific token by its row id.
 ///
 /// Authenticates via the bearer in the `Authorization` header (same as
-/// [`list_tokens_handler`]), then revokes the token with the given id. This
-/// allows a user to revoke **any** of their tokens (not just the current
-/// one), as long as they hold a valid token for authentication.
+/// [`list_tokens_handler`]), then revokes the token with the given id —
+/// but **only if it belongs to the authenticated user**. This allows a user
+/// to revoke any of their own tokens (not just the current one), as long as
+/// they hold a valid token for authentication.
 ///
-/// Returns 204 No Content on success, 401 if the bearer is invalid, 500 if
-/// the revocation fails.
+/// Returns 204 No Content on success, 401 if the bearer is invalid, 404 if
+/// the token does not exist or belongs to a different user, 500 if the
+/// revocation fails.
 pub async fn revoke_by_id_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, StatusCode> {
     let bearer = extract_bearer_from_headers(&headers).ok_or(StatusCode::UNAUTHORIZED)?;
-    let _verification = state
+    let verification = state
         .token_store
         .verify_token(bearer)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    state
+    // Ownership check: only allow revoking tokens that belong to the
+    // authenticated subject. Returns 404 (not 403) to avoid leaking
+    // whether the token id exists for another user.
+    let revoked = state
         .token_store
-        .revoke_by_token_id(&id)
+        .revoke_by_token_id_for_subject(&id, &verification.identity.subject)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-    Ok(StatusCode::NO_CONTENT)
+    if revoked {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
 }
 
 /// Extracts the bearer token from the `Authorization` header, if present.
@@ -1134,5 +1143,136 @@ mod tests {
             .await
             .expect("router");
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn delete_tokens_by_id_cannot_revoke_other_users_token() {
+        let state = test_state().await;
+        let app = router(state.clone());
+
+        // Mint a token for alice.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        let json = body_json(resp).await;
+        let alice_token = json["token"].as_str().expect("token").to_string();
+        let alice_id = json["token_id"].as_str().expect("id").to_string();
+
+        // Mint a token for bob.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("bob", "desktop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        let json = body_json(resp).await;
+        let bob_token = json["token"].as_str().expect("token").to_string();
+        let bob_id = json["token_id"].as_str().expect("id").to_string();
+
+        // Alice tries to revoke bob's token by id → must get 404 (not 204).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/tokens/{bob_id}"))
+                    .header("authorization", format!("Bearer {alice_token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "alice must not be able to revoke bob's token"
+        );
+
+        // Bob's token must still verify.
+        let verify = state
+            .token_store
+            .verify_token(&bob_token)
+            .await
+            .expect("verify bob")
+            .expect("bob token must still be valid");
+        assert_eq!(verify.identity.subject, "bob");
+
+        // Alice can still revoke her own token.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/tokens/{alice_id}"))
+                    .header("authorization", format!("Bearer {alice_token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "alice must be able to revoke her own token"
+        );
+
+        // Alice's token must no longer verify.
+        let verify = state
+            .token_store
+            .verify_token(&alice_token)
+            .await
+            .expect("verify alice");
+        assert!(verify.is_none(), "alice's token must be revoked");
+    }
+
+    #[tokio::test]
+    async fn delete_tokens_by_id_nonexistent_returns_404() {
+        let state = test_state().await;
+        let app = router(state.clone());
+
+        // Mint a token for alice.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokens")
+                    .header("content-type", "application/json")
+                    .body(Body::from(mint_body("alice", "laptop", Some(3600))))
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        let json = body_json(resp).await;
+        let alice_token = json["token"].as_str().expect("token").to_string();
+
+        // Try to revoke a nonexistent token id → 404.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/tokens/nonexistent-uuid")
+                    .header("authorization", format!("Bearer {alice_token}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
