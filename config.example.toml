@@ -1,10 +1,14 @@
 # OIDC Agent Compatibility Server — Example Configuration
 #
 # The relay and central proxy each use a SEPARATE config file with flat
-# top-level fields (NOT under a [relay] or [central] section). Copy the
-# relevant block below into its own file (e.g. relay.toml / central.toml)
-# and edit for your environment. NEVER commit a filled config — it is
-# gitignored.
+# top-level fields (NOT under a [relay] or [central] section).
+#
+# Quick start:
+#   1. Copy the relay block below into `config.toml` (for oac-relay) or
+#      the central block into `config.toml` (for oac-central).
+#   2. UNCOMMENT the lines you need (everything is commented out by default).
+#   3. Edit the values for your environment.
+#   4. NEVER commit a filled config — it is gitignored.
 #
 # See docs/src/user-guide/configuration.md for the full field reference.
 

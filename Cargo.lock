@@ -118,12 +118,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "arc-swap"
 version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1535,16 +1529,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keyring"
-version = "3.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eebcc3aff044e5944a8fbaf69eb277d11986064cba30c468730e8b9909fb551c"
-dependencies = [
- "log",
- "zeroize",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1728,7 +1712,6 @@ name = "oac-central"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
- "anyhow",
  "async-trait",
  "axum",
  "axum-server",
@@ -1736,7 +1719,6 @@ dependencies = [
  "bytes",
  "clap",
  "futures",
- "hkdf",
  "oac-mcp",
  "oidc-agent-common",
  "openidconnect",
@@ -1793,13 +1775,11 @@ dependencies = [
 name = "oac-relay"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",
  "clap",
- "keyring",
  "oac-mcp",
  "oidc-agent-common",
  "openidconnect",

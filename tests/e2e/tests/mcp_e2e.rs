@@ -152,7 +152,8 @@ async fn setup_mcp_system() -> (
     let provider_store =
         oac_central::provider::ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
     let mcp_manager =
-        oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
+        oac_central::mcp::McpManager::new(audit.db().clone(), Zeroizing::new([7_u8; 32]))
+            .expect("mcp manager");
 
     // Register an MCP server "fs" pointing at the mock server, with an auth
     // header (encrypted at rest) so we can assert it is forwarded.
@@ -425,7 +426,8 @@ async fn setup_hub_system() -> (
     };
 
     let mcp_manager =
-        oac_central::mcp::McpManager::new(central_db.clone(), Zeroizing::new([7_u8; 32]));
+        oac_central::mcp::McpManager::new(central_db.clone(), Zeroizing::new([7_u8; 32]))
+            .expect("mcp manager");
     for (id, base) in [("fs", fs_base), ("gh", gh_base)] {
         mcp_manager
             .upsert_server(&oac_central::mcp::McpServerInput {

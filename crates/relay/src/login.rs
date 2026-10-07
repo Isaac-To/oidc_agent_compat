@@ -95,6 +95,8 @@ pub struct LoginResult {
     pub email: Option<String>,
     /// The agent config injection result.
     pub injection: crate::agent_config::InjectionResult,
+    /// When the minted token expires (RFC 3339), or `None` for never.
+    pub expires_at: Option<String>,
 }
 
 /// Request body for `POST /v1/tokens` (central token mint).
@@ -132,7 +134,6 @@ struct MintTokenResponse {
     #[allow(dead_code)]
     token_id: String,
     /// When the token expires (RFC 3339), or `null` for never.
-    #[allow(dead_code)]
     expires_at: Option<String>,
 }
 
@@ -243,6 +244,7 @@ pub async fn complete_login(
         subject: identity.subject.to_string(),
         email: identity.email.map(String::from),
         injection,
+        expires_at: minted.expires_at,
     })
 }
 
@@ -500,6 +502,12 @@ fn claims_from_id_token(
     let subject = claims.subject().to_string();
     let email = claims.email().map(|e| e.as_str().to_string());
     let email_verified = claims.email_verified().unwrap_or(false);
+    if email.is_some() && !email_verified {
+        tracing::warn!(
+            subject = %subject,
+            "IdP reports email_verified=false; the email will be used for audit attribution but is not verified"
+        );
+    }
     // Prefer the userinfo-style name; fall back to preferred_username.
     let display_name = claims
         .name()
@@ -511,7 +519,6 @@ fn claims_from_id_token(
         let combined = union_groups_roles(claims.additional_claims());
         groups_to_json_string(&combined)
     };
-    let _ = email_verified;
     (subject, email, display_name, groups)
 }
 
@@ -618,8 +625,12 @@ async fn wait_for_callback(
         body.len(),
         body
     );
-    let _ = stream.write_all(response.as_bytes()).await;
-    let _ = stream.flush().await;
+    if let Err(e) = stream.write_all(response.as_bytes()).await {
+        tracing::warn!(error = %e, "failed to write OIDC callback response to browser");
+    }
+    if let Err(e) = stream.flush().await {
+        tracing::warn!(error = %e, "failed to flush OIDC callback response");
+    }
 
     Ok((
         AuthorizationCode::new((*code).to_string()),

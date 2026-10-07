@@ -101,10 +101,12 @@ pub async fn permissions_middleware(
     let policy = match state.policy_store.resolve_policy(&groups).await {
         Ok(p) => p,
         Err(e) => {
-            tracing::error!(error = %e, "failed to resolve policy");
-            // Fail open on policy store errors to avoid locking out all
-            // users due to a DB issue. Log loudly.
-            return Ok(next.run(request).await);
+            // Fail CLOSED on policy store errors. A DB outage must not
+            // bypass authorization — that would let any authenticated user
+            // access any model/endpoint. Return 503 so the client retries
+            // when the DB recovers.
+            tracing::error!(error = %e, "failed to resolve policy; denying request (fail-closed)");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
 
@@ -117,7 +119,9 @@ pub async fn permissions_middleware(
     if let (Some(token_id), Some(created_at)) = (&identity.token_id, identity.created_at) {
         if crate::token_store::check_backstop(created_at, policy.max_token_ttl_seconds) {
             // Delete the stale token row so it cannot be replayed.
-            let _ = state.token_store.revoke_by_token_id(token_id).await;
+            if let Err(e) = state.token_store.revoke_by_token_id(token_id).await {
+                tracing::error!(error = %e, token_id = %token_id, "failed to delete backstop-violating token");
+            }
             tracing::warn!(
                 token_id = %token_id,
                 "token backstop exceeded: token is older than the maximum allowed lifetime"
@@ -169,7 +173,9 @@ pub async fn permissions_middleware(
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, "failed to check device revocation; allowing");
+            // Fail CLOSED: a DB error must not bypass device revocation.
+            tracing::error!(error = %e, "failed to check device revocation; denying request (fail-closed)");
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
@@ -240,7 +246,9 @@ pub async fn permissions_middleware(
             }
             Ok(None) => {}
             Err(e) => {
-                tracing::warn!(error = %e, "failed to check token usage; allowing");
+                // Fail CLOSED: a DB error must not bypass quota enforcement.
+                tracing::error!(error = %e, "failed to check token usage; denying request (fail-closed)");
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
         }
     }
@@ -267,9 +275,9 @@ pub async fn permissions_middleware(
                 .await;
             }
             Err(e) => {
-                // Preserve the existing fail-open behavior for database
-                // outages, but make the failure visible to operators.
-                tracing::warn!(error = %e, "failed to reserve request quota; allowing");
+                // Fail CLOSED: a DB error must not bypass quota enforcement.
+                tracing::error!(error = %e, "failed to reserve request quota; denying request (fail-closed)");
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
             }
         }
     }
@@ -293,6 +301,10 @@ pub async fn permissions_middleware(
 }
 
 /// Records a denied audit entry and returns the given status code.
+///
+/// When the status is `429 Too Many Requests` (quota exceeded), a
+/// `Retry-After` header is added with the number of seconds until the
+/// daily quota resets (midnight UTC).
 async fn deny(
     state: &AppState,
     identity: &super::auth::VerifiedRelayIdentity,
@@ -352,15 +364,32 @@ async fn deny(
             "type": "permission_denied",
         }
     });
-    let response = Response::builder()
+    let mut response_builder = Response::builder()
         .status(status)
-        .header("content-type", "application/json")
+        .header("content-type", "application/json");
+
+    // Add Retry-After for quota denials (429) — seconds until midnight UTC.
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = seconds_until_midnight_utc();
+        response_builder = response_builder.header("retry-after", retry_after.to_string());
+    }
+
+    let response = response_builder
         .body(Body::from(body.to_string()))
         .map_err(|e| {
             tracing::error!(error = %e, "failed to build denial response");
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     Ok(response)
+}
+
+/// Returns the number of seconds until the next midnight UTC (when daily
+/// quotas reset).
+fn seconds_until_midnight_utc() -> u64 {
+    let now = oidc_agent_common::time_util::now_utc();
+    let midnight = now.date().next_day().unwrap_or(now.date()).midnight();
+    let duration = midnight - now;
+    u64::try_from(duration.whole_seconds()).unwrap_or(0).max(1)
 }
 
 #[cfg(test)]
@@ -407,7 +436,8 @@ mod tests {
             device_store: crate::device_store::DeviceStore::new(db.clone()),
             usage_tracker: UsageTracker::new(db.clone()),
             price_table: crate::pricing::PriceTable::empty(),
-            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32]))
+                .expect("mcp manager"),
             token_store: crate::token_store::TokenStore::new(db),
         }
     }

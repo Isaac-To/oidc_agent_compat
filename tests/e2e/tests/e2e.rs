@@ -144,7 +144,8 @@ async fn setup_full_system() -> (
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let central_app = central_proxy::router(central_state);

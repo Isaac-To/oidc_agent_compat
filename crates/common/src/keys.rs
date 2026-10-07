@@ -143,18 +143,20 @@ impl KeyHash {
     ///
     /// # Panics
     ///
-    /// Panics if `bytes` is not exactly 32 bytes long. This is a programming
-    /// error (DB schema mismatch), not a runtime condition.
-    #[must_use]
-    pub fn from_hash_bytes(bytes: &[u8]) -> Self {
-        assert!(
-            bytes.len() == 32,
-            "KeyHash must be exactly 32 bytes, got {}",
-            bytes.len()
-        );
+    /// # Errors
+    ///
+    /// Returns [`Error::Crypto`][crate::error::Error::Crypto] if `bytes` is
+    /// not exactly 32 bytes long (DB schema mismatch or corruption).
+    pub fn from_hash_bytes(bytes: &[u8]) -> crate::error::Result<Self> {
+        if bytes.len() != 32 {
+            return Err(crate::error::Error::crypto(format!(
+                "KeyHash must be exactly 32 bytes, got {}",
+                bytes.len()
+            )));
+        }
         let mut out = [0u8; 32];
         out.copy_from_slice(bytes);
-        Self(out)
+        Ok(Self(out))
     }
 
     /// Returns the raw 32-byte hash.
@@ -336,14 +338,14 @@ mod tests {
         let key = LocalKey::generate();
         let h = KeyHash::from_plaintext(&key.to_string());
         let bytes = h.as_bytes();
-        let h2 = KeyHash::from_hash_bytes(bytes);
+        let h2 = KeyHash::from_hash_bytes(bytes).expect("32 bytes");
         assert!(h.matches(&h2), "from_hash_bytes must round-trip");
     }
 
     #[test]
-    #[should_panic(expected = "KeyHash must be exactly 32 bytes")]
     fn from_hash_bytes_rejects_wrong_length() {
-        let _ = KeyHash::from_hash_bytes(&[0u8; 16]);
+        let result = KeyHash::from_hash_bytes(&[0u8; 16]);
+        assert!(result.is_err(), "wrong length must return an error");
     }
 
     #[test]

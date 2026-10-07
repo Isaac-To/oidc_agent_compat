@@ -45,9 +45,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-pemfile = "2"
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 
-# OpenAI types (types only)
-async-openai = { version = "0.41", default-features = false, features = ["types"] }
-
 # Persistence
 sea-orm = { version = "1", default-features = false, features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls", "macros", "with-time", "with-uuid"] }
 sea-orm-migration = "1"
@@ -55,9 +52,6 @@ sea-orm-migration = "1"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 rpassword = "7"
-
-# OS keychain
-keyring = "3"
 
 # Serde / config
 serde = { version = "1", features = ["derive"] }
@@ -73,14 +67,12 @@ subtle = "2"
 sha2 = "0.10"
 hmac = "0.12"
 aes-gcm = "0.10"
-hkdf = "0.12"
 base64 = "0.22"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 
 # Errors
 thiserror = "2"
-anyhow = "1"
 
 # Time
 time = "0.3"

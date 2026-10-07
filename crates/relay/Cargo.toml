@@ -42,9 +42,7 @@ base64 = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 time = { workspace = true }
-keyring = { workspace = true }
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"

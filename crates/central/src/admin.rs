@@ -1612,7 +1612,7 @@ mod tests {
             device_store: DeviceStore::new(db.clone()),
             audit: AuditLogger::new(db.clone()),
             usage_tracker: UsageTracker::new(db.clone()),
-            mcp_manager: McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+            mcp_manager: McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])).expect("mcp manager"),
             token_store: crate::token_store::TokenStore::new(db),
             admin_group: "oac-admins".into(),
         }
