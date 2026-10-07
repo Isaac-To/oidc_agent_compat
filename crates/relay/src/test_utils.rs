@@ -15,6 +15,7 @@
 
 use std::net::SocketAddr;
 
+use axum::Router;
 use oidc_agent_common::config::RelayConfig;
 use oidc_agent_common::persistence::temp_sqlite_url;
 use sea_orm::DatabaseConnection;
@@ -114,4 +115,25 @@ impl TestRelayState {
         });
         (addr, reqwest::Client::new())
     }
+}
+
+/// Spawns an Axum router on a random port and returns its address.
+///
+/// Convenience wrapper for the common pattern of binding a `TcpListener`
+/// on `127.0.0.1:0`, spawning `axum::serve`, and returning the bound
+/// address. Used to spin up mock central proxies in relay tests.
+///
+/// # Panics
+///
+/// Panics if the listener bind fails.
+#[must_use]
+pub async fn spawn_server(router: Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind server");
+    let addr = listener.local_addr().expect("server addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    addr
 }

@@ -21,6 +21,7 @@ use oidc_agent_common::persistence::temp_sqlite_url;
 use sea_orm::DatabaseConnection;
 use zeroize::Zeroizing;
 
+use crate::admin::AdminState;
 use crate::audit::AuditLogger;
 use crate::device_store::DeviceStore;
 use crate::mcp::McpManager;
@@ -191,6 +192,44 @@ impl TestCentralState {
             .await
             .expect("mint token");
         minted.plaintext.to_string()
+    }
+
+    /// Builds the [`AdminState`] from this test state.
+    ///
+    /// Used by admin API integration tests that drive the admin router
+    /// directly via `tower::ServiceExt::oneshot`.
+    #[must_use]
+    pub fn build_admin_state(&self) -> AdminState {
+        AdminState {
+            policy_store: self.policy_store.clone(),
+            provider_store: self.provider_store.clone(),
+            device_store: self.device_store.clone(),
+            audit: self.audit.clone(),
+            usage_tracker: self.usage_tracker.clone(),
+            mcp_manager: self.mcp_manager.clone(),
+            token_store: self.token_store.clone(),
+            admin_group: "oac-admins".into(),
+        }
+    }
+
+    /// Mints an admin token (member of `oac-admins` group).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mint fails.
+    pub async fn mint_admin_token(&self) -> String {
+        self.mint_token("admin-user", Some(r#"["oac-admins"]"#))
+            .await
+    }
+
+    /// Mints a non-admin token (member of `engineering` group only).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the mint fails.
+    pub async fn mint_non_admin_token(&self) -> String {
+        self.mint_token("regular-user", Some(r#"["engineering"]"#))
+            .await
     }
 }
 

@@ -11,8 +11,8 @@ publish = false
 workspace = true
 
 [dependencies]
-oac-relay = { path = "../../crates/relay" }
-oac-central = { path = "../../crates/central" }
+oac-relay = { path = "../../crates/relay", features = ["test-utils"] }
+oac-central = { path = "../../crates/central", features = ["test-utils"] }
 oidc-agent-common = { path = "../../crates/common", features = ["test-certs"] }
 axum = { workspace = true }
 tokio = { workspace = true }

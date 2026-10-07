@@ -120,7 +120,6 @@ mod tests {
     use crate::proxy::{AppState, router};
     use axum::body::Body;
     use axum::http::StatusCode;
-    use oidc_agent_common::config::{CentralConnectionConfig, OidcConfig, RelayConfig};
     use tower::ServiceExt;
 
     /// Builds an AppState with the given `dev_mode` flag and a central URL
@@ -132,34 +131,17 @@ mod tests {
     /// a plain `reqwest::Client::new()` instead since these tests only
     /// exercise the auth middleware (not the forward handler).
     async fn test_state(dev_mode: bool) -> AppState {
-        let url = oidc_agent_common::persistence::temp_sqlite_url("relay-auth");
-        let db = crate::db::setup(&url).await.expect("db");
-        let config = RelayConfig {
-            listen_addr: "127.0.0.1:0".parse().expect("addr"),
-            database_url: "sqlite://test.db".into(),
-            oidc: OidcConfig {
-                issuer: "https://idp.example.com".into(),
-                client_id: "t".into(),
-                client_secret_env: "T".into(),
-                redirect_uri: "http://127.0.0.1:0/callback".into(),
-                scopes: vec!["openid".into()],
-            },
-            central: CentralConnectionConfig {
-                url: "http://127.0.0.1:1".into(),
-                ca_cert_path: "/ca.pem".into(),
-                client_cert_path: "/c.pem".into(),
-                client_key_path: "/c.key".into(),
-            },
-            dev_mode,
-        };
+        let relay = crate::test_utils::TestRelayState::new("http://127.0.0.1:1").await;
+        let mut config = relay.config.clone();
+        config.dev_mode = dev_mode;
         AppState {
-            config: config.clone(),
+            config,
             // Use a plain client to avoid mTLS cert loading in non-dev mode;
             // the auth middleware runs before the forward handler so the
             // client is never actually used for the auth rejection tests.
             client: reqwest::Client::new(),
             listen_addr: "127.0.0.1:8787".parse().expect("addr"),
-            activity: crate::activity::ActivityLogger::new(db),
+            activity: relay.activity.clone(),
             device_fingerprint: None,
         }
     }

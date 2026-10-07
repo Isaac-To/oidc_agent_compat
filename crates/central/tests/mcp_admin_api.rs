@@ -13,70 +13,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use axum::http::{Request, StatusCode};
-use oac_central::admin::{self, AdminState};
-use oac_central::audit::AuditLogger;
-use oac_central::device_store::DeviceStore;
-use oac_central::policy::PolicyStore;
-use oac_central::provider::ProviderStore;
-use oac_central::usage::UsageTracker;
+use oac_central::admin;
+use oac_central::test_utils::TestCentralState;
 use tower::util::ServiceExt;
-use zeroize::Zeroizing;
 
 /// Sets up the admin router and returns it together with an admin bearer
 /// token and a non-admin bearer token.
 async fn setup_router() -> (axum::Router, String, String) {
-    let url = oidc_agent_common::persistence::temp_sqlite_url("admin-mcp");
-    let db = oac_central::db::setup(&url).await.expect("db setup");
-    let audit = AuditLogger::new(db.clone());
-    let state = AdminState {
-        policy_store: PolicyStore::new(db.clone()),
-        provider_store: ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32])),
-        device_store: DeviceStore::new(db.clone()),
-        audit,
-        usage_tracker: UsageTracker::new(db.clone()),
-        mcp_manager: oac_central::mcp::McpManager::new(db.clone(), Zeroizing::new([7_u8; 32]))
-            .expect("mcp manager"),
-        token_store: oac_central::token_store::TokenStore::new(db),
-        admin_group: "oac-admins".into(),
-    };
-    let admin_token = mint_admin_token(&state).await;
-    let non_admin_token = state
-        .token_store
-        .mint_token(&oac_central::token_store::MintRequest {
-            subject: "regular-user".into(),
-            issuer: "https://idp.example.com".into(),
-            email: None,
-            display_name: None,
-            groups: Some(r#"["engineering"]"#.into()),
-            identity_id: None,
-            label: "non-admin".into(),
-            expires_at: None,
-            device_fingerprint: None,
-        })
-        .await
-        .expect("mint non-admin token");
-    let non_admin_token = non_admin_token.plaintext.to_string();
-    (admin::router(state), admin_token, non_admin_token)
-}
-
-/// Mints an admin token via the token store and returns the plaintext.
-async fn mint_admin_token(state: &AdminState) -> String {
-    let minted = state
-        .token_store
-        .mint_token(&oac_central::token_store::MintRequest {
-            subject: "admin-user".into(),
-            issuer: "https://idp.example.com".into(),
-            email: None,
-            display_name: None,
-            groups: Some(r#"["oac-admins"]"#.into()),
-            identity_id: None,
-            label: "test".into(),
-            expires_at: None,
-            device_fingerprint: None,
-        })
-        .await
-        .expect("mint admin token");
-    minted.plaintext.to_string()
+    let state = TestCentralState::new().await;
+    let admin_state = state.build_admin_state();
+    let admin_token = state.mint_admin_token().await;
+    let non_admin_token = state.mint_non_admin_token().await;
+    (admin::router(admin_state), admin_token, non_admin_token)
 }
 
 /// Builds an admin-authenticated JSON request with a bearer token.

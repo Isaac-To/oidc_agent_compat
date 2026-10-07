@@ -395,51 +395,13 @@ fn seconds_until_midnight_utc() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::ProviderStore;
-    use crate::usage::UsageTracker;
     use axum::Router;
     use tower::ServiceExt;
-    use zeroize::Zeroizing;
 
     async fn test_state() -> AppState {
-        let url = oidc_agent_common::persistence::temp_sqlite_url("perms");
-        let db = crate::db::setup(&url).await.expect("db setup");
-        let audit = crate::audit::AuditLogger::new(db.clone());
-        let mcp_db = db.clone();
-        AppState {
-            config: oidc_agent_common::config::CentralConfig {
-                listen_addr: "127.0.0.1:0".parse().expect("addr"),
-                database_url: "sqlite://test.db".into(),
-                oidc: oidc_agent_common::config::OidcConfig {
-                    issuer: "https://idp.example.com".into(),
-                    client_id: "test".into(),
-                    client_secret_env: "TEST".into(),
-                    redirect_uri: "http://127.0.0.1:0/callback".into(),
-                    scopes: vec!["openid".into()],
-                },
-                mtls: oidc_agent_common::config::MtlsServerConfig {
-                    ca_cert_path: "/ca.pem".into(),
-                    server_cert_path: "/server.pem".into(),
-                    server_key_path: "/server.key".into(),
-                },
-                admin: None,
-                pricing: None,
-                dev_mode: true,
-                rate_limit_requests: 60,
-                rate_limit_window_secs: 60,
-            },
-            provider_store: ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32])),
-            client: reqwest::Client::new(),
-            audit,
-            rate_limiter: None,
-            policy_store: crate::policy::PolicyStore::new(db.clone()),
-            device_store: crate::device_store::DeviceStore::new(db.clone()),
-            usage_tracker: UsageTracker::new(db.clone()),
-            price_table: crate::pricing::PriceTable::empty(),
-            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32]))
-                .expect("mcp manager"),
-            token_store: crate::token_store::TokenStore::new(db),
-        }
+        crate::test_utils::TestCentralState::new()
+            .await
+            .build_state()
     }
 
     /// Mints a token with the given subject and groups, returns the plaintext.

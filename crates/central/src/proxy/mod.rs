@@ -330,55 +330,19 @@ pub async fn serve(
 mod tests {
     use super::*;
     use crate::audit::AuditLogger;
-    use crate::device_store::DeviceStore;
-    use crate::policy::PolicyStore;
-    use crate::provider::ProviderStore;
-    use crate::usage::UsageTracker;
     use axum::http::StatusCode;
-    use oidc_agent_common::config::{AdminConfig, CentralConfig};
+    use oidc_agent_common::config::AdminConfig;
     use tower::ServiceExt;
     use zeroize::Zeroizing;
 
     /// Builds a minimal dev-mode AppState for middleware-level tests.
     async fn test_state(admin: Option<AdminConfig>) -> AppState {
-        let url = oidc_agent_common::persistence::temp_sqlite_url("proxy-mod");
-        let db = crate::db::setup(&url).await.expect("db setup");
-        let audit = AuditLogger::new(db.clone());
-        let mcp_db = db.clone();
-        AppState {
-            config: CentralConfig {
-                listen_addr: "127.0.0.1:0".parse().expect("addr"),
-                database_url: "sqlite://test.db".into(),
-                oidc: oidc_agent_common::config::OidcConfig {
-                    issuer: "https://idp.example.com".into(),
-                    client_id: "test".into(),
-                    client_secret_env: "TEST".into(),
-                    redirect_uri: "http://127.0.0.1:0/callback".into(),
-                    scopes: vec!["openid".into()],
-                },
-                mtls: oidc_agent_common::config::MtlsServerConfig {
-                    ca_cert_path: "/ca.pem".into(),
-                    server_cert_path: "/server.pem".into(),
-                    server_key_path: "/server.key".into(),
-                },
-                admin,
-                pricing: None,
-                dev_mode: true,
-                rate_limit_requests: 60,
-                rate_limit_window_secs: 60,
-            },
-            provider_store: ProviderStore::new(db.clone(), Zeroizing::new([7_u8; 32])),
-            client: reqwest::Client::new(),
-            audit,
-            rate_limiter: None,
-            policy_store: PolicyStore::new(db.clone()),
-            device_store: DeviceStore::new(db.clone()),
-            usage_tracker: UsageTracker::new(db.clone()),
-            price_table: crate::pricing::PriceTable::empty(),
-            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32]))
-                .expect("mcp manager"),
-            token_store: crate::token_store::TokenStore::new(db),
-        }
+        let mut config = oidc_agent_common::config::CentralConfig::test_dev();
+        config.admin = admin;
+        crate::test_utils::TestCentralState::new()
+            .await
+            .with_config(config)
+            .build_state()
     }
 
     fn admin_group_config() -> AdminConfig {
