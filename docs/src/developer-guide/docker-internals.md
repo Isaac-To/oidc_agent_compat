@@ -63,7 +63,7 @@ Multi-stage build, central proxy only:
 | `mock-backend` | built from `./mock-backend` | `8090:8080` | — |
 | `central` | built from `../..` with `docker/dev/Dockerfile` | `8443:8443` | keycloak (healthy), mock-backend (healthy) |
 | `relay` | built from `../..` with `docker/dev/Dockerfile` | `127.0.0.1:8787:8787` | central (healthy) |
-| `goose` | `ghcr.io/aaif-goose/goose:latest` | — | relay (healthy) |
+| `pi` | built from `./Dockerfile.pi` (Node.js + `@earendil-works/pi-coding-agent`) | — | relay (healthy) |
 
 The dev central receives its provider encryption key via the
 `OAC_PROVIDER_ENCRYPTION_KEY` env var (a fixed dev 64-hex value in the
@@ -77,8 +77,7 @@ headers — there is no init container and no key file on disk.
 |---|---|---|
 | `central-data` | `/data` | central |
 | `relay-data` | `/data` | relay |
-| `goose-config` | `/home/goose/.config/goose` | goose |
-| `./workspace` | `/workspace` | goose (working_dir) |
+| `./workspace` | `/workspace` | pi (working_dir) |
 
 ### Healthchecks
 

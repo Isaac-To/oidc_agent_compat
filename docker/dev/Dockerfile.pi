@@ -1,0 +1,23 @@
+# Pi coding agent container for the OIDC Agent Compatibility Server dev stack.
+#
+# Builds a minimal Node.js image with Pi installed globally.
+# Pi connects to the relay at http://relay:8787 via a pre-configured
+# models.json that reads the API key from the RELAY_API_KEY env var.
+
+FROM node:24-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates git ripgrep curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+
+# Pre-configure Pi to use the relay as an OpenAI-compatible provider.
+# The API key is injected at runtime via the RELAY_API_KEY env var.
+RUN mkdir -p /root/.pi/agent
+COPY pi-config/models.json /root/.pi/agent/models.json
+COPY pi-config/settings.json /root/.pi/agent/settings.json
+
+WORKDIR /workspace
+ENTRYPOINT ["pi"]

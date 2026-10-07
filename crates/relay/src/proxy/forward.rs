@@ -278,35 +278,9 @@ mod tests {
     /// larger router; pin that all four OpenAI-compatible endpoints exist.
     #[tokio::test]
     async fn v1_routes_registers_all_four_endpoints() {
-        use crate::proxy::AppState;
-
-        let url = oidc_agent_common::persistence::temp_sqlite_url("fwd-routes");
-        let db = crate::db::setup(&url).await.expect("db");
-        let config = RelayConfig {
-            listen_addr: "127.0.0.1:0".parse().expect("addr"),
-            database_url: "sqlite://test.db".into(),
-            oidc: oidc_agent_common::config::OidcConfig {
-                issuer: "https://idp.example.com".into(),
-                client_id: "t".into(),
-                client_secret_env: "T".into(),
-                redirect_uri: "http://127.0.0.1:0/callback".into(),
-                scopes: vec!["openid".into()],
-            },
-            central: oidc_agent_common::config::CentralConnectionConfig {
-                url: "http://127.0.0.1:1".into(),
-                ca_cert_path: "/ca.pem".into(),
-                client_cert_path: "/c.pem".into(),
-                client_key_path: "/c.key".into(),
-            },
-            dev_mode: true,
-        };
-        let state = AppState {
-            config: config.clone(),
-            client: build_client(&config).expect("client"),
-            listen_addr: "127.0.0.1:8787".parse().expect("addr"),
-            activity: crate::activity::ActivityLogger::new(db),
-            device_fingerprint: None,
-        };
+        let state = crate::test_utils::TestRelayState::new("http://127.0.0.1:1")
+            .await
+            .build_state();
         let app = v1_routes().with_state(state);
 
         // All four routes must resolve (405 vs 404 distinguishes "wrong

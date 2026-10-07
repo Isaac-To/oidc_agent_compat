@@ -9,7 +9,7 @@
     clippy::indexing_slicing
 )]
 #![cfg_attr(
-    test,
+    any(test, feature = "test-utils"),
     allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)
 )]
 
@@ -21,3 +21,5 @@ pub mod keystore;
 pub mod login;
 pub mod migration;
 pub mod proxy;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;

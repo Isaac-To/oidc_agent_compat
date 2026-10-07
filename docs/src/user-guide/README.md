@@ -1,13 +1,13 @@
 # Overview
 
 The OIDC Agent Compatibility Server is an enterprise-grade forwarder that
-lets employees use any OpenAI-compatible AI agent (Codex, Goose, etc.)
+lets employees use any OpenAI-compatible AI agent (Codex, Pi, etc.)
 through company-approved backends — **without provider keys ever touching an
 employee's laptop**.
 
 ## Why this exists
 
-AI coding agents (Codex, Goose, Cursor, etc.) need an API key to talk to a
+AI coding agents (Codex, Pi, Cursor, etc.) need an API key to talk to a
 backend. In an enterprise, handing every employee a shared backend API key
 is a non-starter: keys leak, get committed to git, and can't be easily
 revoked per-person. This project solves that by inserting two components
@@ -31,7 +31,7 @@ Agent → [127.0.0.1 relay] → mTLS → [central proxy] → [OpenAI-compatible 
 
 | Component | Where it runs | What it does |
 |---|---|---|
-| **Agent** (Codex, Goose, etc.) | Employee laptop | Sends OpenAI-compatible API requests to `127.0.0.1:8787/v1` |
+| **Agent** (Codex, Pi, etc.) | Employee laptop | Sends OpenAI-compatible API requests to `127.0.0.1:8787/v1` |
 | **Relay** (`oac-relay`) | Employee laptop | Authenticates employee via OIDC, requests a central-minted token, injects it into the agent config, forwards traffic over mTLS to the central proxy |
 | **Central proxy** (`oac-central`) | Company-hosted server | Mints and verifies opaque tokens (TokenStore), manages encrypted provider keys, enforces group-based policies and quotas, forwards to the backend with SSE streaming |
 | **IdP** (Okta, Keycloak, etc.) | Company infrastructure | Authenticates employees via OIDC auth-code + PKCE |

@@ -277,10 +277,11 @@ loopback callback).
 
 ## Docker dev stack
 
-Everything runs in Docker; Goose runs headless in a container.
+Everything runs in Docker; Pi runs headless in a container (opt-in via
+Compose profile `agent`).
 
 ```sh
-./docker/dev.sh up|down|status|logs|shell|goose|goose-run|test
+./docker/dev.sh up|down|status|logs|shell|pi|pi-run|test
 ```
 
 - Central proxy serves **mTLS on :8443** in production mode (`dev_mode=false`),
@@ -289,7 +290,7 @@ Everything runs in Docker; Goose runs headless in a container.
   Never probe a prod central proxy over plain HTTP.
 - Relay is a dumb forwarder — it does not auto-mint a dev key. `docker/dev.sh`
   mints a dev token via `POST /v1/tokens` at central after the stack starts, then
-  writes it to the Goose agent config.
+  passes it to the Pi agent as `RELAY_API_KEY`.
 - `dev.sh test` exercises the full chain + SSE + provider-key-leak check.
 - Mock provider key `sk-mock-backend-master-key` is registered at runtime by
   `docker/dev.sh` `cmd_up()` via the admin API (`POST /admin/v1/providers` +

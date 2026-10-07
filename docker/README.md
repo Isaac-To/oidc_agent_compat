@@ -6,7 +6,7 @@ each can evolve for its own purpose.
 
 | Directory | Purpose | What's in it |
 |---|---|---|
-| [`dev/`](dev/README.md) | Local development & testing stack | Keycloak (test IdP), mock backend, central, relay, Goose — all containerized |
+| [`dev/`](dev/README.md) | Local development & testing stack | Keycloak (test IdP), mock backend, central, relay, Pi — all containerized |
 | [`prod/`](prod/README.md) | Production deployment | Only our own server (central proxy); you bring your own IdP and backend |
 
 Shared between the two:
@@ -18,7 +18,7 @@ Shared between the two:
 ## Quick start
 
 ```sh
-# Dev stack (Keycloak + mock backend + central + relay + Goose):
+# Dev stack (Keycloak + mock backend + central + relay + Pi):
 ./docker/dev.sh up
 
 # Production (central proxy only — see prod/README.md for prerequisites):

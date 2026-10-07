@@ -15,10 +15,9 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use oac_central::audit::AuditLogger;
-use oac_central::proxy as central_proxy;
+use oac_central::test_utils::{TestCentralState, spawn_server};
 use oac_relay::keystore::KeyStore;
-use oac_relay::proxy as relay_proxy;
-use zeroize::Zeroizing;
+use oac_relay::test_utils::TestRelayState;
 
 /// Sets up the full system: mock backend + central proxy + relay.
 ///
@@ -32,11 +31,8 @@ async fn setup_full_system() -> (
     AuditLogger,
     oac_relay::keystore::KeyStore,
 ) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
-
-    // 1. Mock OpenAI-compatible backend.
+    // 1. Mock OpenAI-compatible backend (richer than the default mock —
+    //    includes gpt-3.5-turbo and a "hello from backend" response).
     let mock_backend = Router::new()
         .route(
             "/v1/models",
@@ -62,117 +58,26 @@ async fn setup_full_system() -> (
                 )
             }),
         );
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind backend");
-    let backend_addr = backend_listener.local_addr().expect("backend addr");
-    tokio::spawn(async {
-        let _ = axum::serve(backend_listener, mock_backend).await;
-    });
+    let backend_addr = spawn_server(mock_backend).await;
 
-    // 2. Central proxy.
-    let central_tmp = std::env::temp_dir().join(format!(
-        "oac-e2e-central-{}-{counter}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
-    let central_url = format!("sqlite://{}?mode=rwc", central_tmp.display());
-    let central_db = oac_central::db::setup(&central_url)
+    // 2. Central proxy with a provider pointing at the mock backend.
+    let central = TestCentralState::new()
         .await
-        .expect("central db");
-    let audit = AuditLogger::new(central_db);
-
-    let central_config = oidc_agent_common::config::CentralConfig {
-        listen_addr: "127.0.0.1:0".parse().expect("addr"),
-        database_url: "sqlite://test.db".into(),
-        oidc: oidc_agent_common::config::OidcConfig {
-            issuer: "https://idp.example.com".into(),
-            client_id: "test".into(),
-            client_secret_env: "TEST".into(),
-            redirect_uri: "http://127.0.0.1:0/callback".into(),
-            scopes: vec!["openid".into()],
-        },
-        mtls: oidc_agent_common::config::MtlsServerConfig {
-            ca_cert_path: "/ca.pem".into(),
-            server_cert_path: "/server.pem".into(),
-            server_key_path: "/server.key".into(),
-        },
-        admin: None,
-        pricing: None,
-        dev_mode: true,
-        rate_limit_requests: 60,
-        rate_limit_window_secs: 60,
-    };
-
-    let provider_store =
-        oac_central::provider::ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
-    provider_store
-        .upsert_provider(&oac_central::provider::ProviderInput {
-            id: "mock-backend".into(),
-            name: "mock-backend".into(),
-            base_url: format!("http://{backend_addr}"),
-            enabled: true,
-            is_default: true,
-            models: Some(vec!["gpt-4".into()]),
-        })
-        .await
-        .expect("provider");
-    provider_store
-        .add_key(
+        .with_provider(
             "mock-backend",
-            "test-key",
+            &format!("http://{backend_addr}"),
             "sk-e2e-master-key-secret",
-            0,
-            &[],
         )
-        .await
-        .expect("provider key");
-    let central_client = central_proxy::forward::build_client().expect("central client");
-    let central_state = central_proxy::AppState {
-        config: central_config.clone(),
-        provider_store,
-        client: central_client,
-        audit: audit.clone(),
-        rate_limiter: None,
-        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
-        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
-        usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
-        price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(
-            audit.db().clone(),
-            Zeroizing::new([7_u8; 32]),
-        )
-        .expect("mcp manager"),
-        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
-    };
-    let central_app = central_proxy::router(central_state);
-    let central_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind central");
-    let central_addr = central_listener.local_addr().expect("central addr");
-    tokio::spawn(async {
-        let _ = axum::serve(central_listener, central_app).await;
-    });
+        .await;
+    let audit = central.audit.clone();
+    let (central_addr, _) = central.spawn().await;
 
-    // 3. Relay proxy.
-    let relay_tmp = std::env::temp_dir().join(format!(
-        "oac-e2e-relay-{}-{counter}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
-    let relay_url = format!("sqlite://{}?mode=rwc", relay_tmp.display());
-    let relay_db = oac_relay::db::setup(&relay_url).await.expect("relay db");
-    let key_store = KeyStore::new(relay_db);
+    // 3. Relay proxy pointing at the central.
+    let relay = TestRelayState::new(&format!("http://{central_addr}")).await;
+    let key_store = KeyStore::new(relay.db.clone());
 
-    // Create the relay-side identity first so its database id can be
-    // carried in the central token record (the central proxy's audit log
-    // records the identity_id from the verified token, not from headers).
+    // Create the relay-side identity so its database id can be carried in
+    // the central token record.
     let ident = key_store
         .upsert_identity(
             "https://idp.example.com",
@@ -184,11 +89,9 @@ async fn setup_full_system() -> (
         .await
         .expect("identity");
 
-    // Mint a central token (carrying the relay identity id) and register
-    // it as a local relay key so both the relay (local auth) and the
-    // central proxy (token store) accept it.
-    let central_token_store = oac_central::token_store::TokenStore::new(audit.db().clone());
-    let minted_central = central_token_store
+    // Mint a central token carrying the relay identity id.
+    let minted = central
+        .token_store
         .mint_token(&oac_central::token_store::MintRequest {
             subject: "e2e-user".into(),
             issuer: "https://idp.example.com".into(),
@@ -202,54 +105,11 @@ async fn setup_full_system() -> (
         })
         .await
         .expect("mint central token");
-    let local_key = minted_central.plaintext.to_string();
+    let local_key = minted.plaintext.to_string();
 
-    // The relay no longer registers the token as a local key — it forwards
-    // the bearer to central, which verifies it via its token store.
+    let (relay_addr, client) = relay.spawn().await;
 
-    let relay_config = oidc_agent_common::config::RelayConfig {
-        listen_addr: "127.0.0.1:0".parse().expect("addr"),
-        database_url: "sqlite://test.db".into(),
-        oidc: oidc_agent_common::config::OidcConfig {
-            issuer: "https://idp.example.com".into(),
-            client_id: "test".into(),
-            client_secret_env: "TEST".into(),
-            redirect_uri: "http://127.0.0.1:0/callback".into(),
-            scopes: vec!["openid".into()],
-        },
-        central: oidc_agent_common::config::CentralConnectionConfig {
-            url: format!("http://{}", central_addr),
-            ca_cert_path: "/ca.pem".into(),
-            client_cert_path: "/client.pem".into(),
-            client_key_path: "/client.key".into(),
-        },
-        dev_mode: true,
-    };
-
-    let relay_client = relay_proxy::forward::build_client(&relay_config).expect("relay client");
-    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind relay");
-    let relay_addr = relay_listener.local_addr().expect("relay addr");
-    let relay_state = relay_proxy::AppState {
-        config: relay_config.clone(),
-        client: relay_client,
-        listen_addr: relay_addr,
-        activity: oac_relay::activity::ActivityLogger::new(key_store.db.clone()),
-        device_fingerprint: None,
-    };
-    let relay_app = relay_proxy::router(relay_state);
-    tokio::spawn(async {
-        let _ = axum::serve(relay_listener, relay_app).await;
-    });
-
-    (
-        relay_addr,
-        reqwest::Client::new(),
-        local_key,
-        audit,
-        key_store,
-    )
+    (relay_addr, client, local_key, audit, key_store)
 }
 
 #[tokio::test]

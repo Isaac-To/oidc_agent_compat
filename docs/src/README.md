@@ -2,7 +2,7 @@
 
 Welcome to the documentation for the **OIDC Agent Compatibility Server** —
 an enterprise-grade OIDC-to-AI-agent forwarder that lets employees use any
-OpenAI-compatible AI agent (Codex, Goose, etc.) through company-approved
+OpenAI-compatible AI agent (Codex, Pi, etc.) through company-approved
 backends **without the master backend key ever touching an employee's
 laptop**.
 

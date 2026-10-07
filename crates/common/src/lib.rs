@@ -31,7 +31,10 @@
     clippy::indexing_slicing
 )]
 // In tests, `unwrap`/`expect` are acceptable for brevity and clarity.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+#![cfg_attr(
+    any(test, feature = "test-utils"),
+    allow(clippy::unwrap_used, clippy::expect_used)
+)]
 
 pub mod config;
 pub mod error;

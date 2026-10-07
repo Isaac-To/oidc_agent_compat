@@ -1,0 +1,19 @@
+{
+  "providers": {
+    "relay": {
+      "baseUrl": "http://relay:8787/v1",
+      "api": "openai-completions",
+      "apiKey": "$RELAY_API_KEY",
+      "models": [
+        {
+          "id": "mock-gpt-4",
+          "name": "Mock GPT-4 (via relay)"
+        },
+        {
+          "id": "mock-gpt-4o",
+          "name": "Mock GPT-4o (via relay)"
+        }
+      ]
+    }
+  }
+}

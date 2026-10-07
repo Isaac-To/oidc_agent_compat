@@ -14,12 +14,12 @@ itself.
 | Mock backend | `mock-backend` | `localhost:8090` | OpenAI-compatible Flask server |
 | Central proxy | `central` | `localhost:8443` | Mints/verifies tokens, holds the encrypted provider key |
 | Relay | `relay` | `127.0.0.1:8787` | Forwards to central |
-| Goose | `goose` | — | AI agent (headless) |
+| Pi | `pi` | — | AI agent (headless, opt-in via `--profile agent`) |
 
 ```sh
 ./docker/dev.sh up       # Start all containers
 ./docker/dev.sh test     # Run full-chain tests
-./docker/dev.sh goose-run "Hello!"  # Run Goose
+./docker/dev.sh pi-run "Hello!"  # Run Pi
 ./docker/dev.sh down     # Stop
 ```
 

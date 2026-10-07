@@ -51,7 +51,11 @@ uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 bytes = "1"
 
+[features]
+test-utils = ["oidc-agent-common/test-utils"]
+
 [dev-dependencies]
 oidc-agent-common = { workspace = true, features = ["test-certs", "test-utils"] }
+oac-central = { path = ".", features = ["test-utils"] }
 rcgen = { workspace = true }
 tokio = { workspace = true }

@@ -47,7 +47,11 @@ async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 
+[features]
+test-utils = ["oidc-agent-common/test-utils"]
+
 [dev-dependencies]
 oidc-agent-common = { workspace = true, features = ["test-certs", "test-utils"] }
+oac-relay = { path = ".", features = ["test-utils"] }
 rcgen = { workspace = true }
 tokio = { workspace = true }

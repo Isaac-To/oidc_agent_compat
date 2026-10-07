@@ -124,12 +124,15 @@ default, production only). If you hit this:
 - If it still fails, check Keycloak logs:
   `docker compose -f docker/dev/docker-compose.yml logs keycloak`.
 
-### Goose can't connect to relay
+### Pi can't connect to relay
 
 - Ensure the relay container is healthy:
   `docker compose -f docker/dev/docker-compose.yml ps relay`.
-- Goose connects to `http://relay:8787` over the Docker network. Ensure
+- Pi connects to `http://relay:8787` over the Docker network. Ensure
   both containers are on the same network.
+- The Pi service uses a Compose profile (`agent`). Make sure to include
+  `--profile agent` when running it manually, or use
+  `./docker/dev.sh pi-run "prompt"` which handles this automatically.
 
 ## Logging
 

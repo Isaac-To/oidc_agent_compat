@@ -28,7 +28,7 @@
 ### For the dev stack (optional)
 
 - **Docker** and **Docker Compose** — for running the bundled dev stack
-  (Keycloak + mock backend + central + relay + Goose).
+  (Keycloak + mock backend + central + relay + Pi).
 
 ### For documentation (optional)
 

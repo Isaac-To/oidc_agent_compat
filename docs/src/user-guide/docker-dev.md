@@ -1,16 +1,16 @@
 # Docker: Dev Stack
 
 The dev stack runs the entire system in Docker: Keycloak (IdP), mock
-backend, central proxy, relay, and Goose (AI agent). It's the fastest way
+backend, central proxy, relay, and Pi (AI agent). It's the fastest way
 to get a working end-to-end setup.
 
 ## Architecture
 
 ```
-Goose (Docker) → relay (Docker, :8787) → central (Docker, :8443) → mock-backend (Docker, :8080)
-                                       ↑ encrypted provider key (dev secret)
-                    ↑ OIDC (browser)
-              Keycloak (Docker, :8080)
+Pi (Docker) → relay (Docker, :8787) → central (Docker, :8443) → mock-backend (Docker, :8080)
+                                    ↑ encrypted provider key (dev secret)
+                 ↑ OIDC (browser)
+           Keycloak (Docker, :8080)
 ```
 
 (Ports shown are the in-network container ports. The mock backend is
@@ -24,8 +24,8 @@ published to the host on `localhost:8090`; the relay is published on
 | Keycloak | `keycloak` | `localhost:8080` | OIDC IdP with pre-configured realm `oac-dev` |
 | Mock backend | `mock-backend` | `localhost:8090` | OpenAI-compatible Flask server |
 | Central proxy | `central` | `localhost:8443` | Resolves the encrypted mock provider key, forwards to mock-backend |
-| Relay | `relay` | `127.0.0.1:8787` | Forwards to central; Goose connects here |
-| Goose | `goose` | — | AI agent (headless CLI, connects to relay) |
+| Relay | `relay` | `127.0.0.1:8787` | Forwards to central; Pi connects here |
+| Pi | `pi` | — | AI agent (headless CLI, connects to relay; opt-in via `--profile agent`) |
 
 ## Test users
 
@@ -56,8 +56,8 @@ The `docker/dev.sh` script orchestrates the dev stack:
 | `./docker/dev.sh status` | Show container status |
 | `./docker/dev.sh logs` | Tail logs from all services |
 | `./docker/dev.sh shell` | Open a shell in the relay container |
-| `./docker/dev.sh goose` | Show Goose usage info |
-| `./docker/dev.sh goose-run "prompt"` | Run a headless Goose prompt through the full chain |
+| `./docker/dev.sh pi` | Show Pi usage info |
+| `./docker/dev.sh pi-run "prompt"` | Run a headless Pi prompt through the full chain |
 | `./docker/dev.sh test` | Send test requests through the full chain (infra + full chain + SSE + provider-key-leak check) |
 
 ## Quick start
@@ -66,14 +66,14 @@ The `docker/dev.sh` script orchestrates the dev stack:
 # Start everything:
 ./docker/dev.sh up
 
-# Run a Goose prompt:
-./docker/dev.sh goose-run "Hello from Goose!"
+# Run a Pi prompt:
+./docker/dev.sh pi-run "Hello from Pi!"
 
 # Run the test suite:
 ./docker/dev.sh test
 
-# Interactive Goose session:
-docker compose -f docker/dev/docker-compose.yml run --rm goose session
+# Interactive Pi session:
+docker compose -f docker/dev/docker-compose.yml --profile agent run --rm -it pi
 ```
 
 ## Manual requests
@@ -184,8 +184,12 @@ docker/
 ├── generate-certs.sh         # Generates mTLS CA + server + client certs
 ├── certs/                    # Generated certs (gitignored)
 └── dev/
-    ├── docker-compose.yml     # Keycloak + mock-backend + central + relay + goose
+    ├── docker-compose.yml     # Keycloak + mock-backend + central + relay + pi
     ├── Dockerfile             # Builds oac-central + oac-relay binaries
+    ├── Dockerfile.pi          # Builds the Pi agent image (Node.js + pi-coding-agent)
+    ├── pi-config/
+    │   ├── models.json        # Pi provider config (relay as OpenAI-compatible endpoint)
+    │   └── settings.json      # Pi default provider/model settings
     ├── configs/
     │   ├── central.toml
     │   ├── relay.toml
@@ -195,5 +199,5 @@ docker/
     ├── mock-backend/
     │   ├── Dockerfile         # Python Flask image
     │   └── app.py            # OpenAI-compatible mock API
-    └── workspace/             # Goose working directory
+    └── workspace/             # Pi working directory
 ```
