@@ -19,7 +19,7 @@ All configs are parsed and validated by
 | Field | Type | Required | Default | Validation |
 |---|---|---|---|---|
 | `listen_addr` | `SocketAddr` | yes | — | Must be loopback (`127.0.0.0/8` or `::1`) unless `dev_mode = true` |
-| `database_url` | `String` | yes | — | SQLite URL, e.g. `sqlite://~/.oac/relay.db` (`~` is expanded in `sqlite://` URLs) |
+| `database_url` | `String` | yes | — | Must start with `sqlite://`, `postgres://`, or `postgresql://`. E.g. `sqlite://~/.oac/relay.db` (`~` is expanded in `sqlite://` URLs) |
 | `oidc` | table | yes | — | See [OIDC](#oidc) below |
 | `central` | table | yes | — | See [Central connection](#central-connection) below |
 | `dev_mode` | `bool` | no | `false` | When `true`: allows non-loopback bind, HTTP central URL, skips auth checks |
@@ -80,7 +80,7 @@ client_key_path = "/etc/oac/client.key"
 | Field | Type | Required | Default | Validation |
 |---|---|---|---|---|
 | `listen_addr` | `SocketAddr` | yes | — | e.g. `0.0.0.0:8443` |
-| `database_url` | `String` | yes | — | SQLite or Postgres URL |
+| `database_url` | `String` | yes | — | Must start with `sqlite://`, `postgres://`, or `postgresql://` |
 | `oidc` | table | yes | — | See [OIDC](#oidc-1) below |
 | `mtls` | table | yes | — | See [mTLS server](#mtls-server) below |
 | `admin` | table | no | `None` (admin API disabled) | See [Admin](#admin) below |

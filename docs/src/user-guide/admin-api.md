@@ -453,10 +453,16 @@ row is deleted from central's database.
 
 Revoke a specific token by its row ID (UUID). Bearer-authenticated — the
 caller must hold a valid token (any of their tokens) for authentication. This
-lets a user revoke any of their tokens, not just the current one.
+lets a user revoke any of **their own** tokens, not just the current one.
 
-**Response:** `204 No Content` (401 if the bearer is invalid, 500 if the
-revocation fails).
+**Ownership enforcement:** The central proxy verifies that the token with the
+given ID belongs to the authenticated subject. Attempting to revoke another
+user's token returns `404 Not Found` (the same response as a nonexistent
+token, to avoid leaking token existence across users).
+
+**Response:** `204 No Content` (401 if the bearer is invalid, 404 if the
+token does not exist or belongs to a different user, 500 if the revocation
+fails).
 
 ### `GET /v1/tokens`
 

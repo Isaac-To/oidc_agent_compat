@@ -141,8 +141,9 @@ oac-relay --config config.toml token list
 ##### `token revoke`
 
 Revoke a specific token by its row ID (UUID). The current token is used
-for authentication; any of the user's tokens can be revoked (including the
-current one).
+for authentication; **only tokens belonging to the current user** can be
+revoked (the central proxy enforces ownership — attempting to revoke
+another user's token returns 404).
 
 ```sh
 oac-relay --config config.toml token revoke <token-id>
@@ -150,6 +151,29 @@ oac-relay --config config.toml token revoke <token-id>
 
 Calls `DELETE /v1/tokens/{id}` at central with `Authorization: Bearer`.
 Returns success (204) or an error message.
+
+#### `status`
+
+Show relay status: config summary, database health, central proxy
+connectivity, and token info. This is a diagnostic command — it does not
+start the relay server.
+
+```sh
+oac-relay --config config.toml status
+```
+
+Checks performed:
+
+| Check | Description |
+|---|---|
+| Config | Shows listen address, database URL (redacted), OIDC issuer, central URL, dev mode |
+| Database | Verifies the SQLite database is accessible |
+| Central proxy | Pings the central proxy's `/healthz` endpoint (5s timeout) |
+| Agent config | Checks if the agent config file exists (login status) |
+| Token list | Lists tokens via the central API (if logged in) |
+
+Each check reports `OK`, `WARN`, or `FAIL` with details. The API key is
+redacted (only the first 12 characters are shown).
 
 ---
 
