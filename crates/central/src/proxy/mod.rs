@@ -329,11 +329,9 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audit::AuditLogger;
     use axum::http::StatusCode;
     use oidc_agent_common::config::AdminConfig;
     use tower::ServiceExt;
-    use zeroize::Zeroizing;
 
     /// Builds a minimal dev-mode AppState for middleware-level tests.
     async fn test_state(admin: Option<AdminConfig>) -> AppState {
@@ -662,6 +660,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn serve_boots_dev_and_mtls_then_shuts_down_gracefully() {
+        use crate::audit::AuditLogger;
+        use zeroize::Zeroizing;
+
         let dev_url = oidc_agent_common::persistence::temp_sqlite_url("serve-dev");
         let dev_db = crate::db::setup(&dev_url).await.expect("db setup");
         let dev_audit = AuditLogger::new(dev_db);
