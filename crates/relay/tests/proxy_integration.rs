@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use oac_relay::proxy;
+use oac_relay::test_utils::TestRelayState;
 
 /// Sets up a test relay with a mock central proxy.
 ///
@@ -30,27 +31,6 @@ async fn setup_test_relay() -> (
     String,
     sea_orm::DatabaseConnection,
 ) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
-
-    // Set up the relay DB.
-    let tmp = std::env::temp_dir().join(format!(
-        "oac-integ-test-{}-{counter}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
-    let url = format!("sqlite://{}?mode=rwc", tmp.display());
-    let db = oac_relay::db::setup(&url).await.expect("db setup");
-
-    // The relay does not mint or verify local keys. The bearer token is a
-    // dummy — the relay only checks it's present (non-dev mode). Central
-    // verifies it.
-    let key = "oac_dummy_token_relay_does_not_verify".to_string();
-
     // Set up a mock central proxy.
     let mock_central = Router::new()
         .route(
@@ -71,44 +51,17 @@ async fn setup_test_relay() -> (
         let _ = axum::serve(mock_listener, mock_central).await;
     });
 
+    // The relay does not mint or verify local keys. The bearer token is a
+    // dummy — the relay only checks it's present (non-dev mode). Central
+    // verifies it.
+    let key = "oac_dummy_token_relay_does_not_verify".to_string();
+
     // Set up the relay pointing at the mock central.
-    let config = oidc_agent_common::config::RelayConfig {
-        listen_addr: "127.0.0.1:0".parse().expect("addr"),
-        database_url: "sqlite://test.db".into(),
-        oidc: oidc_agent_common::config::OidcConfig {
-            issuer: "https://idp.example.com".into(),
-            client_id: "test".into(),
-            client_secret_env: "TEST".into(),
-            redirect_uri: "http://127.0.0.1:0/callback".into(),
-            scopes: vec!["openid".into()],
-        },
-        central: oidc_agent_common::config::CentralConnectionConfig {
-            url: format!("http://{}", mock_addr),
-            ca_cert_path: "/ca.pem".into(),
-            client_cert_path: "/client.pem".into(),
-            client_key_path: "/client.key".into(),
-        },
-        dev_mode: true,
-    };
+    let state = TestRelayState::new(&format!("http://{mock_addr}")).await;
+    let db = state.db.clone();
+    let (relay_addr, client) = state.spawn().await;
 
-    let client = proxy::forward::build_client(&config).expect("client");
-    let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind relay");
-    let relay_addr = relay_listener.local_addr().expect("relay addr");
-    let state = proxy::AppState {
-        config: config.clone(),
-        client,
-        listen_addr: relay_addr,
-        activity: oac_relay::activity::ActivityLogger::new(db.clone()),
-        device_fingerprint: None,
-    };
-    let app = proxy::router(state);
-    tokio::spawn(async {
-        let _ = axum::serve(relay_listener, app).await;
-    });
-
-    (relay_addr, reqwest::Client::new(), key, db)
+    (relay_addr, client, key, db)
 }
 
 #[tokio::test]

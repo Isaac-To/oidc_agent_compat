@@ -16,118 +16,24 @@ use axum::Router;
 use oac_central::audit::AuditLogger;
 use oac_central::provider::{ProviderInput, ProviderStore};
 use oac_central::proxy;
+use oac_central::test_utils::{TestCentralState, mock_backend_router, spawn_server};
 use zeroize::Zeroizing;
 
 /// Sets up a test central proxy with a mock backend.
 async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let counter = COUNTER.fetch_add(1, Ordering::SeqCst);
-
     // Set up a mock OpenAI-compatible backend.
-    let mock_backend = Router::new()
-        .route(
-            "/v1/models",
-            axum::routing::get(|| async {
-                r#"{"data": [{"id": "gpt-4"}]}"#
-            }),
+    let mock_addr = spawn_server(mock_backend_router()).await;
+
+    // Set up the central proxy with the test builder.
+    let state = TestCentralState::new()
+        .await
+        .with_provider(
+            "mock",
+            &format!("http://{mock_addr}"),
+            "sk-test-master-key-12345",
         )
-        .route(
-            "/v1/chat/completions",
-            axum::routing::post(|_body: axum::body::Body| async {
-                (
-                    [("content-type", "application/json")],
-                    r#"{"choices": [{"message": {"content": "hello"}}], "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}"#,
-                )
-            }),
-        );
-    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock");
-    let mock_addr = mock_listener.local_addr().expect("mock addr");
-    tokio::spawn(async {
-        let _ = axum::serve(mock_listener, mock_backend).await;
-    });
-
-    // Set up the central DB.
-    let tmp = std::env::temp_dir().join(format!(
-        "oac-central-integ-{}-{counter}-{}.db",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-    ));
-    let url = format!("sqlite://{}?mode=rwc", tmp.display());
-    let db = oac_central::db::setup(&url).await.expect("db setup");
-    let audit = AuditLogger::new(db);
-
-    let config = oidc_agent_common::config::CentralConfig {
-        listen_addr: "127.0.0.1:0".parse().expect("addr"),
-        database_url: "sqlite://test.db".into(),
-        oidc: oidc_agent_common::config::OidcConfig {
-            issuer: "https://idp.example.com".into(),
-            client_id: "test".into(),
-            client_secret_env: "TEST".into(),
-            redirect_uri: "http://127.0.0.1:0/callback".into(),
-            scopes: vec!["openid".into()],
-        },
-        mtls: oidc_agent_common::config::MtlsServerConfig {
-            ca_cert_path: "/ca.pem".into(),
-            server_cert_path: "/server.pem".into(),
-            server_key_path: "/server.key".into(),
-        },
-        admin: None,
-        pricing: None,
-        dev_mode: true,
-        rate_limit_requests: 60,
-        rate_limit_window_secs: 60,
-    };
-
-    let provider_store = ProviderStore::new(audit.db().clone(), Zeroizing::new([7_u8; 32]));
-    provider_store
-        .upsert_provider(&ProviderInput {
-            id: "mock".into(),
-            name: "mock".into(),
-            base_url: format!("http://{mock_addr}"),
-            enabled: true,
-            is_default: true,
-            models: Some(vec!["gpt-4".into()]),
-        })
-        .await
-        .expect("provider");
-    provider_store
-        .add_key("mock", "test-key", "sk-test-master-key-12345", 0, &[])
-        .await
-        .expect("provider key");
-    let client = proxy::forward::build_client().expect("client");
-    let state = proxy::AppState {
-        config: config.clone(),
-        provider_store,
-        client,
-        audit: audit.clone(),
-        rate_limiter: None,
-        policy_store: oac_central::policy::PolicyStore::new(audit.db().clone()),
-        device_store: oac_central::device_store::DeviceStore::new(audit.db().clone()),
-        usage_tracker: oac_central::usage::UsageTracker::new(audit.db().clone()),
-        price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(
-            audit.db().clone(),
-            Zeroizing::new([7_u8; 32]),
-        )
-        .expect("mcp manager"),
-        token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
-    };
-    let app = proxy::router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind central");
-    let addr = listener.local_addr().expect("central addr");
-    tokio::spawn(async {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    (addr, reqwest::Client::new())
+        .await;
+    state.spawn().await
 }
 
 /// Mints a token via the central proxy's token API endpoint.

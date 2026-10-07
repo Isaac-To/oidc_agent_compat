@@ -244,6 +244,38 @@ impl RelayConfig {
         }
         Ok(())
     }
+
+    /// Creates a minimal dev-mode config for tests.
+    ///
+    /// Uses `127.0.0.1:0` (random port), a placeholder database URL, dummy
+    /// OIDC settings, and `dev_mode = true`. The `central_url` parameter
+    /// sets the central proxy URL (use `http://127.0.0.1:1` for a dead
+    /// endpoint, or the actual address of a spawned central).
+    ///
+    /// This is gated behind the `test-utils` feature so it is only compiled
+    /// into test builds of dependent crates.
+    #[cfg(feature = "test-utils")]
+    #[must_use]
+    pub fn test_dev(central_url: &str) -> Self {
+        Self {
+            listen_addr: "127.0.0.1:0".parse().expect("valid addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "test".into(),
+                client_secret_env: "TEST".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            central: CentralConnectionConfig {
+                url: central_url.into(),
+                ca_cert_path: "/ca.pem".into(),
+                client_cert_path: "/client.pem".into(),
+                client_key_path: "/client.key".into(),
+            },
+            dev_mode: true,
+        }
+    }
 }
 
 impl CentralConfig {
@@ -257,6 +289,39 @@ impl CentralConfig {
             toml::from_str(toml_str).map_err(|e| Error::Config(format!("toml parse: {e}")))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Creates a minimal dev-mode config for tests.
+    ///
+    /// Uses `127.0.0.1:0` (random port), a placeholder database URL, dummy
+    /// OIDC settings, dummy mTLS cert paths, and `dev_mode = true`.
+    ///
+    /// This is gated behind the `test-utils` feature so it is only compiled
+    /// into test builds of dependent crates.
+    #[cfg(feature = "test-utils")]
+    #[must_use]
+    pub fn test_dev() -> Self {
+        Self {
+            listen_addr: "127.0.0.1:0".parse().expect("valid addr"),
+            database_url: "sqlite://test.db".into(),
+            oidc: OidcConfig {
+                issuer: "https://idp.example.com".into(),
+                client_id: "test".into(),
+                client_secret_env: "TEST".into(),
+                redirect_uri: "http://127.0.0.1:0/callback".into(),
+                scopes: vec!["openid".into()],
+            },
+            mtls: MtlsServerConfig {
+                ca_cert_path: "/ca.pem".into(),
+                server_cert_path: "/server.pem".into(),
+                server_key_path: "/server.key".into(),
+            },
+            admin: None,
+            pricing: None,
+            dev_mode: true,
+            rate_limit_requests: 60,
+            rate_limit_window_secs: 60,
+        }
     }
 
     /// Validates the config.
