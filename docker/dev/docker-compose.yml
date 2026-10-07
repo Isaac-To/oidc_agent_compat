@@ -1,7 +1,7 @@
 # Docker dev stack for the OIDC Agent Compatibility Server.
 #
 # All services run in containers — no host dependencies beyond Docker.
-# Goose runs headless in a container and connects to the relay via the
+# Pi runs headless in a container and connects to the relay via the
 # Docker network.
 #
 # Services:
@@ -9,7 +9,7 @@
 #   mock-backend  — OpenAI-compatible mock API (Flask)
 #   central       — Central proxy (holds encrypted provider keys, forwards to mock-backend)
 #   relay         — Laptop relay (forwards to central, exposed on 127.0.0.1:8787)
-#   goose         — AI agent (headless CLI, connects to relay)
+#   pi            — AI agent (headless CLI, connects to relay)
 
 services:
   keycloak:
@@ -90,39 +90,36 @@ services:
       timeout: 3s
       retries: 10
 
-  # Goose AI agent — runs headless in a container.
+  # Pi AI agent — runs headless in a container.
   # Connects to the relay via the Docker network at http://relay:8787.
-  # Uses the built-in 'openai' provider with a custom host pointing at the relay.
-  goose:
-    # NOTE: pinned to :latest for convenience. For reproducible dev stacks,
-    # pin to a specific tag or digest (e.g. ghcr.io/aaif-goose/goose@sha256:...).
-    image: ghcr.io/aaif-goose/goose:latest
+  # Pre-configured via models.json to use the relay as an OpenAI-compatible
+  # provider. The API key is injected at runtime via RELAY_API_KEY.
+  #
+  # This service uses a Compose profile so it is NOT built/started by default.
+  # Enable it with: docker compose --profile agent run --rm -e RELAY_API_KEY=... pi -p "Hello"
+  # Or simply use: ./docker/dev.sh pi-run "Hello"
+  pi:
+    profiles: ["agent"]
+    build:
+      context: .
+      dockerfile: Dockerfile.pi
     environment:
-      # Use the built-in openai provider pointing at the relay.
-      GOOSE_PROVIDER: openai
-      GOOSE_MODEL: mock-gpt-4
       # Dev token is minted dynamically by docker/dev.sh after central starts.
-      # Set OPENAI_API_KEY at runtime (e.g. via docker compose run --env).
-      # OPENAI_API_KEY: set-at-runtime
-      OPENAI_HOST: http://relay:8787
-      OPENAI_BASE_PATH: v1/chat/completions
-      # Headless mode — auto-approve tools, no prompts.
-      GOOSE_MODE: auto
-      GOOSE_DISABLE_SESSION_NAMING: "true"
-      GOOSE_CONTEXT_STRATEGY: summarize
+      # Passed at runtime via: docker compose run --rm -e RELAY_API_KEY=... pi
+      # RELAY_API_KEY: set-at-runtime
+      # Disable network activity (model catalog refresh, version check, telemetry).
+      PI_OFFLINE: "1"
+      PI_SKIP_VERSION_CHECK: "1"
+      PI_TELEMETRY: "0"
     volumes:
-      - goose-config:/home/goose/.config/goose
       - ./workspace:/workspace
     working_dir: /workspace
-    stdin_open: true
-    tty: true
     depends_on:
       relay:
         condition: service_healthy
-    # Default command prints help; use `run -t "prompt"` for headless execution.
-    # Example: docker compose run --rm goose run --no-session -t "Hello!"
+    # Default command is `pi` (ENTRYPOINT). Use `-p "prompt"` for headless execution.
+    # Example: docker compose --profile agent run --rm -e RELAY_API_KEY=... pi -p "Hello!"
 
 volumes:
   central-data:
   relay-data:
-  goose-config:

@@ -1,0 +1,4 @@
+{
+  "defaultProvider": "relay",
+  "defaultModel": "mock-gpt-4"
+}

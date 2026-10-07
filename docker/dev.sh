@@ -1,7 +1,7 @@
 #!/bin/bash
 # Dev environment orchestration for the OIDC Agent Compatibility Server.
 #
-# Everything runs in Docker containers, including Goose (headless).
+# Everything runs in Docker containers, including Pi (headless).
 # The relay is exposed to the host on 127.0.0.1:8787 for direct tests.
 #
 # Usage:
@@ -10,8 +10,8 @@
 #   ./docker/dev.sh down       — stop all containers
 #   ./docker/dev.sh status     — show status
 #   ./docker/dev.sh logs       — tail logs from all services
-#   ./docker/dev.sh goose      — configure Goose to use the relay
-#   ./docker/dev.sh goose-run  — run a headless Goose prompt
+#   ./docker/dev.sh pi         — show Pi usage info
+#   ./docker/dev.sh pi-run     — run a headless Pi prompt
 #   ./docker/dev.sh test       — send test requests through the full chain
 #   ./docker/dev.sh shell      — open a shell in the relay container
 
@@ -60,7 +60,7 @@ cmd_up() {
     info "Minting a dev token at central..."
     # Mint a dev token via the central token API (POST /v1/tokens).
     # The relay is a dumb forwarder — it does not mint keys locally.
-    # This token is used for Goose and for admin API calls in the dev stack.
+    # This token is used for Pi and for admin API calls in the dev stack.
     DEV_TOKEN=$(curl -sfS -X POST http://localhost:8443/v1/tokens \
         -H 'Content-Type: application/json' \
         -d '{"subject":"dev-alice","issuer":"dev","email":"alice@example.com","groups":["oac-admins"],"label":"dev-stack","ttl_seconds":null}' \
@@ -101,7 +101,7 @@ cmd_up() {
     echo "    admin   / admin-pass-000   (admin@example.com)"
     echo ""
     echo "  Next steps:"
-    echo "    ./docker/dev.sh goose   — configure Goose"
+    echo "    ./docker/dev.sh pi      — show Pi usage info"
     echo "    ./docker/dev.sh test    — send a test request"
     echo "═══════════════════════════════════════════════════════════════════════"
 }
@@ -124,35 +124,42 @@ cmd_shell() {
     docker compose -f "$COMPOSE_FILE" exec relay /bin/bash
 }
 
-cmd_goose() {
-    info "Goose is now containerized. Usage:"
+cmd_pi() {
+    info "Pi is now containerized. Usage:"
     echo ""
-    echo "  # Run a headless prompt through Goose → relay → central → backend:"
-    echo "  ./docker/dev.sh goose-run \"Summarize the files in /workspace\""
+    echo "  # Run a headless prompt through Pi → relay → central → backend:"
+    echo "  ./docker/dev.sh pi-run \"Summarize the files in /workspace\""
     echo ""
-    echo "  # Open an interactive Goose session:"
-    echo "  docker compose -f docker/dev/docker-compose.yml run --rm goose session"
+    echo "  # Open an interactive Pi session:"
+    echo "  docker compose -f docker/dev/docker-compose.yml --profile agent run --rm -it pi"
     echo ""
-    echo "  # Goose is configured to use the relay at http://relay:8787"
-    echo "  # with a central-minted dev token and model 'mock-gpt-4'.
-  # The dev token is minted by 'dev.sh up' via POST /v1/tokens at central."
-    echo ""
-    echo "  # To use a different key, edit the OPENAI_API_KEY env var in"
-    echo "  # docker/dev/docker-compose.yml under the 'goose' service."
+    echo "  # Pi is pre-configured to use the relay at http://relay:8787"
+    echo "  # with model 'mock-gpt-4'. The dev token is minted by 'dev.sh up'"
+    echo "  # via POST /v1/tokens at central and passed as RELAY_API_KEY."
 }
 
-cmd_goose_run() {
-    local prompt="${2:-Hello from Goose!}"
-    info "Running Goose headless: $prompt"
-    info "  Goose → relay (relay:8787) → central (central:8443) → mock-backend"
+cmd_pi_run() {
+    local prompt="${2:-Hello from Pi!}"
+    info "Running Pi headless: $prompt"
+    info "  Pi → relay (relay:8787) → central (central:8443) → mock-backend"
     echo ""
-    docker compose -f "$COMPOSE_FILE" run --rm \
-        goose run --no-session -t "$prompt"
+
+    # Read the dev token minted by 'dev.sh up'.
+    if [ ! -f /tmp/oac-dev-token ]; then
+        err "Dev token not found. Run './docker/dev.sh up' first."
+        exit 1
+    fi
+    local dev_token
+    dev_token=$(cat /tmp/oac-dev-token)
+
+    docker compose -f "$COMPOSE_FILE" --profile agent run --rm \
+        -e "RELAY_API_KEY=$dev_token" \
+        pi -p "$prompt"
 }
 
 cmd_test() {
     info "Sending test requests through the full chain..."
-    info "  Goose → relay (127.0.0.1:8787) → central (8443) → mock-backend (8090)"
+    info "  Agent → relay (127.0.0.1:8787) → central (8443) → mock-backend (8090)"
 
     # Read the dev token minted by 'dev.sh up'.
     if [ ! -f /tmp/oac-dev-token ]; then
@@ -333,19 +340,19 @@ case "${1:-}" in
     status)    cmd_status ;;
     logs)      cmd_logs ;;
     shell)     cmd_shell ;;
-    goose)     cmd_goose ;;
-    goose-run) cmd_goose_run "$@" ;;
+    pi)        cmd_pi ;;
+    pi-run)    cmd_pi_run "$@" ;;
     test)      cmd_test ;;
     *)
-        echo "Usage: $0 {up|down|status|logs|shell|goose|goose-run|test}"
+        echo "Usage: $0 {up|down|status|logs|shell|pi|pi-run|test}"
         echo ""
         echo "  up         — generate certs, build and start all containers"
         echo "  down       — stop all containers"
         echo "  status     — show container status"
         echo "  logs       — tail logs from all services"
         echo "  shell      — open a shell in the relay container"
-        echo "  goose      — show Goose usage info"
-        echo "  goose-run  — run a headless Goose prompt (e.g. ./docker/dev.sh goose-run \"Hello\")"
+        echo "  pi         — show Pi usage info"
+        echo "  pi-run     — run a headless Pi prompt (e.g. ./docker/dev.sh pi-run \"Hello\")"
         echo "  test       — send test requests through the full chain"
         exit 1
         ;;

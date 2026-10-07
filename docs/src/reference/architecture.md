@@ -3,7 +3,7 @@
 ## System overview
 
 ```
-Agent (Codex, Goose, etc.)
+Agent (Codex, Pi, etc.)
   │  Authorization: Bearer *** token>
   ▼
 [127.0.0.1 relay]  ── mTLS (TLS 1.3) ──►  [central proxy]  ──►  [OpenAI-compatible backend]

@@ -6,7 +6,7 @@ agents, with **per-server, per-tool permissions** and **full audit logging**.
 ## What is MCP?
 
 [MCP](https://modelcontextprotocol.io) is an open protocol that lets an agent
-(e.g. Gemini CLI, Claude Desktop, Goose) call external tools from a server.
+(e.g. Gemini CLI, Claude Desktop, Pi) call external tools from a server.
 The agent speaks JSON-RPC 2.0 over the **Streamable HTTP** transport. The two
 endpoints this server exposes support different method sets:
 

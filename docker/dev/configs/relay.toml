@@ -1,6 +1,6 @@
 # Relay config for Docker dev stack.
 # Runs inside Docker with dev_mode = true (allows 0.0.0.0 bind).
-# Exposed to the host on 127.0.0.1:8787 so Goose can connect.
+# Exposed to the host on 127.0.0.1:8787 so agents (e.g. Pi) can connect.
 # Forwards to the central proxy over the Docker network.
 
 listen_addr = "0.0.0.0:8787"

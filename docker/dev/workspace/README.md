@@ -1,3 +1,3 @@
-# This directory is mounted into the Goose container as /workspace.
-# Goose will operate on files in this directory.
-# Place any files you want Goose to work with here.
+# This directory is mounted into the Pi container as /workspace.
+# Pi will operate on files in this directory.
+# Place any files you want Pi to work with here.

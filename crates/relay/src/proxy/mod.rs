@@ -158,7 +158,7 @@ pub async fn serve(config: RelayConfig, db: DatabaseConnection) -> Result<()> {
 ///
 /// Used by the Host header validation middleware to reject DNS rebinding
 /// attacks. Only loopback addresses are allowed. In dev mode, the Docker
-/// service name `relay` is also allowed so containerized agents (e.g. Goose)
+/// service name `relay` is also allowed so containerized agents (e.g. Pi)
 /// can connect via the Docker network.
 #[must_use]
 pub fn allowed_hosts(listen_addr: &SocketAddr, dev_mode: bool) -> Vec<String> {
