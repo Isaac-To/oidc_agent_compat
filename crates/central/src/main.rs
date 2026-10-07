@@ -88,11 +88,20 @@ enum AdminSubcommand {
         disabled: bool,
     },
     /// Delete a provider and all of its keys.
-    ProviderDelete { id: String },
+    ProviderDelete {
+        /// Provider identifier to delete.
+        id: String,
+    },
     /// Set the default fallback provider.
-    ProviderDefault { id: String },
+    ProviderDefault {
+        /// Provider identifier to set as default.
+        id: String,
+    },
     /// List metadata for a provider's keys.
-    ProviderKeyList { provider_id: String },
+    ProviderKeyList {
+        /// Provider identifier.
+        provider_id: String,
+    },
     /// Add a provider key, reading its secret without echo.
     ProviderKeyAdd {
         /// Provider identifier.
@@ -108,13 +117,22 @@ enum AdminSubcommand {
         groups: Option<String>,
     },
     /// Delete a provider key.
-    ProviderKeyDelete { provider_id: String, key_id: String },
+    ProviderKeyDelete {
+        /// Provider identifier.
+        provider_id: String,
+        /// Key identifier to delete.
+        key_id: String,
+    },
     /// List all group policies.
     PolicyList,
     /// Get a single group policy.
-    PolicyGet { name: String },
+    PolicyGet {
+        /// Group name.
+        name: String,
+    },
     /// Set (upsert) a group policy.
     PolicySet {
+        /// Group name.
         name: String,
         /// Comma-separated list of allowed models (omit for all).
         #[arg(long)]
@@ -130,13 +148,22 @@ enum AdminSubcommand {
         request_quota: Option<i64>,
     },
     /// Delete a group policy.
-    PolicyDelete { name: String },
+    PolicyDelete {
+        /// Group name to delete.
+        name: String,
+    },
     /// List all devices.
     DeviceList,
     /// Revoke a device.
-    DeviceRevoke { fingerprint: String },
+    DeviceRevoke {
+        /// Device fingerprint (SHA-256 of the mTLS client cert).
+        fingerprint: String,
+    },
     /// Reinstate a revoked device.
-    DeviceReinstate { fingerprint: String },
+    DeviceReinstate {
+        /// Device fingerprint (SHA-256 of the mTLS client cert).
+        fingerprint: String,
+    },
     /// Query the audit log.
     AuditQuery {
         /// Filter by user subject.
@@ -157,7 +184,7 @@ enum AdminSubcommand {
     },
     /// Get quota status for a user.
     QuotaGet {
-        /// The user subject.
+        /// The user subject (from the IdP).
         subject: String,
     },
 }
@@ -165,7 +192,16 @@ enum AdminSubcommand {
 fn main() {
     let cli = Cli::parse();
 
-    let _ = oidc_agent_common::logging::init();
+    // Initialize logging. Use the CLI variant for non-server subcommands to
+    // suppress noisy SQL/migration logs; use the full variant for `serve`.
+    let is_serve = matches!(cli.command, None | Some(Command::Serve));
+    if is_serve {
+        if let Err(e) = oidc_agent_common::logging::init() {
+            eprintln!("oac-central: warning: failed to initialize logging: {e}");
+        }
+    } else if let Err(e) = oidc_agent_common::logging::init_cli() {
+        eprintln!("oac-central: warning: failed to initialize logging: {e}");
+    }
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -176,9 +212,13 @@ fn main() {
     };
 
     let result = rt.block_on(async {
-        let config = load_config(&cli.config)?;
+        // The admin CLI is a pure HTTP client — it does not need the central
+        // config file. Only `serve` loads the config.
         match cli.command.unwrap_or(Command::Serve) {
-            Command::Serve => serve(config).await,
+            Command::Serve => {
+                let config = load_config(&cli.config)?;
+                serve(config).await
+            }
             Command::Admin(admin_cli) => admin(admin_cli).await,
         }
     });
@@ -266,7 +306,14 @@ async fn admin(cli: AdminCli) -> Result<()> {
         .url
         .unwrap_or_else(|| "http://127.0.0.1:8787".to_string());
 
+    // Validate the key format client-side for a better error message.
     let key = cli.key;
+    if !key.starts_with("oac_") {
+        return Err(oidc_agent_common::error::Error::Config(
+            "invalid API key format: must start with 'oac_' — run 'oac-relay print-key' to see your key"
+                .into(),
+        ));
+    }
     let client = reqwest::Client::new();
     let base_url = url.trim_end_matches('/');
 

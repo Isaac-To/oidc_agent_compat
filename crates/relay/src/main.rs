@@ -52,8 +52,8 @@ enum Command {
     ListKeys,
     /// Show recent relay request activity.
     Activity {
-        /// Maximum number of entries to display (default 20, max 1000).
-        #[arg(long, default_value_t = 20)]
+        /// Maximum number of entries to display (1-1000).
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..=1000))]
         limit: u32,
     },
     /// Manage central tokens (create, list, revoke).
@@ -86,13 +86,22 @@ enum TokenCommand {
         /// The token row ID (UUID) to revoke.
         token_id: String,
     },
+    // Note: `token_id` is a positional arg; clap shows it as `<TOKEN_ID>`.
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    // Initialize logging.
-    let _ = oidc_agent_common::logging::init();
+    // Initialize logging. Use the CLI variant for non-server subcommands to
+    // suppress noisy SQL/migration logs; use the full variant for `serve`.
+    let is_serve = matches!(cli.command, None | Some(Command::Serve));
+    if is_serve {
+        if let Err(e) = oidc_agent_common::logging::init() {
+            eprintln!("oac-relay: warning: failed to initialize logging: {e}");
+        }
+    } else if let Err(e) = oidc_agent_common::logging::init_cli() {
+        eprintln!("oac-relay: warning: failed to initialize logging: {e}");
+    }
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -134,14 +143,17 @@ fn print_error(err: &oidc_agent_common::error::Error) {
     eprintln!("oac-relay: error: {err}");
     match err {
         Error::Config(msg) => {
-            if msg.contains("No such file or directory") {
+            // Check "not logged in" FIRST — it also contains "No such file
+            // or directory" (agent-env.sh missing), which would otherwise
+            // trigger the wrong hint.
+            if msg.contains("not logged in") {
+                eprintln!();
+                eprintln!("hint: run 'oac-relay login' first to authenticate via OIDC.");
+            } else if msg.contains("No such file or directory") {
                 eprintln!();
                 eprintln!("hint: the config file was not found. Create one from the example:");
                 eprintln!("  cp config.example.toml config.toml");
                 eprintln!("  # then edit config.toml with your settings");
-            } else if msg.contains("not logged in") {
-                eprintln!();
-                eprintln!("hint: run 'oac-relay login' first to authenticate via OIDC.");
             }
         }
         Error::Http(msg) => {
@@ -193,6 +205,10 @@ async fn login_cmd(config: RelayConfig, ttl: Option<&str>) -> Result<()> {
         result.email.as_deref().unwrap_or(&result.subject),
         result.injection.path.display()
     );
+    match &result.expires_at {
+        Some(exp) => println!("  token expires at {exp}"),
+        None => println!("  token never expires (unless revoked or clamped by admin backstop)"),
+    }
     Ok(())
 }
 
@@ -245,7 +261,15 @@ async fn logout_cmd(config: RelayConfig) -> Result<()> {
 /// from the database (which only stores the hash). This is useful when the
 /// employee needs to reconfigure their agent manually.
 async fn print_key_cmd() -> Result<()> {
+    use std::io::IsTerminal;
     let config = oac_relay::agent_config::read()?;
+    // Warn if stdout is not a terminal — the key may be piped to a file or
+    // captured in a log.
+    if !std::io::stdout().is_terminal() {
+        eprintln!(
+            "oac-relay: warning: stdout is not a terminal — the API key may be logged or persisted."
+        );
+    }
     println!("oac-relay: agent config:");
     println!("  base_url = {}", config.base_url);
     println!("  api_key  = {}", config.api_key);

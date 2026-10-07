@@ -383,7 +383,8 @@ mod tests {
             device_store: crate::device_store::DeviceStore::new(db.clone()),
             usage_tracker: crate::usage::UsageTracker::new(db.clone()),
             price_table: crate::pricing::PriceTable::empty(),
-            mcp_manager: crate::mcp::McpManager::new(mcp_db, zeroize::Zeroizing::new([7_u8; 32])),
+            mcp_manager: crate::mcp::McpManager::new(mcp_db, zeroize::Zeroizing::new([7_u8; 32]))
+                .expect("mcp manager"),
             token_store: crate::token_store::TokenStore::new(db),
         }
     }

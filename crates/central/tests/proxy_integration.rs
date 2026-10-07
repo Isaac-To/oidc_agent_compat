@@ -114,7 +114,8 @@ async fn setup_test_central() -> (SocketAddr, reqwest::Client) {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -321,7 +322,8 @@ async fn streaming_response_records_token_usage_after_stream_completes() {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     // Mint a token before moving state into the router.
@@ -497,7 +499,8 @@ async fn setup_prod_central() -> (SocketAddr, reqwest::Client) {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -728,7 +731,8 @@ async fn setup_mtls_central() -> SocketAddr {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -983,7 +987,8 @@ async fn setup_multi_provider_central(
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -1234,7 +1239,8 @@ async fn key_falls_back_on_upstream_401() {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -1323,7 +1329,8 @@ async fn no_provider_configured_returns_error_without_key_leak() {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -1480,7 +1487,8 @@ async fn token_saver_deduplicates_and_audits() {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -1713,7 +1721,8 @@ async fn ansi_strip_end_to_end() {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -1891,7 +1900,8 @@ async fn rtk_collapse_repeated_lines_end_to_end() {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -2120,7 +2130,8 @@ async fn upstream_failure_releases_request_quota_reservation() {
         mcp_manager: oac_central::mcp::McpManager::new(
             audit.db().clone(),
             Zeroizing::new([7_u8; 32]),
-        ),
+        )
+        .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(audit.db().clone()),
     };
     let app = proxy::router(state);
@@ -2292,7 +2303,8 @@ async fn rate_limit_429_through_router_carries_retry_after() {
         device_store: oac_central::device_store::DeviceStore::new(db.clone()),
         usage_tracker: oac_central::usage::UsageTracker::new(db.clone()),
         price_table: oac_central::pricing::PriceTable::empty(),
-        mcp_manager: oac_central::mcp::McpManager::new(db.clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(db.clone(), Zeroizing::new([7_u8; 32]))
+            .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(db.clone()),
     };
     let app = proxy::router(state);

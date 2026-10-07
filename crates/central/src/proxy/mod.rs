@@ -78,6 +78,34 @@ impl AppState {
 /// a single source of truth.
 pub const MAX_BODY_SIZE: usize = oidc_agent_common::http_util::MAX_BODY_SIZE;
 
+/// Readiness probe handler for the central proxy.
+///
+/// Checks DB connectivity (via `SELECT 1`). Returns `200 OK` if the DB is
+/// reachable, `503 Service Unavailable` otherwise. This is intended for
+/// Kubernetes/Docker readiness probes — unlike `/healthz` (liveness), it
+/// verifies the proxy can actually serve traffic.
+async fn readyz_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::http::StatusCode {
+    use sea_orm::{ConnectionTrait, Statement};
+    match state
+        .audit
+        .db()
+        .execute(Statement::from_sql_and_values(
+            state.audit.db().get_database_backend(),
+            "SELECT 1",
+            vec![],
+        ))
+        .await
+    {
+        Ok(_) => axum::http::StatusCode::OK,
+        Err(e) => {
+            tracing::error!(error = %e, "readiness check failed: DB unreachable");
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
+}
+
 /// Builds the Axum router for the central proxy.
 ///
 /// # Security
@@ -88,6 +116,7 @@ pub const MAX_BODY_SIZE: usize = oidc_agent_common::http_util::MAX_BODY_SIZE;
 pub fn router(state: AppState) -> Router {
     let mut proxy_router = Router::new()
         .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route("/readyz", axum::routing::get(readyz_handler))
         .route(
             "/v1/chat/completions",
             axum::routing::post(forward::proxy_handler),
@@ -206,7 +235,7 @@ pub async fn serve(
     let policy_store = PolicyStore::new(audit.db().clone());
     let device_store = DeviceStore::new(audit.db().clone());
     let provider_store = ProviderStore::new(audit.db().clone(), encryption_key.clone());
-    let mcp_manager = crate::mcp::McpManager::new(audit.db().clone(), encryption_key);
+    let mcp_manager = crate::mcp::McpManager::new(audit.db().clone(), encryption_key)?;
     let usage_tracker = UsageTracker::new(audit.db().clone());
     let token_store = crate::token_store::TokenStore::new(audit.db().clone());
     let price_table = config
@@ -346,7 +375,8 @@ mod tests {
             device_store: DeviceStore::new(db.clone()),
             usage_tracker: UsageTracker::new(db.clone()),
             price_table: crate::pricing::PriceTable::empty(),
-            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32])),
+            mcp_manager: crate::mcp::McpManager::new(mcp_db, Zeroizing::new([7_u8; 32]))
+                .expect("mcp manager"),
             token_store: crate::token_store::TokenStore::new(db),
         }
     }

@@ -117,8 +117,12 @@ pub fn read() -> Result<AgentConfig> {
 
 /// Reads the base URL and API key from a Codex `config.json` file.
 fn read_codex(path: &Path) -> Result<AgentConfig> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        Error::Config(format!(
+            "not logged in — run oac-relay login first (read {}: {e})",
+            path.display()
+        ))
+    })?;
     let json: serde_json::Value = serde_json::from_str(&contents)
         .map_err(|e| Error::Config(format!("parse {}: {e}", path.display())))?;
     let base_url = json
@@ -146,8 +150,12 @@ fn read_codex(path: &Path) -> Result<AgentConfig> {
 
 /// Reads the base URL and API key from a generic env file (`agent-env.sh`).
 fn read_generic_env(path: &Path) -> Result<AgentConfig> {
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| Error::Config(format!("read {}: {e}", path.display())))?;
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        Error::Config(format!(
+            "not logged in — run oac-relay login first (read {}: {e})",
+            path.display()
+        ))
+    })?;
     let base_url = extract_env_var(&contents, "OPENAI_API_BASE").ok_or_else(|| {
         Error::Config(format!(
             "{} does not contain OPENAI_API_BASE; run `oac-relay login` first",

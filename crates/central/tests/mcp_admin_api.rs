@@ -34,7 +34,8 @@ async fn setup_router() -> (axum::Router, String, String) {
         device_store: DeviceStore::new(db.clone()),
         audit,
         usage_tracker: UsageTracker::new(db.clone()),
-        mcp_manager: oac_central::mcp::McpManager::new(db.clone(), Zeroizing::new([7_u8; 32])),
+        mcp_manager: oac_central::mcp::McpManager::new(db.clone(), Zeroizing::new([7_u8; 32]))
+            .expect("mcp manager"),
         token_store: oac_central::token_store::TokenStore::new(db),
         admin_group: "oac-admins".into(),
     };

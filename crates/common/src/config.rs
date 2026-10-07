@@ -238,7 +238,7 @@ impl RelayConfig {
             validate_loopback(&self.listen_addr)?;
         }
         validate_database_url(&self.database_url)?;
-        validate_oidc(&self.oidc)?;
+        validate_oidc(&self.oidc, self.dev_mode)?;
         if !self.dev_mode {
             validate_central_url(&self.central.url)?;
         }
@@ -268,7 +268,7 @@ impl CentralConfig {
     /// `admin_group`.
     pub fn validate(&self) -> Result<()> {
         validate_database_url(&self.database_url)?;
-        validate_oidc(&self.oidc)?;
+        validate_oidc(&self.oidc, self.dev_mode)?;
         if self.rate_limit_requests == 0 {
             return Err(Error::Config(
                 "rate_limit_requests must be greater than zero".into(),
@@ -318,7 +318,11 @@ fn validate_loopback(addr: &SocketAddr) -> Result<()> {
 }
 
 /// Validates OIDC config fields.
-fn validate_oidc(oidc: &OidcConfig) -> Result<()> {
+///
+/// When `dev_mode` is `false`, the issuer must be `https://` — OIDC discovery
+/// over plain HTTP is a MITM vector. In dev mode, `http://` is allowed for
+/// local Keycloak containers.
+fn validate_oidc(oidc: &OidcConfig, dev_mode: bool) -> Result<()> {
     if oidc.issuer.is_empty() {
         return Err(Error::Config("oidc.issuer must not be empty".into()));
     }
@@ -327,6 +331,14 @@ fn validate_oidc(oidc: &OidcConfig) -> Result<()> {
             "oidc.issuer must be an http(s) URL, got: {}",
             oidc.issuer
         )));
+    }
+    if !dev_mode && oidc.issuer.starts_with("http://") {
+        return Err(Error::Config(
+            "oidc.issuer must be https:// in production (got http://). \
+             OIDC discovery over plain HTTP is a MITM vector. \
+             Set dev_mode = true only for local development."
+                .into(),
+        ));
     }
     if oidc.client_id.is_empty() {
         return Err(Error::Config("oidc.client_id must not be empty".into()));
@@ -485,6 +497,39 @@ server_key_path = "/server.key"
         let toml = valid_relay_toml().replace("https://idp.example.com", "ftp://bad");
         let err = RelayConfig::from_toml(&toml).unwrap_err();
         assert!(err.to_string().contains("http(s)"), "{err}");
+    }
+
+    #[test]
+    fn relay_rejects_http_issuer_in_production() {
+        // http:// issuer in production (dev_mode=false) must be rejected.
+        let toml = valid_relay_toml().replace("https://idp.example.com", "http://idp.example.com");
+        let err = RelayConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("https://"), "{err}");
+        assert!(err.to_string().contains("MITM"), "{err}");
+    }
+
+    #[test]
+    fn relay_allows_http_issuer_in_dev_mode() {
+        // http:// issuer is allowed when dev_mode=true (local Keycloak).
+        let toml = valid_relay_toml()
+            .replace(
+                "https://idp.example.com",
+                "http://localhost:8080/realms/oac-dev",
+            )
+            .replace(
+                "database_url = \"sqlite://relay.db\"",
+                "database_url = \"sqlite://relay.db\"\ndev_mode = true",
+            )
+            .replace("https://central.example.com", "http://localhost:8443");
+        RelayConfig::from_toml(&toml).expect("dev_mode allows http issuer");
+    }
+
+    #[test]
+    fn central_rejects_http_issuer_in_production() {
+        let toml =
+            valid_central_toml().replace("https://idp.example.com", "http://idp.example.com");
+        let err = CentralConfig::from_toml(&toml).unwrap_err();
+        assert!(err.to_string().contains("https://"), "{err}");
     }
 
     #[test]

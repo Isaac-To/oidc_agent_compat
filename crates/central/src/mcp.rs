@@ -125,20 +125,33 @@ pub struct McpManager {
 
 impl McpManager {
     /// Creates an `McpManager` with the supplied 32-byte encryption key and
-    /// an HTTP client tailored for MCP forwarding (no redirects followed).
-    #[must_use]
-    pub fn new(db: DatabaseConnection, encryption_key: Zeroizing<[u8; 32]>) -> Self {
-        // The builder can only fail on a misconfiguration that never occurs
-        // here; fall back to a plain client rather than aborting startup.
+    /// an HTTP client tailored for MCP forwarding (no redirects followed,
+    /// with timeouts matching the OpenAI forward path).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Internal`][oidc_agent_common::error::Error::Internal]
+    /// if the HTTP client builder fails (should not happen in practice, but
+    /// we refuse to silently degrade the no-redirect security policy).
+    pub fn new(
+        db: DatabaseConnection,
+        encryption_key: Zeroizing<[u8; 32]>,
+    ) -> oidc_agent_common::error::Result<Self> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-        Self {
+            .map_err(|e| {
+                oidc_agent_common::error::Error::Internal(format!(
+                    "failed to build MCP HTTP client: {e}"
+                ))
+            })?;
+        Ok(Self {
             db,
             encryption_key: Arc::new(encryption_key),
             client,
-        }
+        })
     }
 
     /// Returns a reference to the underlying database connection.
@@ -353,7 +366,7 @@ mod tests {
         crate::migration::Migrator::up(&db, None)
             .await
             .expect("migrate");
-        McpManager::new(db, key)
+        McpManager::new(db, key).expect("mcp manager")
     }
 
     #[tokio::test]

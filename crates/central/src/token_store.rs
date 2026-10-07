@@ -12,7 +12,7 @@
 //! - Tokens are 256-bit OS CSPRNG, `oac_` prefix, base64url.
 //! - Only SHA-256 hash stored at rest.
 //! - Constant-time hash comparison via [`KeyHash::matches`].
-//! - No early return in the verification loop (timing attack prevention).
+//! - Indexed DB lookup on `token_hash` (O(1) per verification).
 //! - The plaintext is never logged.
 
 use sea_orm::{ConnectionTrait, DatabaseConnection, Statement, Value};
@@ -186,10 +186,11 @@ impl TokenStore {
 
     /// Verifies a plaintext bearer token against the stored hashes.
     ///
-    /// Iterates ALL rows without early return to prevent timing leaks
-    /// (CWE-208). Expired tokens are deleted on verification. Returns the
-    /// verified identity on success, or `Ok(None)` if no matching,
-    /// non-expired, non-revoked token exists.
+    /// Uses an indexed `WHERE token_hash = $1` lookup (O(1)) with
+    /// constant-time hash comparison on the returned row (CWE-208).
+    /// Expired tokens are deleted on verification. Returns the verified
+    /// identity on success, or `Ok(None)` if no matching, non-expired,
+    /// non-revoked token exists.
     ///
     /// # Errors
     ///
@@ -198,14 +199,19 @@ impl TokenStore {
         let candidate = KeyHash::from_plaintext(plaintext);
         let now = time_util::now_utc();
 
+        // Indexed lookup: the DB finds the row by token_hash, then we do a
+        // constant-time comparison on the returned hash to prevent timing
+        // leaks (CWE-208). This is O(1) instead of the previous O(n) full
+        // table scan.
         let sql = "SELECT id, subject, issuer, email, groups, identity_id, token_hash, \
-             created_at, expires_at, revoked, device_fingerprint FROM tokens";
+             created_at, expires_at, revoked, device_fingerprint FROM tokens \
+             WHERE token_hash = $1";
         let rows = self
             .db
             .query_all(Statement::from_sql_and_values(
                 self.db.get_database_backend(),
                 sql,
-                vec![],
+                vec![candidate.as_bytes().to_vec().into()],
             ))
             .await
             .map_err(|e| Error::Database(format!("query tokens: {e}")))?;
@@ -236,17 +242,15 @@ impl TokenStore {
 
             // Skip rows with corrupted token_hash (wrong length) instead of
             // panicking. This is defense-in-depth against DB corruption.
-            if row_hash.len() != 32 {
+            // Constant-time comparison against the candidate hash.
+            let Ok(stored) = KeyHash::from_hash_bytes(&row_hash) else {
                 tracing::error!(
                     token_id = %row_id,
                     hash_len = row_hash.len(),
                     "corrupted token_hash in database row, skipping"
                 );
                 continue;
-            }
-
-            // Constant-time comparison against the candidate hash.
-            let stored = KeyHash::from_hash_bytes(&row_hash);
+            };
             if !row_revoked && stored.matches(&candidate) {
                 // Check expiry.
                 let expired = row_expires.is_some_and(|e| e <= now);
@@ -268,7 +272,9 @@ impl TokenStore {
 
         // Delete expired tokens so stale credentials cannot be replayed.
         for id in &expired_ids {
-            let _ = self.delete_by_id(id).await;
+            if let Err(e) = self.delete_by_id(id).await {
+                tracing::warn!(error = %e, token_id = %id, "failed to delete expired token");
+            }
         }
 
         let Some(token_id) = matched_id else {
@@ -276,7 +282,9 @@ impl TokenStore {
         };
 
         // Update last_used_at (best-effort, non-fatal).
-        let _ = self.touch_last_used(&token_id).await;
+        if let Err(e) = self.touch_last_used(&token_id).await {
+            tracing::warn!(error = %e, token_id = %token_id, "failed to update last_used_at");
+        }
 
         Ok(Some(TokenVerification {
             identity: TokenIdentity {
@@ -296,18 +304,21 @@ impl TokenStore {
     /// Revokes the token matching the given plaintext. Returns `true` if a
     /// token was found and deleted, `false` if no matching token exists.
     ///
+    /// Uses an indexed `WHERE token_hash = $1` lookup (O(1)) with
+    /// constant-time hash comparison on the returned row (CWE-208).
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Database`] on query/delete failure.
     pub async fn revoke_by_token(&self, plaintext: &str) -> Result<bool> {
         let candidate = KeyHash::from_plaintext(plaintext);
-        let sql = "SELECT id, token_hash, revoked FROM tokens";
+        let sql = "SELECT id, token_hash, revoked FROM tokens WHERE token_hash = $1";
         let rows = self
             .db
             .query_all(Statement::from_sql_and_values(
                 self.db.get_database_backend(),
                 sql,
-                vec![],
+                vec![candidate.as_bytes().to_vec().into()],
             ))
             .await
             .map_err(|e| Error::Database(format!("query tokens for revoke: {e}")))?;
@@ -317,18 +328,16 @@ impl TokenStore {
             let row_id: String = row.try_get("", "id").unwrap_or_default();
             let row_hash: Vec<u8> = row.try_get("", "token_hash").unwrap_or_default();
             // Skip rows with corrupted token_hash instead of panicking.
-            if row_hash.len() != 32 {
+            let Ok(stored) = KeyHash::from_hash_bytes(&row_hash) else {
                 tracing::error!(
                     token_id = %row_id,
                     hash_len = row_hash.len(),
                     "corrupted token_hash in database row, skipping"
                 );
                 continue;
-            }
-            let stored = KeyHash::from_hash_bytes(&row_hash);
+            };
             if stored.matches(&candidate) {
                 target_id = Some(row_id);
-                // Do NOT break — iterate all rows to avoid timing leaks.
             }
         }
 

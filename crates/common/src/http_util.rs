@@ -70,6 +70,7 @@ pub fn extract_model(body: &[u8]) -> Option<String> {
 /// - `\` (backslashes, which some upstreams normalize to `/`)
 /// - `//` (double slashes)
 /// - Absolute URLs (`http://` or `https://`)
+/// - Null bytes (`\0`) or other control characters (< 0x20)
 ///
 /// # Errors
 ///
@@ -90,6 +91,13 @@ pub fn sanitize_path(path: &str) -> Result<String> {
     }
     if path.starts_with("http://") || path.starts_with("https://") {
         return Err(Error::Http(format!("path is absolute URL: {path}")));
+    }
+    // Reject null bytes and control characters (defense-in-depth against
+    // upstream proxies/servers that interpret them specially).
+    if let Some(pos) = path.bytes().position(|b| b < 0x20) {
+        return Err(Error::Http(format!(
+            "path contains control character at byte {pos}"
+        )));
     }
     Ok(path.to_string())
 }

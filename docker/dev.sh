@@ -21,6 +21,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/dev/docker-compose.yml"
 CERT_DIR="$SCRIPT_DIR/certs"
 
+# The mock provider key registered at central. Used both for registration
+# and for the leak check in `cmd_test` — keep them in sync via this variable.
+MOCK_PROVIDER_KEY="sk-mock-backend-master-key"
+
 # ─── Colors ──────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -72,13 +76,14 @@ cmd_up() {
     curl -sfS -X POST http://localhost:8443/admin/v1/providers/mock-backend/keys \
         -H 'Content-Type: application/json' \
         -H "Authorization: Bearer $DEV_TOKEN" \
-        -d '{"key":"sk-moc...-key","label":"dev-mock-key","priority":0}' \
+        -d "{\"key\":\"$MOCK_PROVIDER_KEY\",\"label\":\"dev-mock-key\",\"priority\":0}" \
         >/dev/null
     ok "Mock provider and test key registered"
 
     info "Writing dev token for manual curl..."
+    umask 077
     echo "$DEV_TOKEN" > /tmp/oac-dev-token
-    ok "Dev token written to /tmp/oac-dev-token"
+    ok "Dev token written to /tmp/oac-dev-token (mode 600)"
 
     echo ""
     echo "═══════════════════════════════════════════════════════════════════════"
@@ -286,7 +291,7 @@ cmd_test() {
     LEAK=$(curl -s \
         -H "Authorization: Bearer $DEV_TOKEN" \
         http://127.0.0.1:8787/v1/models)
-    if echo "$LEAK" | grep -q "sk-mock-backend-master-key"; then
+    if echo "$LEAK" | grep -q "$MOCK_PROVIDER_KEY"; then
         err "Master key leaked into relay /v1/models response!"
         exit 1
     else

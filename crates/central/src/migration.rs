@@ -182,6 +182,7 @@ impl MigratorTrait for Migrator {
             Box::new(Migration0009Mcp),
             Box::new(Migration0010Tokens),
             Box::new(Migration0011DeviceFingerprint),
+            Box::new(Migration0012TokenHashIndex),
         ]
     }
 }
@@ -531,6 +532,48 @@ impl MigrationTrait for Migration0011DeviceFingerprint {
         // SQLite does not support DROP COLUMN; forward-only, no-op down
         // (consistent with migrations 0006/0007/0008).
         let _ = manager;
+        Ok(())
+    }
+}
+
+/// Migration 0012: add an index on `tokens.token_hash` for O(1) lookup.
+///
+/// The token verification path previously loaded ALL token rows and compared
+/// hashes in memory (O(n) per request). With this index, verification does
+/// a targeted `WHERE token_hash = $1` lookup. Constant-time comparison is
+/// still applied to the returned row.
+pub struct Migration0012TokenHashIndex;
+
+impl MigrationName for Migration0012TokenHashIndex {
+    fn name(&self) -> &str {
+        "m0000012_token_hash_index"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration0012TokenHashIndex {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_tokens_token_hash")
+                    .table(Token::Table)
+                    .col(Token::TokenHash)
+                    .to_owned(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_tokens_token_hash")
+                    .table(Token::Table)
+                    .to_owned(),
+            )
+            .await?;
         Ok(())
     }
 }
@@ -1258,6 +1301,7 @@ mod tests {
                 "m000009_mcp",
                 "m0000010_tokens",
                 "m0000011_device_fingerprint",
+                "m0000012_token_hash_index",
             ],
             "migration order is part of the schema contract"
         );

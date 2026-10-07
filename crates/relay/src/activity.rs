@@ -61,6 +61,12 @@ impl ActivityLogger {
         Self { db }
     }
 
+    /// Returns a reference to the underlying database connection.
+    #[must_use]
+    pub fn db(&self) -> &DatabaseConnection {
+        &self.db
+    }
+
     /// Records a relay activity entry.
     ///
     /// # Security

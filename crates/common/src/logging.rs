@@ -54,7 +54,8 @@ pub const SENSITIVE_FIELDS: &[&str] = &[
 pub const REDACTED: &str = "[REDACTED]";
 
 /// Initializes the global tracing subscriber with JSON output and secret
-/// redaction.
+/// redaction. Logs are written to **stderr** so that CLI command output on
+/// stdout remains clean and pipeable.
 ///
 /// # Errors
 ///
@@ -70,7 +71,50 @@ pub fn init() -> Result<()> {
 
     let json_layer = tracing_subscriber::fmt::layer()
         .json()
-        .with_writer(RedactingMakeWriter::new(io::stdout()))
+        .with_writer(RedactingMakeWriter::new(io::stderr()))
+        .with_filter(filter);
+
+    tracing_subscriber::registry()
+        .with(json_layer)
+        .try_init()
+        .map_err(|e| Error::Internal(format!("tracing init: {e}")))?;
+
+    Ok(())
+}
+
+/// Initializes the global tracing subscriber for CLI (non-server) commands.
+///
+/// Like [`init`] but suppresses noisy SQL/migration log targets so that CLI
+/// output on stdout is not polluted by database setup logs. Logs still go
+/// to stderr.
+///
+/// # Errors
+///
+/// Returns [`Error::Internal`] if the subscriber could not be set.
+pub fn init_cli() -> Result<()> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("warn")
+            // Suppress noisy SQL and migration logs for CLI commands.
+            .add_directive(
+                "sqlx::query=off"
+                    .parse()
+                    .unwrap_or_else(|_| "off".parse().unwrap_or_default()),
+            )
+            .add_directive(
+                "sea_orm_migration=off"
+                    .parse()
+                    .unwrap_or_else(|_| "off".parse().unwrap_or_default()),
+            )
+            .add_directive(
+                "sea_orm=off"
+                    .parse()
+                    .unwrap_or_else(|_| "off".parse().unwrap_or_default()),
+            )
+    });
+
+    let json_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(RedactingMakeWriter::new(io::stderr()))
         .with_filter(filter);
 
     tracing_subscriber::registry()
